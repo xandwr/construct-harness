@@ -10,17 +10,24 @@ export interface TextPart {
     text: string;
 }
 
+export interface ToolDef {
+    name: string;
+    description: string;
+    parameters: unknown; // JSON
+    run(args: unknown): Promise<unknown>;
+}
+
 export interface ToolCallPart {
     kind: "tool_call";
     id: string; // correlates this call with its result
     name: string; // which tool to run
-    args: unknown; // parsed JSON arguments (refine per-tool later)
+    args: unknown; // parsed JSON arguments
 }
 
 export interface ToolResultPart {
     kind: "tool_result";
     callId: string; // must match a ToolCallPart.id
-    result: unknown; // tool output (or an error payload)
+    result: unknown; // tool output
     isError?: boolean;
 }
 
