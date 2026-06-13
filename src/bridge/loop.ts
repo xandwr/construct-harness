@@ -10,11 +10,21 @@
 
 import { RoleType } from "../types.ts";
 import type { ContentPart, Message, ToolDef, ToolCallPart } from "../types.ts";
+import { applyContext } from "../context.ts";
+import type { ContextProvider } from "../context.ts";
 import type { GenerateParams, GenerateResult, ModelClient } from "./types.ts";
 
 export interface RunLoopParams extends GenerateParams {
     /** Hard cap on model turns, to bound runaway tool loops. Default 10. */
     maxTurns?: number;
+    /**
+     * Passive context providers, evaluated just before every `generate` call.
+     * Their contributions (current date/time, standing reminders, …) are folded
+     * onto the outgoing messages for that turn only — recomputed each turn so
+     * temporal values stay current and never leaking into the conversation
+     * history this returns. See {@link applyContext}.
+     */
+    context?: ContextProvider[];
 }
 
 export interface RunLoopResult {
@@ -116,13 +126,18 @@ async function runTool(call: ToolCallPart, tools: Map<string, ToolDef>): Promise
 export async function runLoop(client: ModelClient, params: RunLoopParams): Promise<RunLoopResult> {
     const maxTurns = params.maxTurns ?? 10;
     const toolIndex = indexTools(params.tools);
+    const context = params.context ?? [];
 
     const messages = [...params.messages];
     let final: GenerateResult | undefined;
     let turns = 0;
 
     while (turns < maxTurns) {
-        const result = await client.generate({ ...params, messages });
+        // Fold this turn's passive context (e.g. the current time) onto the
+        // outgoing messages only — `messages` itself, and so the conversation we
+        // return, stays free of per-turn injected content.
+        const outgoing = applyContext(messages, context, turns);
+        const result = await client.generate({ ...params, messages: outgoing });
         turns++;
         final = result;
         messages.push(result.message);

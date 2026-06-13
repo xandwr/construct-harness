@@ -14,6 +14,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { runLoop } from "../src/bridge/loop.ts";
+import type { ContextProvider } from "../src/context.ts";
 import { RoleType } from "../src/types.ts";
 import type { Message, ToolDef, ToolResultPart, ContentPart } from "../src/types.ts";
 import { FakeClient, callTurn, textTurn } from "./helpers/fakeClient.ts";
@@ -190,6 +191,57 @@ test("passes tools through to every generate call", async () => {
         assert.equal(call.tools?.length, 1);
         assert.equal(call.tools?.[0]!.name, "echo");
     }
+});
+
+// ── Passive context ──────────────────────────────────────────────────────────
+
+/** Concatenate the system text seen by a given generate call. */
+function systemTextOf(messages: Message[]): string {
+    return messages
+        .filter((m) => m.sender.role === RoleType.System)
+        .flatMap((m) => m.content)
+        .filter((p): p is Extract<ContentPart, { kind: "text" }> => p.kind === "text")
+        .map((p) => p.text)
+        .join("\n\n");
+}
+
+test("context providers are folded into the system prompt every turn", async () => {
+    const tool = spyTool();
+    let calls = 0;
+    // A provider whose output changes per turn, so we can prove it's recomputed.
+    const ticking: ContextProvider = {
+        name: "ticking",
+        contribute: () => ({ system: `tick ${calls++}` }),
+    };
+    const client = new FakeClient([callTurn("c1", "echo", {}), textTurn("done")]);
+
+    await runLoop(client, { messages: [user("go")], tools: [tool], context: [ticking] });
+
+    // Two generate calls; each saw a freshly-recomputed system contribution.
+    assert.equal(client.calls.length, 2);
+    assert.match(systemTextOf(client.calls[0]!.messages), /tick 0/);
+    assert.match(systemTextOf(client.calls[1]!.messages), /tick 1/);
+});
+
+test("folded context does not leak into the returned conversation", async () => {
+    const provider: ContextProvider = {
+        name: "p",
+        contribute: () => ({ system: "EPHEMERAL-CONTEXT" }),
+    };
+    const client = new FakeClient([textTurn("hi")]);
+
+    const res = await runLoop(client, { messages: [user("go")], context: [provider] });
+
+    // The wire saw it…
+    assert.match(systemTextOf(client.calls[0]!.messages), /EPHEMERAL-CONTEXT/);
+    // …but the conversation we return is clean.
+    assert.doesNotMatch(systemTextOf(res.messages), /EPHEMERAL-CONTEXT/);
+});
+
+test("no context providers leaves the messages untouched", async () => {
+    const client = new FakeClient([textTurn("hi")]);
+    await runLoop(client, { messages: [user("go")] });
+    assert.equal(systemTextOf(client.calls[0]!.messages), "");
 });
 
 // ── Truncation handling ─────────────────────────────────────────────────────

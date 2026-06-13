@@ -5,6 +5,7 @@ import type { ModelClient } from "./bridge/types.ts";
 import { MemoryStore } from "./memory.ts";
 import { memoryTools, recallContext } from "./memoryTools.ts";
 import { OpenAIEmbedder, EmbeddingError, type Embedder } from "./embeddings.ts";
+import { temporalContext } from "./context.ts";
 
 const BASE_SYSTEM =
     "You are a terse assistant. Use tools when asked about weather. " +
@@ -132,9 +133,12 @@ async function main() {
         const tools: ToolDef[] = [weatherTool, ...memoryTools(store, embedder)];
 
         // Run the agentic loop: model → tool → model, all in core types.
+        // Passive context (the current date/time in the user's timezone) is
+        // recomputed and folded into the system prompt before every turn.
         const { final, turns } = await runLoop(client, {
             messages: [system, ask],
             tools,
+            context: [temporalContext()],
         });
 
         for (const part of final.message.content) {
