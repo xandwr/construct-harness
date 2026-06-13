@@ -21,9 +21,13 @@ export * from "./bridge/retry.ts";
 export * from "./bridge/loop.ts";
 export * from "./bridge/anthropic.ts";
 
-// Memory: the store, the embedder, and the tools/recall that bridge them in.
+// Storage substrate: shared SQLite helpers, the curated memory store, the
+// embedder, the append-only event log, and the tools/recall that bridge memory
+// into the loop.
+export * from "./sqlite.ts";
 export * from "./memory.ts";
 export * from "./embeddings.ts";
+export * from "./events.ts";
 export * from "./memoryTools.ts";
 
 // Context engineering: passive context, compaction, usage accounting.

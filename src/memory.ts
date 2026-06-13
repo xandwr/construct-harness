@@ -1,5 +1,19 @@
 import { DatabaseSync } from "node:sqlite";
 import { blobToVector, cosineSimilarity, vectorToBlob } from "./embeddings.ts";
+import {
+    clampLimit,
+    escapeLike,
+    toFtsQuery,
+    DEFAULT_LIMIT,
+    MAX_LIMIT,
+    MAX_CONTENT_LENGTH,
+} from "./sqlite.ts";
+
+// Re-export the shared SQLite helpers/constants that callers (and the existing
+// tests) import from this module, so the extraction into ./sqlite.ts stays
+// source-compatible. These resolve to the same bindings ./sqlite.ts exports, so
+// star-exporting both modules from mod.ts is unambiguous.
+export { clampLimit, escapeLike, toFtsQuery, DEFAULT_LIMIT, MAX_LIMIT, MAX_CONTENT_LENGTH };
 
 /**
  * Thrown when a memory fails validation before it ever reaches the database.
@@ -17,8 +31,6 @@ export class MemoryError extends Error {
 export const MIN_IMPORTANCE = 0;
 export const MAX_IMPORTANCE = 1;
 
-/** Hard ceiling on stored content so a runaway write can't bloat the db. */
-export const MAX_CONTENT_LENGTH = 100_000;
 /** Hard ceiling on a single tag, and on the number of tags per memory. */
 export const MAX_TAG_LENGTH = 256;
 export const MAX_TAGS = 64;
@@ -41,9 +53,6 @@ export interface QueryOptions {
     /** Only return memories carrying ALL of these tags. */
     tags?: string[];
 }
-
-export const DEFAULT_LIMIT = 100;
-export const MAX_LIMIT = 1000;
 
 /** A memory paired with its cosine similarity to a query vector, from
  *  {@link MemoryStore.semanticSearch}. Score is in roughly [-1, 1], higher =
@@ -187,6 +196,86 @@ const MIGRATIONS: ReadonlyArray<{ name: string; up: (db: DatabaseSync) => void }
             `);
         },
     },
+    {
+        // The append-only event log: the raw substrate every runtime signal
+        // (message, tool_call, tool_result, recall, dream, ...) is written to.
+        // It lives in the SAME database file and under the SAME user_version as
+        // `memory`, so it ships as a migration in this one authoritative array
+        // rather than a second migration runner (two runners on one user_version
+        // would corrupt the version accounting). EventStore calls this same
+        // migrate(); MemoryStore opening an events-migrated file is a no-op.
+        //
+        // It deliberately mirrors `memory`'s FTS5 + vector indexing exactly: an
+        // external-content porter-stemmed FTS index over `content`, kept in sync
+        // by an insert/delete/update trigger trio, and a selective vector table
+        // keyed by event id with cascade-delete and content-update invalidation.
+        // Events are append-only at the API layer, so the UPDATE triggers should
+        // never fire in practice; we keep them anyway (belt-and-braces, and they
+        // cost nothing if no UPDATE ever runs) so the indexes can never serve a
+        // row that doesn't match the current content.
+        name: "create event log table with fts and vector indices",
+        up(db) {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS events (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts          INTEGER NOT NULL,
+                    kind        TEXT NOT NULL,
+                    role        TEXT,
+                    content     TEXT NOT NULL,
+                    meta        TEXT,
+                    session     TEXT,
+                    correlation TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_kind ON events (kind);
+                CREATE INDEX IF NOT EXISTS idx_events_session ON events (session);
+
+                -- External-content FTS5 over content (same pattern as memory_fts):
+                -- the porter stemmer folds morphological variants together so a
+                -- lexical replay query is robust to exact wording.
+                CREATE VIRTUAL TABLE event_fts USING fts5(
+                    content,
+                    content='events',
+                    content_rowid='id',
+                    tokenize='porter'
+                );
+
+                CREATE TRIGGER event_ai AFTER INSERT ON events BEGIN
+                    INSERT INTO event_fts (rowid, content) VALUES (new.id, new.content);
+                END;
+                CREATE TRIGGER event_ad AFTER DELETE ON events BEGIN
+                    INSERT INTO event_fts (event_fts, rowid, content)
+                        VALUES ('delete', old.id, old.content);
+                END;
+                CREATE TRIGGER event_au AFTER UPDATE ON events BEGIN
+                    INSERT INTO event_fts (event_fts, rowid, content)
+                        VALUES ('delete', old.id, old.content);
+                    INSERT INTO event_fts (rowid, content) VALUES (new.id, new.content);
+                END;
+
+                -- Selective vector index (same pattern as memory_vec): the log is
+                -- total, the vector index is opt-in. Most events (tool_result,
+                -- system turns) never get a vector, which keeps the linear cosine
+                -- scan from becoming the bottleneck. Rows are written explicitly
+                -- by the application, never by an insert trigger.
+                CREATE TABLE IF NOT EXISTS event_vec (
+                    rowid INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+                    dim   INTEGER NOT NULL,
+                    vec   BLOB NOT NULL
+                );
+
+                CREATE TRIGGER event_vec_ad AFTER DELETE ON events BEGIN
+                    DELETE FROM event_vec WHERE rowid = old.id;
+                END;
+
+                CREATE TRIGGER event_vec_au AFTER UPDATE OF content ON events
+                    WHEN new.content <> old.content
+                BEGIN
+                    DELETE FROM event_vec WHERE rowid = old.id;
+                END;
+            `);
+        },
+    },
 ];
 
 /** The schema version this build of the code expects. */
@@ -200,8 +289,13 @@ export const SCHEMA_VERSION = MIGRATIONS.length;
  * Refuses to touch a database whose version is *newer* than this code knows
  * about: that means an older binary opened a future schema, and proceeding
  * could corrupt it. Fail loudly instead.
+ *
+ * Exported so sibling stores in the same database file (see {@link EventStore})
+ * share this one migration runner rather than forking a second: there is a
+ * single `user_version` per file, and two runners racing to advance it would
+ * corrupt the version accounting.
  */
-function migrate(db: DatabaseSync): number {
+export function migrate(db: DatabaseSync): number {
     const row = db.prepare(`PRAGMA user_version`).get() as { user_version: number };
     let version = row.user_version;
 
@@ -769,39 +863,3 @@ export class MemoryStore {
 function serializeTags(tags: string[]): string | null {
     return tags.length ? JSON.stringify(tags) : null;
 }
-
-function clampLimit(limit: number | undefined): number {
-    if (limit === undefined) return DEFAULT_LIMIT;
-    if (!Number.isFinite(limit) || limit <= 0) return DEFAULT_LIMIT;
-    return Math.min(Math.floor(limit), MAX_LIMIT);
-}
-
-/** Escape LIKE wildcards so user text is matched literally (with ESCAPE '\'). */
-function escapeLike(s: string): string {
-    return s.replace(/[\\%_]/g, (c) => `\\${c}`);
-}
-
-/**
- * Turn free text into a safe FTS5 MATCH query.
- *
- * Raw user text can't go straight into MATCH: characters like `"`, `*`, `:`,
- * `(`, `-`, and the bareword `AND`/`OR`/`NOT` are FTS operators and would
- * either throw a syntax error or change the query's meaning. So we extract
- * alphanumeric word tokens, wrap each in double quotes (which makes it a
- * literal string token, neutralizing operators), and OR them together: any
- * shared term makes a memory a candidate, and bm25 sorts by how well it matches.
- *
- * Returns null when the text has no usable tokens, so the caller can treat that
- * as "no query" rather than issuing an empty MATCH (which is itself an error).
- */
-function toFtsQuery(text: string): string | null {
-    if (typeof text !== "string") return null;
-    const tokens = text.toLowerCase().match(/[\p{L}\p{N}]+/gu);
-    if (!tokens || tokens.length === 0) return null;
-    // Dedupe to keep the query compact; cap to bound pathological inputs.
-    const unique = [...new Set(tokens)].slice(0, MAX_FTS_TOKENS);
-    return unique.map((t) => `"${t}"`).join(" OR ");
-}
-
-/** Cap on tokens fed into a single FTS MATCH, to bound a giant prompt. */
-const MAX_FTS_TOKENS = 32;
