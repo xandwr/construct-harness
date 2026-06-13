@@ -61,6 +61,90 @@ export interface StoreOptions {
     wal?: boolean;
 }
 
+/** Raised when the on-disk schema can't be reconciled with this code. */
+export class MigrationError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "MigrationError";
+    }
+}
+
+/**
+ * Ordered schema migrations. Each entry's `up` brings the database from version
+ * `i` to version `i + 1` (1-indexed: MIGRATIONS[0] produces schema version 1).
+ *
+ * Rules that keep this honest:
+ *  - APPEND ONLY. Never edit or reorder a published migration — add a new one.
+ *    Changing history would make already-migrated databases silently wrong.
+ *  - Each `up` runs inside a transaction managed by {@link migrate}; it should
+ *    not BEGIN/COMMIT itself.
+ *  - Migration 1 is written defensively (IF NOT EXISTS) so it adopts pre-
+ *    versioning databases — those created before user_version was tracked
+ *    already have the table and simply advance to version 1 as a no-op.
+ */
+const MIGRATIONS: ReadonlyArray<{ name: string; up: (db: DatabaseSync) => void }> = [
+    {
+        name: "create memory table and indices",
+        up(db) {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    content TEXT NOT NULL,
+                    created INTEGER NOT NULL,
+                    updated INTEGER NOT NULL,
+                    tags TEXT,
+                    importance REAL
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_importance ON memory (importance DESC);
+                CREATE INDEX IF NOT EXISTS idx_memory_created ON memory (created DESC);
+            `);
+        },
+    },
+];
+
+/** The schema version this build of the code expects. */
+export const SCHEMA_VERSION = MIGRATIONS.length;
+
+/**
+ * Bring `db` up to {@link SCHEMA_VERSION}, running each pending migration in its
+ * own transaction and bumping `PRAGMA user_version` as it goes. Returns the
+ * resulting version.
+ *
+ * Refuses to touch a database whose version is *newer* than this code knows
+ * about — that means an older binary opened a future schema, and proceeding
+ * could corrupt it. Fail loudly instead.
+ */
+function migrate(db: DatabaseSync): number {
+    const row = db.prepare(`PRAGMA user_version`).get() as { user_version: number };
+    let version = row.user_version;
+
+    if (version > MIGRATIONS.length) {
+        throw new MigrationError(
+            `database schema version ${version} is newer than this code supports ` +
+                `(max ${MIGRATIONS.length}); upgrade the application`,
+        );
+    }
+
+    for (let target = version + 1; target <= MIGRATIONS.length; target++) {
+        const migration = MIGRATIONS[target - 1];
+        db.exec("BEGIN");
+        try {
+            migration.up(db);
+            // user_version doesn't accept bound params; target is a trusted int.
+            db.exec(`PRAGMA user_version = ${target}`);
+            db.exec("COMMIT");
+        } catch (err) {
+            db.exec("ROLLBACK");
+            throw new MigrationError(
+                `migration ${target} (${migration.name}) failed: ${(err as Error).message}`,
+            );
+        }
+        version = target;
+    }
+
+    return version;
+}
+
 export class Memory {
     id: number;
     content: string;
@@ -208,6 +292,7 @@ function parseTags(raw: string | null): string[] {
 export class MemoryStore {
     private readonly db: DatabaseSync;
     private readonly walEnabled: boolean;
+    private readonly schemaVersion: number;
     private readonly insertStmt;
     private readonly getStmt;
     private readonly updateStmt;
@@ -244,18 +329,7 @@ export class MemoryStore {
             this.walEnabled = false;
         }
 
-        this.db.exec(`
-            CREATE TABLE IF NOT EXISTS memory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                content TEXT NOT NULL,
-                created INTEGER NOT NULL,
-                updated INTEGER NOT NULL,
-                tags TEXT,
-                importance REAL
-            );
-            CREATE INDEX IF NOT EXISTS idx_memory_importance ON memory (importance DESC);
-            CREATE INDEX IF NOT EXISTS idx_memory_created ON memory (created DESC);
-        `);
+        this.schemaVersion = migrate(this.db);
 
         this.insertStmt = this.db.prepare(
             `INSERT INTO memory (content, created, updated, tags, importance)
@@ -406,6 +480,11 @@ export class MemoryStore {
     /** Whether this store is actually running in WAL mode. */
     get wal(): boolean {
         return this.walEnabled;
+    }
+
+    /** The schema version the underlying database was migrated to on open. */
+    get version(): number {
+        return this.schemaVersion;
     }
 
     /**

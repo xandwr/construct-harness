@@ -12,11 +12,14 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import {
     Memory,
     MemoryStore,
     MemoryError,
+    MigrationError,
+    SCHEMA_VERSION,
     MAX_CONTENT_LENGTH,
     MAX_TAGS,
     MAX_TAG_LENGTH,
@@ -428,5 +431,87 @@ test("checkpoint throws on a closed store", () => {
         const store = new MemoryStore(join(dir, "closed.sqlite"));
         store.close();
         assert.throws(() => store.checkpoint(), MemoryError);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Schema migrations
+// ---------------------------------------------------------------------------
+
+test("a fresh store is migrated to SCHEMA_VERSION", () => {
+    const store = new MemoryStore(":memory:");
+    assert.equal(store.version, SCHEMA_VERSION);
+    assert.ok(SCHEMA_VERSION >= 1);
+    store.close();
+});
+
+test("opening writes user_version to the database file", () => {
+    withTempDir((dir) => {
+        const path = join(dir, "ver.sqlite");
+        const store = new MemoryStore(path);
+        store.close();
+
+        const raw = new DatabaseSync(path);
+        const { user_version } = raw.prepare("PRAGMA user_version").get() as {
+            user_version: number;
+        };
+        raw.close();
+        assert.equal(user_version, SCHEMA_VERSION);
+    });
+});
+
+test("adopts a pre-versioning database without losing data", () => {
+    withTempDir((dir) => {
+        const path = join(dir, "legacy.sqlite");
+        // Build a db the way the old code did: full table, but user_version still 0.
+        const raw = new DatabaseSync(path);
+        raw.exec(`
+            CREATE TABLE memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                created INTEGER NOT NULL,
+                updated INTEGER NOT NULL,
+                tags TEXT,
+                importance REAL
+            );
+        `);
+        raw.exec("INSERT INTO memory (content, created, updated) VALUES ('legacy', 1, 1)");
+        const { user_version } = raw.prepare("PRAGMA user_version").get() as {
+            user_version: number;
+        };
+        assert.equal(user_version, 0);
+        raw.close();
+
+        // Opening through the store adopts it: bumps version, keeps the row.
+        const store = new MemoryStore(path);
+        assert.equal(store.version, SCHEMA_VERSION);
+        assert.equal(store.count(), 1);
+        assert.equal(store.all()[0]?.content, "legacy");
+        store.close();
+    });
+});
+
+test("reopening an already-migrated store is a no-op at the same version", () => {
+    withTempDir((dir) => {
+        const path = join(dir, "again.sqlite");
+        const a = new MemoryStore(path);
+        a.save(mem("kept"));
+        a.close();
+
+        const b = new MemoryStore(path);
+        assert.equal(b.version, SCHEMA_VERSION);
+        assert.equal(b.count(), 1);
+        b.close();
+    });
+});
+
+test("refuses to open a database newer than the code supports", () => {
+    withTempDir((dir) => {
+        const path = join(dir, "future.sqlite");
+        const raw = new DatabaseSync(path);
+        raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 100}`);
+        raw.close();
+
+        assert.throws(() => new MemoryStore(path), MigrationError);
     });
 });

@@ -2,14 +2,23 @@ import { RoleType, type Message, type ToolDef } from "./types.ts";
 import { AnthropicClient } from "./bridge/anthropic.ts";
 import { runLoop } from "./bridge/loop.ts";
 import type { ModelClient } from "./bridge/types.ts";
+import { MemoryStore } from "./memory.ts";
+import { memoryTools, recallContext } from "./memoryTools.ts";
 
-const system: Message = {
-    sender: { role: RoleType.System },
-    timestamp: Date.now(),
-    content: [
-        { kind: "text", text: "You are a terse assistant. Use tools when asked about weather." },
-    ],
-};
+const BASE_SYSTEM =
+    "You are a terse assistant. Use tools when asked about weather. " +
+    "Save durable facts and preferences with memory_save, and recall them with memory_recall.";
+
+/** Build the system turn, folding in any memories worth recalling up front. */
+function buildSystem(store: MemoryStore): Message {
+    const recalled = recallContext(store);
+    const text = recalled ? `${BASE_SYSTEM}\n\n${recalled}` : BASE_SYSTEM;
+    return {
+        sender: { role: RoleType.System },
+        timestamp: Date.now(),
+        content: [{ kind: "text", text }],
+    };
+}
 
 const ask: Message = {
     sender: { role: RoleType.User },
@@ -41,17 +50,28 @@ async function main() {
     }
 
     const client: ModelClient = new AnthropicClient({ model: process.env.MODEL });
+    const store = new MemoryStore(process.env.MEMORY_DB ?? "db.sqlite");
 
-    // Run the agentic loop: model → tool → model, all in core types.
-    const { final, turns } = await runLoop(client, {
-        messages: [system, ask],
-        tools: [weatherTool],
-    });
+    try {
+        // Inject what we already know, and let the model read/write memory.
+        const system = buildSystem(store);
+        const tools: ToolDef[] = [weatherTool, ...memoryTools(store)];
 
-    for (const part of final.message.content) {
-        if (part.kind === "text") process.stdout.write(part.text);
+        // Run the agentic loop: model → tool → model, all in core types.
+        const { final, turns } = await runLoop(client, {
+            messages: [system, ask],
+            tools,
+        });
+
+        for (const part of final.message.content) {
+            if (part.kind === "text") process.stdout.write(part.text);
+        }
+        console.log(
+            `\n[${final.stopReason}] ${turns} turn(s), ${final.usage.outputTokens} out tokens`,
+        );
+    } finally {
+        store.close();
     }
-    console.log(`\n[${final.stopReason}] ${turns} turn(s), ${final.usage.outputTokens} out tokens`);
 }
 
 main().catch((err) => {

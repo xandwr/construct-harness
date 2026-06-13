@@ -1,0 +1,229 @@
+/**
+ * Tests for the memory tool bridge ({@link memoryTools}, {@link recallContext}).
+ *
+ * These exercise the tools two ways: directly (calling each `ToolDef.run` with
+ * an args bag, the way the loop would) and through {@link runLoop} driven by the
+ * scripted {@link FakeClient}, which proves they're actually dispatchable and
+ * that results flow back as `tool_result` parts.
+ */
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+import { MemoryStore, Memory } from "../src/memory.ts";
+import { memoryTools, recallContext, DEFAULT_RECALL_LIMIT } from "../src/memoryTools.ts";
+import { runLoop } from "../src/bridge/loop.ts";
+import { RoleType } from "../src/types.ts";
+import type { Message, ToolDef, ToolResultPart } from "../src/types.ts";
+import { FakeClient, callTurn, textTurn } from "./helpers/fakeClient.ts";
+
+function freshStore(): MemoryStore {
+    return new MemoryStore(":memory:");
+}
+
+/** Find a tool by name from the factory output. */
+function tool(tools: ToolDef[], name: string): ToolDef {
+    const t = tools.find((x) => x.name === name);
+    assert.ok(t, `expected a tool named ${name}`);
+    return t;
+}
+
+const user = (text: string): Message => ({
+    sender: { role: RoleType.User },
+    timestamp: 0,
+    content: [{ kind: "text", text }],
+});
+
+function toolResults(messages: Message[]): ToolResultPart[] {
+    return messages
+        .flatMap((m) => m.content)
+        .filter((p): p is ToolResultPart => p.kind === "tool_result");
+}
+
+// ---------------------------------------------------------------------------
+// memory_save
+// ---------------------------------------------------------------------------
+
+test("memory_save persists a memory and returns its view", async () => {
+    const store = freshStore();
+    const save = tool(memoryTools(store), "memory_save");
+    const res = (await save.run({
+        content: "user prefers dark mode",
+        tags: ["pref"],
+        importance: 0.8,
+    })) as { saved: boolean; memory: { id: number; content: string } };
+
+    assert.equal(res.saved, true);
+    assert.ok(res.memory.id > 0);
+    assert.equal(store.count(), 1);
+    assert.equal(store.get(res.memory.id)?.content, "user prefers dark mode");
+    store.close();
+});
+
+test("memory_save reports validation failures instead of throwing", async () => {
+    const store = freshStore();
+    const save = tool(memoryTools(store), "memory_save");
+    const res = (await save.run({ content: "   " })) as { saved: boolean; error?: string };
+    assert.equal(res.saved, false);
+    assert.match(res.error ?? "", /empty/);
+    assert.equal(store.count(), 0);
+    store.close();
+});
+
+test("memory_save ignores a non-array tags value rather than crashing", async () => {
+    const store = freshStore();
+    const save = tool(memoryTools(store), "memory_save");
+    const res = (await save.run({ content: "hi", tags: "not-an-array" })) as { saved: boolean };
+    assert.equal(res.saved, true);
+    assert.deepEqual(store.all()[0]?.tags, []);
+    store.close();
+});
+
+// ---------------------------------------------------------------------------
+// memory_recall
+// ---------------------------------------------------------------------------
+
+test("memory_recall searches by query, most relevant first", async () => {
+    const store = freshStore();
+    store.save(new Memory({ content: "likes oat milk", importance: 0.2 }));
+    store.save(new Memory({ content: "allergic to oat", importance: 0.9 }));
+    store.save(new Memory({ content: "unrelated" }));
+
+    const recall = tool(memoryTools(store), "memory_recall");
+    const res = (await recall.run({ query: "oat" })) as {
+        count: number;
+        memories: { content: string }[];
+    };
+    assert.equal(res.count, 2);
+    assert.equal(res.memories[0].content, "allergic to oat"); // higher importance first
+    store.close();
+});
+
+test("memory_recall with no query lists recent/important memories", async () => {
+    const store = freshStore();
+    store.save(new Memory({ content: "a" }));
+    store.save(new Memory({ content: "b" }));
+    const recall = tool(memoryTools(store), "memory_recall");
+    const res = (await recall.run({})) as { count: number };
+    assert.equal(res.count, 2);
+    store.close();
+});
+
+test("memory_recall filters by tags", async () => {
+    const store = freshStore();
+    store.save(new Memory({ content: "work thing", tags: ["work"] }));
+    store.save(new Memory({ content: "home thing", tags: ["home"] }));
+    const recall = tool(memoryTools(store), "memory_recall");
+    const res = (await recall.run({ tags: ["work"] })) as { memories: { content: string }[] };
+    assert.deepEqual(
+        res.memories.map((m) => m.content),
+        ["work thing"],
+    );
+    store.close();
+});
+
+// ---------------------------------------------------------------------------
+// memory_forget
+// ---------------------------------------------------------------------------
+
+test("memory_forget deletes by id and reports the outcome", async () => {
+    const store = freshStore();
+    const saved = store.save(new Memory({ content: "delete me" }));
+    const forget = tool(memoryTools(store), "memory_forget");
+
+    const hit = (await forget.run({ id: saved.id })) as { forgotten: boolean };
+    assert.equal(hit.forgotten, true);
+    assert.equal(store.count(), 0);
+
+    const miss = (await forget.run({ id: saved.id })) as { forgotten: boolean };
+    assert.equal(miss.forgotten, false);
+    store.close();
+});
+
+test("memory_forget rejects a non-numeric id", async () => {
+    const store = freshStore();
+    const forget = tool(memoryTools(store), "memory_forget");
+    const res = (await forget.run({ id: "nope" })) as { forgotten: boolean; error?: string };
+    assert.equal(res.forgotten, false);
+    assert.match(res.error ?? "", /finite number/);
+    store.close();
+});
+
+// ---------------------------------------------------------------------------
+// recallContext
+// ---------------------------------------------------------------------------
+
+test("recallContext returns null for an empty store", () => {
+    const store = freshStore();
+    assert.equal(recallContext(store), null);
+    store.close();
+});
+
+test("recallContext renders memories with id and tags", () => {
+    const store = freshStore();
+    const saved = store.save(new Memory({ content: "remember this", tags: ["x", "y"] }));
+    const text = recallContext(store);
+    assert.ok(text);
+    assert.match(text, /Relevant things you remember:/);
+    assert.match(text, new RegExp(`#${saved.id}`));
+    assert.match(text, /\[x, y\]/);
+    assert.match(text, /remember this/);
+    store.close();
+});
+
+test("recallContext honors its limit", () => {
+    const store = freshStore();
+    for (let i = 0; i < DEFAULT_RECALL_LIMIT + 5; i++) {
+        store.save(new Memory({ content: `m${i}`, created: i }));
+    }
+    const text = recallContext(store, 3);
+    assert.ok(text);
+    assert.equal(text.split("\n").length - 1, 3); // 1 header line + 3 bullets
+    store.close();
+});
+
+// ---------------------------------------------------------------------------
+// Integration through the loop
+// ---------------------------------------------------------------------------
+
+test("the loop can dispatch memory_save and feed the result back", async () => {
+    const store = freshStore();
+    const tools = memoryTools(store);
+    const client = new FakeClient([
+        callTurn("c1", "memory_save", { content: "loop-saved fact", importance: 0.5 }),
+        textTurn("done"),
+    ]);
+
+    const res = await runLoop(client, { messages: [user("remember something")], tools });
+
+    assert.equal(res.turns, 2);
+    assert.equal(store.count(), 1);
+    assert.equal(store.all()[0]?.content, "loop-saved fact");
+
+    // The save result came back to the model as a non-error tool_result.
+    const [result] = toolResults(res.messages);
+    assert.equal(result.callId, "c1");
+    assert.notEqual(result.isError, true);
+    assert.equal((result.result as { saved: boolean }).saved, true);
+    store.close();
+});
+
+test("the loop surfaces a save validation failure as a non-error result", async () => {
+    const store = freshStore();
+    const tools = memoryTools(store);
+    const client = new FakeClient([
+        callTurn("c1", "memory_save", { content: "  " }),
+        textTurn("ok"),
+    ]);
+
+    const res = await runLoop(client, { messages: [user("save blank")], tools });
+
+    // The tool handled the bad input itself, so it's a normal result the model
+    // can read — not a thrown error that aborts the call.
+    const [result] = toolResults(res.messages);
+    assert.equal(result.callId, "c1");
+    assert.notEqual(result.isError, true);
+    assert.equal((result.result as { saved: boolean }).saved, false);
+    assert.equal(store.count(), 0);
+    store.close();
+});
