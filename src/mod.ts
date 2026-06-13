@@ -36,5 +36,8 @@ export * from "./session.ts";
 export * from "./orchestrate.ts";
 export * from "./critics.ts";
 
+// Dreaming: generating disposable Constructs during downtime.
+export * from "./dreaming.ts";
+
 // The interactive runner, for embedding a REPL in your own entry point.
 export * from "./repl.ts";
