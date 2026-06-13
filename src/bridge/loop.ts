@@ -16,7 +16,7 @@ import { compactConversation } from "../compaction.ts";
 import type { CompactionOptions } from "../compaction.ts";
 import { UsageTracker, estimateTokens } from "../usage.ts";
 import type { CumulativeUsage } from "../usage.ts";
-import type { GenerateParams, GenerateResult, ModelClient } from "./types.ts";
+import type { CoreDelta, GenerateParams, GenerateResult, ModelClient } from "./types.ts";
 
 export interface RunLoopParams extends GenerateParams {
     /** Hard cap on model turns, to bound runaway tool loops. Default 10. */
@@ -157,6 +157,54 @@ async function runTool(call: ToolCallPart, tools: Map<string, ToolDef>): Promise
 }
 
 /**
+ * Run the compaction gate for one iteration: if compaction is configured and the
+ * estimate exceeds the threshold, summarize older turns. Returns the (possibly
+ * rewritten) message list and whether it actually compacted, folding the
+ * summarizer's usage into `usage`. Shared by both the buffered and streaming
+ * loops so the gate behaves identically in each.
+ */
+async function compactGate(
+    client: ModelClient,
+    messages: Message[],
+    params: RunLoopParams,
+    usage: UsageTracker,
+): Promise<{ messages: Message[]; compacted: boolean }> {
+    if (!params.compaction || estimateTokens(messages) <= params.compaction.thresholdTokens) {
+        return { messages, compacted: false };
+    }
+    const compacted = await compactConversation(client, messages, params.compaction);
+    if (compacted.usage) usage.add(compacted.usage);
+    return {
+        messages: compacted.compacted ? compacted.messages : messages,
+        compacted: compacted.compacted,
+    };
+}
+
+/**
+ * Run the tools a completed assistant turn requested and build the `user` turn
+ * of results to append. Returns null when the turn isn't a clean `tool_use` stop
+ * or carries no calls — in which case the loop should terminate. A `max_tokens`
+ * turn may carry a half-emitted tool_call whose args were cut off; treating only
+ * a clean `tool_use` stop as actionable keeps us from dispatching it. Shared by
+ * both loops.
+ */
+async function runToolTurn(
+    result: GenerateResult,
+    toolIndex: Map<string, ToolDef>,
+): Promise<Message | null> {
+    if (result.stopReason !== "tool_use") return null;
+    const calls = toolCalls(result.message);
+    if (calls.length === 0) return null;
+
+    const results = await Promise.all(calls.map((c) => runTool(c, toolIndex)));
+    return {
+        sender: { role: RoleType.User },
+        timestamp: Date.now(),
+        content: results,
+    };
+}
+
+/**
  * Drive a model + tools to completion.
  *
  * Each iteration calls {@link ModelClient.generate}, appends the assistant
@@ -178,18 +226,12 @@ export async function runLoop(client: ModelClient, params: RunLoopParams): Promi
 
     while (turns < maxTurns) {
         // Gate: before sending, compact the persistent conversation if our
-        // estimate says it's grown past the threshold. We mutate `messages`
+        // estimate says it's grown past the threshold. We reassign `messages`
         // itself (not just the outgoing copy) so the compaction carries forward
-        // to every later turn — the whole point for a long-lived session. The
-        // summarizer's own turn is counted toward this run's usage.
-        if (params.compaction && estimateTokens(messages) > params.compaction.thresholdTokens) {
-            const compacted = await compactConversation(client, messages, params.compaction);
-            if (compacted.usage) usage.add(compacted.usage);
-            if (compacted.compacted) {
-                messages = compacted.messages;
-                compactions++;
-            }
-        }
+        // to every later turn — the whole point for a long-lived session.
+        const gated = await compactGate(client, messages, params, usage);
+        messages = gated.messages;
+        if (gated.compacted) compactions++;
 
         // Fold this turn's passive context (e.g. the current time) onto the
         // outgoing messages only — `messages` itself, and so the conversation we
@@ -201,23 +243,9 @@ export async function runLoop(client: ModelClient, params: RunLoopParams): Promi
         usage.add(result.usage);
         messages.push(result.message);
 
-        // Only act on tool calls the provider actually signalled with
-        // `tool_use`. A turn truncated by `max_tokens` may *contain* a
-        // half-emitted tool_call part whose args were cut off; running it would
-        // dispatch a malformed call. Treat anything that isn't a clean
-        // `tool_use` stop as a terminal turn and let the caller inspect
-        // `final.stopReason`.
-        if (result.stopReason !== "tool_use") break;
-
-        const calls = toolCalls(result.message);
-        if (calls.length === 0) break;
-
-        const results = await Promise.all(calls.map((c) => runTool(c, toolIndex)));
-        messages.push({
-            sender: { role: RoleType.User },
-            timestamp: Date.now(),
-            content: results,
-        });
+        const toolTurn = await runToolTurn(result, toolIndex);
+        if (!toolTurn) break;
+        messages.push(toolTurn);
 
         // If that was the last turn we're allowed and the model still wanted
         // tools, we're cutting it off rather than letting it finish. Record that
@@ -233,5 +261,125 @@ export async function runLoop(client: ModelClient, params: RunLoopParams): Promi
         usage: usage.totals(),
         stoppedAtMaxTurns,
         compactions,
+    };
+}
+
+// ── Streaming loop ────────────────────────────────────────────────────────────
+
+/**
+ * Events a streaming run emits, in core vocabulary. A superset of the bridge's
+ * {@link CoreDelta}: the model's own deltas pass through unchanged (so a consumer
+ * can print text as it arrives), and the loop adds events for the things the
+ * bridge can't know about — compaction and the tool lifecycle. Every run ends
+ * with exactly one `loop_done` carrying the full {@link RunLoopResult}.
+ */
+export type LoopEvent =
+    | CoreDelta
+    | { kind: "compacted"; summarizedInto: number; turn: number }
+    | { kind: "tool_start"; id: string; name: string; args: unknown }
+    | { kind: "tool_end"; id: string; name: string; result: unknown; isError: boolean }
+    | { kind: "turn_start"; turn: number }
+    | { kind: "loop_done"; result: RunLoopResult };
+
+/**
+ * The streaming counterpart to {@link runLoop}.
+ *
+ * Drives {@link ModelClient.stream} instead of `generate`, yielding
+ * {@link LoopEvent}s as they happen so a caller (e.g. an interactive REPL) can
+ * render text token-by-token and show tool activity live. Compaction, usage
+ * accounting, the tool loop, and the max-turns cut-off all behave exactly as in
+ * {@link runLoop} — this is the same control flow, observed.
+ *
+ * The model's `stream` ends each turn with a `done` delta carrying the assembled
+ * {@link GenerateResult}; we use that as the turn result (it never crosses to the
+ * consumer as a `done` — the consumer gets per-turn text deltas and a single
+ * terminal `loop_done`). Tools requested by a turn are run between turns, with
+ * `tool_start`/`tool_end` bracketing each.
+ */
+export async function* runLoopStream(
+    client: ModelClient,
+    params: RunLoopParams,
+): AsyncGenerator<LoopEvent, void, void> {
+    const maxTurns = params.maxTurns ?? 10;
+    const toolIndex = indexTools(params.tools);
+    const context = params.context ?? [];
+
+    let messages = [...params.messages];
+    const usage = new UsageTracker();
+    let final: GenerateResult | undefined;
+    let turns = 0;
+    let stoppedAtMaxTurns = false;
+    let compactions = 0;
+
+    while (turns < maxTurns) {
+        const gated = await compactGate(client, messages, params, usage);
+        messages = gated.messages;
+        if (gated.compacted) {
+            compactions++;
+            yield { kind: "compacted", summarizedInto: messages.length, turn: turns };
+        }
+
+        yield { kind: "turn_start", turn: turns };
+
+        const outgoing = applyContext(messages, context, turns);
+
+        // Consume the model stream, passing its deltas straight through and
+        // capturing the terminal `done` as this turn's result.
+        let result: GenerateResult | undefined;
+        for await (const delta of client.stream({ ...params, messages: outgoing })) {
+            if (delta.kind === "done") {
+                result = delta.result;
+            } else {
+                yield delta;
+            }
+        }
+        if (!result) {
+            throw new Error("runLoopStream: model stream ended without a done delta");
+        }
+
+        turns++;
+        final = result;
+        usage.add(result.usage);
+        messages.push(result.message);
+
+        if (result.stopReason !== "tool_use") break;
+        const calls = toolCalls(result.message);
+        if (calls.length === 0) break;
+
+        // Run the requested tools, bracketing each with start/end events so the
+        // consumer can show activity. Announce all calls first, then dispatch
+        // them in parallel (matching runLoop), reporting each as it settles.
+        for (const call of calls) {
+            yield { kind: "tool_start", id: call.id, name: call.name, args: call.args };
+        }
+        const settled = await Promise.all(
+            calls.map(async (call) => ({ call, part: await runTool(call, toolIndex) })),
+        );
+        const resultParts: ContentPart[] = [];
+        for (const { call, part } of settled) {
+            resultParts.push(part);
+            const isError = part.kind === "tool_result" && part.isError === true;
+            const value = part.kind === "tool_result" ? part.result : undefined;
+            yield { kind: "tool_end", id: call.id, name: call.name, result: value, isError };
+        }
+        messages.push({
+            sender: { role: RoleType.User },
+            timestamp: Date.now(),
+            content: resultParts,
+        });
+
+        if (turns >= maxTurns) stoppedAtMaxTurns = true;
+    }
+
+    yield {
+        kind: "loop_done",
+        result: {
+            messages,
+            final: final!,
+            turns,
+            usage: usage.totals(),
+            stoppedAtMaxTurns,
+            compactions,
+        },
     };
 }

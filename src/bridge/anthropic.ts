@@ -21,6 +21,10 @@ import type {
     StopReason,
     Usage,
 } from "./types.ts";
+import { HarnessError, isRetryableKind } from "./errors.ts";
+import type { ErrorKind } from "./errors.ts";
+import { withRetry } from "./retry.ts";
+import type { RetryOptions } from "./retry.ts";
 
 /** Default model + token ceilings, per the Claude API guidance. */
 const DEFAULT_MODEL = "claude-opus-4-8";
@@ -198,6 +202,100 @@ function toResult(msg: Anthropic.Message): GenerateResult {
     };
 }
 
+// ── Error classification ──────────────────────────────────────────────────────
+
+/** Anthropic's "I'm overloaded" status, which the standard fetch error classes
+ *  don't have a dedicated subclass for. */
+const HTTP_OVERLOADED = 529;
+
+/** Read a `retry-after` hint from response headers, in ms. The API may send
+ *  `retry-after-ms` (milliseconds) or the standard `retry-after` (seconds);
+ *  prefer the millisecond form. Returns undefined when neither is present or
+ *  parseable. */
+function retryAfterMsFromHeaders(headers: unknown): number | undefined {
+    if (!headers || typeof (headers as Headers).get !== "function") return undefined;
+    const h = headers as Headers;
+    const ms = h.get("retry-after-ms");
+    if (ms) {
+        const n = Number.parseFloat(ms);
+        if (Number.isFinite(n) && n >= 0) return n;
+    }
+    const secs = h.get("retry-after");
+    if (secs) {
+        const n = Number.parseFloat(secs);
+        if (Number.isFinite(n) && n >= 0) return n * 1000;
+    }
+    return undefined;
+}
+
+/** Map an HTTP status to a neutral {@link ErrorKind}. */
+function kindForStatus(status: number): ErrorKind {
+    if (status === 429) return "rate_limit";
+    if (status === HTTP_OVERLOADED) return "overloaded";
+    if (status === 401 || status === 403) return "auth";
+    if (status === 400 || status === 404 || status === 409 || status === 422) {
+        return "invalid_request";
+    }
+    if (status >= 500) return "server";
+    return "unknown";
+}
+
+/**
+ * Classify any thrown value into a {@link HarnessError}.
+ *
+ * Maps the Anthropic SDK's error classes and HTTP statuses onto the neutral
+ * taxonomy, lifts a `retry-after` hint off the headers when present, and falls
+ * back to `unknown` (non-retryable) for anything unrecognized. Pure and exported
+ * so it can be unit-tested against synthetic SDK errors without a network call.
+ * Already-classified {@link HarnessError}s pass through unchanged.
+ */
+export function classifyAnthropicError(err: unknown): HarnessError {
+    if (err instanceof HarnessError) return err;
+
+    // Caller aborted (AbortController) — not a transport failure, never retried.
+    if (err instanceof Anthropic.APIUserAbortError) {
+        return new HarnessError("request canceled", {
+            kind: "canceled",
+            retryable: false,
+            cause: err,
+        });
+    }
+    // Timeout is a connection error subclass; check it before the parent.
+    if (err instanceof Anthropic.APIConnectionTimeoutError) {
+        return new HarnessError("request timed out", {
+            kind: "timeout",
+            retryable: true,
+            cause: err,
+        });
+    }
+    if (err instanceof Anthropic.APIConnectionError) {
+        return new HarnessError("network error", { kind: "network", retryable: true, cause: err });
+    }
+    // Any HTTP-status APIError: classify by status, then by the body `type`.
+    if (err instanceof Anthropic.APIError && typeof err.status === "number") {
+        let kind = kindForStatus(err.status);
+        // The body type can refine an ambiguous status (e.g. a 500-range
+        // overloaded_error the status alone would call "server").
+        if (err.type === "overloaded_error") kind = "overloaded";
+        if (err.type === "rate_limit_error") kind = "rate_limit";
+        return new HarnessError(err.message || `HTTP ${err.status}`, {
+            kind,
+            retryable: isRetryableKind(kind),
+            retryAfterMs: retryAfterMsFromHeaders(err.headers),
+            status: err.status,
+            providerCode: err.type ?? undefined,
+            cause: err,
+        });
+    }
+
+    const message = err instanceof Error ? err.message : String(err);
+    return new HarnessError(message || "unknown error", {
+        kind: "unknown",
+        retryable: false,
+        cause: err,
+    });
+}
+
 // ── Client ──────────────────────────────────────────────────────────────────
 
 export interface AnthropicClientConfig {
@@ -205,6 +303,14 @@ export interface AnthropicClientConfig {
     apiKey?: string;
     /** Defaults to {@link DEFAULT_MODEL}. */
     model?: string;
+    /**
+     * Harness-level retry policy for `generate` and stream-start. Pass `false`
+     * to disable (the SDK still does its own internal retries); omit for the
+     * defaults in {@link withRetry}. We set the SDK's own `maxRetries` to 0 so
+     * retries aren't applied twice — this layer is the single, observable retry
+     * point, keying off the neutral {@link HarnessError} taxonomy.
+     */
+    retry?: RetryOptions | false;
 }
 
 export class AnthropicClient implements ModelClient {
@@ -213,10 +319,26 @@ export class AnthropicClient implements ModelClient {
     readonly capabilities = ANTHROPIC_CAPABILITIES;
 
     private readonly sdk: Anthropic;
+    private readonly retry: RetryOptions | false;
 
     constructor(config: AnthropicClientConfig = {}) {
-        this.sdk = new Anthropic(config.apiKey ? { apiKey: config.apiKey } : {});
+        // maxRetries: 0 — this client owns retries (see `retry`), so the SDK's
+        // own retry loop would otherwise double up and hide the classified error.
+        this.sdk = new Anthropic({
+            ...(config.apiKey ? { apiKey: config.apiKey } : {}),
+            maxRetries: 0,
+        });
         this.model = config.model ?? DEFAULT_MODEL;
+        this.retry = config.retry ?? {};
+    }
+
+    /** Run `fn` under the configured retry policy, mapping every failure to a
+     *  {@link HarnessError} first so the policy sees the neutral `retryable`
+     *  verdict and the caller never receives a raw SDK error. */
+    private async run<T>(fn: () => Promise<T>): Promise<T> {
+        const attempt = () => fn().catch((err) => Promise.reject(classifyAnthropicError(err)));
+        if (this.retry === false) return attempt();
+        return withRetry(attempt, this.retry);
     }
 
     /** Build the shared request body from neutral params + Anthropic options. */
@@ -257,43 +379,66 @@ export class AnthropicClient implements ModelClient {
 
     async generate(params: GenerateParams): Promise<GenerateResult> {
         const req = this.buildRequest(params, DEFAULT_MAX_TOKENS);
-        const msg = await this.sdk.messages.create({ ...req, stream: false });
+        const msg = await this.run(() => this.sdk.messages.create({ ...req, stream: false }));
         return toResult(msg);
     }
 
     async *stream(params: GenerateParams): AsyncIterable<CoreDelta> {
         const req = this.buildRequest(params, DEFAULT_STREAM_MAX_TOKENS);
-        const stream = this.sdk.messages.stream(req);
 
-        // Anthropic's input_json_delta events identify their block by `index`,
-        // not by tool-use id. Track index→id from the block-start events so we
-        // can stamp each arg fragment with the call it belongs to.
+        // `messages.stream()` returns synchronously; the connection (and any
+        // rate-limit/overload/network failure) surfaces on first iteration. So
+        // retrying around the call itself would catch nothing. Instead, retry
+        // the act of opening the stream *and pulling its first event* as one
+        // unit: that's the window where a retry is safe (no delta emitted yet).
+        // Once the first event is in hand, a later mid-stream failure can't be
+        // retried without duplicating emitted text — it's classified and
+        // rethrown below for the loop/REPL to handle.
         const toolIdByIndex = new Map<number, string>();
+        // Open the stream and pull its first event as one retried unit, holding
+        // onto the single iterator so the rest of the loop continues from it
+        // (not a fresh one).
+        const { stream, iterator, first } = await this.run(async () => {
+            const s = this.sdk.messages.stream(req);
+            const it = s[Symbol.asyncIterator]();
+            const r = await it.next();
+            return { stream: s, iterator: it, first: r };
+        });
 
-        for await (const event of stream) {
-            if (event.type === "content_block_start") {
-                const block = event.content_block;
-                if (block.type === "tool_use") {
-                    toolIdByIndex.set(event.index, block.id);
-                    yield { kind: "tool_call_start", id: block.id, name: block.name };
-                }
-            } else if (event.type === "content_block_delta") {
-                const delta = event.delta;
-                if (delta.type === "text_delta") {
-                    yield { kind: "text", text: delta.text };
-                } else if (delta.type === "thinking_delta") {
-                    yield { kind: "thinking", text: delta.thinking };
-                } else if (delta.type === "input_json_delta") {
-                    yield {
-                        kind: "tool_call_args",
-                        id: toolIdByIndex.get(event.index) ?? "",
-                        partialJson: delta.partial_json,
-                    };
+        try {
+            // Replay the already-pulled first event, then drain the rest.
+            for (let r = first; !r.done; r = await iterator.next()) {
+                const event = r.value;
+                if (event.type === "content_block_start") {
+                    const block = event.content_block;
+                    if (block.type === "tool_use") {
+                        toolIdByIndex.set(event.index, block.id);
+                        yield { kind: "tool_call_start", id: block.id, name: block.name };
+                    }
+                } else if (event.type === "content_block_delta") {
+                    const delta = event.delta;
+                    if (delta.type === "text_delta") {
+                        yield { kind: "text", text: delta.text };
+                    } else if (delta.type === "thinking_delta") {
+                        yield { kind: "thinking", text: delta.thinking };
+                    } else if (delta.type === "input_json_delta") {
+                        yield {
+                            kind: "tool_call_args",
+                            id: toolIdByIndex.get(event.index) ?? "",
+                            partialJson: delta.partial_json,
+                        };
+                    }
                 }
             }
-        }
 
-        const final = await stream.finalMessage();
-        yield { kind: "done", result: toResult(final) };
+            const final = await stream.finalMessage();
+            yield { kind: "done", result: toResult(final) };
+        } catch (err) {
+            // A failure once the stream is underway can't be retried here without
+            // re-emitting text the consumer already saw, but it must still reach
+            // the caller as a classified HarnessError rather than a raw SDK
+            // error. The loop/REPL above decides whether to restart the turn.
+            throw classifyAnthropicError(err);
+        }
     }
 }

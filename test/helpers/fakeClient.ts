@@ -28,7 +28,7 @@ const NO_CAPS: ProviderCapabilities = {
     effort: false,
     promptCaching: false,
     serverTools: false,
-    streaming: false,
+    streaming: true,
 };
 
 /** Convenience: a turn that calls one tool. */
@@ -77,9 +77,49 @@ export class FakeClient implements ModelClient {
         };
     }
 
-    // The loop under test uses only `generate`; `stream` is required by the
-    // interface but unused here.
-    async *stream(): AsyncIterable<CoreDelta> {
-        throw new Error("FakeClient.stream is not implemented");
+    /**
+     * Stream the next scripted turn as deltas: text parts arrive as `text`
+     * deltas, tool calls as a `tool_call_start` + a single `tool_call_args` with
+     * the args as JSON, and the turn ends with the same `done` result `generate`
+     * would return. Records params in `calls` too, so streaming tests can assert
+     * on what the loop sent.
+     */
+    async *stream(params: GenerateParams): AsyncIterable<CoreDelta> {
+        this.calls.push(params);
+        const turn = this.script.shift();
+        if (!turn) {
+            throw new Error("FakeClient: stream called more times than scripted");
+        }
+        const hasToolCall = turn.content.some((p) => p.kind === "tool_call");
+        const stopReason = turn.stopReason ?? (hasToolCall ? "tool_use" : "end_turn");
+
+        for (const part of turn.content) {
+            if (part.kind === "text") {
+                yield { kind: "text", text: part.text };
+            } else if (part.kind === "tool_call") {
+                yield { kind: "tool_call_start", id: part.id, name: part.name };
+                yield {
+                    kind: "tool_call_args",
+                    id: part.id,
+                    partialJson: JSON.stringify(part.args ?? {}),
+                };
+            }
+        }
+
+        const message: Message = {
+            sender: { role: RoleType.Agent, name: this.model },
+            timestamp: 0,
+            content: turn.content,
+        };
+        yield {
+            kind: "done",
+            result: {
+                message,
+                stopReason,
+                usage: { inputTokens: 1, outputTokens: 1 },
+                model: this.model,
+                raw: null,
+            },
+        };
     }
 }

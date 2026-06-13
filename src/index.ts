@@ -1,67 +1,14 @@
-import { RoleType, type Message, type ToolDef } from "./types.ts";
 import { AnthropicClient } from "./bridge/anthropic.ts";
-import { runLoop } from "./bridge/loop.ts";
 import type { ModelClient } from "./bridge/types.ts";
 import { MemoryStore } from "./memory.ts";
-import { memoryTools, recallContext } from "./memoryTools.ts";
 import { OpenAIEmbedder, EmbeddingError, type Embedder } from "./embeddings.ts";
-import { temporalContext } from "./context.ts";
+import { Session } from "./session.ts";
+import { runRepl } from "./repl.ts";
 
 const BASE_SYSTEM =
-    "You are a terse assistant. Use tools when asked about weather. " +
-    "Save durable facts and preferences with memory_save, and recall them with memory_recall.";
-
-/** Concatenate the text parts of a message — the turn's plain-text content. */
-function messageText(message: Message): string {
-    return message.content
-        .filter((p): p is Extract<typeof p, { kind: "text" }> => p.kind === "text")
-        .map((p) => p.text)
-        .join(" ");
-}
-
-/**
- * Build the system turn, folding in any memories worth recalling up front.
- * Ranks recall against `userTurn` so we inject what's relevant to this turn,
- * not just the globally most-important memories.
- */
-async function buildSystem(
-    store: MemoryStore,
-    embedder: Embedder | undefined,
-    userTurn?: Message,
-): Promise<Message> {
-    const recalled = await recallContext(store, {
-        query: userTurn ? messageText(userTurn) : undefined,
-        embedder,
-    });
-    const text = recalled ? `${BASE_SYSTEM}\n\n${recalled}` : BASE_SYSTEM;
-    return {
-        sender: { role: RoleType.System },
-        timestamp: Date.now(),
-        content: [{ kind: "text", text }],
-    };
-}
-
-const ask: Message = {
-    sender: { role: RoleType.User },
-    timestamp: Date.now(),
-    content: [
-        { kind: "text", text: "What's the weather in Dublin? Then tell me in one sentence." },
-    ],
-};
-
-const weatherTool: ToolDef = {
-    name: "get_weather",
-    description: "Get the current weather for a city.",
-    parameters: {
-        type: "object",
-        properties: { city: { type: "string", description: "City name" } },
-        required: ["city"],
-    },
-    async run(args) {
-        const { city } = args as { city: string };
-        return { city, tempC: 14, conditions: "overcast" };
-    },
-};
+    "You are a helpful, concise assistant — a long-lived Construct that remembers " +
+    "across conversations. Save durable facts and preferences with memory_save, and " +
+    "recall them with memory_recall. Don't save transient chatter.";
 
 /**
  * Construct the cloud embedder when an OpenAI key is configured, else return
@@ -110,14 +57,29 @@ async function backfillEmbeddings(store: MemoryStore, embedder: Embedder): Promi
     }
 }
 
+/** Compaction threshold (estimated tokens) for an interactive session. Set well
+ *  below the model's real context window so there's headroom for the next turn's
+ *  output. Overridable via the COMPACT_AT env var. */
+const DEFAULT_COMPACT_AT = 120_000;
+
 async function main() {
     if (!process.env.ANTHROPIC_API_KEY) {
-        console.log("harness boot — no ANTHROPIC_API_KEY set, skipping live call.");
+        console.log("harness boot — no ANTHROPIC_API_KEY set, skipping live session.");
         console.log("bridge wired:", new AnthropicClient().provider);
         return;
     }
 
-    const client: ModelClient = new AnthropicClient({ model: process.env.MODEL });
+    const client: ModelClient = new AnthropicClient({
+        model: process.env.MODEL,
+        // Surface retries on stderr so a flaky connection is visible without
+        // cluttering the conversation on stdout.
+        retry: {
+            onRetry: ({ attempt, delayMs, error }) =>
+                console.error(
+                    `retrying after ${error.kind} (attempt ${attempt}, waiting ${delayMs}ms)`,
+                ),
+        },
+    });
     const store = new MemoryStore(process.env.MEMORY_DB ?? "db.sqlite");
     const embedder = makeEmbedder();
 
@@ -127,26 +89,17 @@ async function main() {
         // semantic recall covers the whole store, not just newly-saved rows.
         if (embedder) await backfillEmbeddings(store, embedder);
 
-        // Inject what we know that's relevant to this turn, and let the model
-        // read/write memory.
-        const system = await buildSystem(store, embedder, ask);
-        const tools: ToolDef[] = [weatherTool, ...memoryTools(store, embedder)];
-
-        // Run the agentic loop: model → tool → model, all in core types.
-        // Passive context (the current date/time in the user's timezone) is
-        // recomputed and folded into the system prompt before every turn.
-        const { final, turns } = await runLoop(client, {
-            messages: [system, ask],
-            tools,
-            context: [temporalContext()],
+        const compactAt = Number(process.env.COMPACT_AT) || DEFAULT_COMPACT_AT;
+        const session = new Session({
+            client,
+            system: BASE_SYSTEM,
+            store,
+            embedder,
+            compaction: { thresholdTokens: compactAt },
+            providerOptions: { cacheSystem: true },
         });
 
-        for (const part of final.message.content) {
-            if (part.kind === "text") process.stdout.write(part.text);
-        }
-        console.log(
-            `\n[${final.stopReason}] ${turns} turn(s), ${final.usage.outputTokens} out tokens`,
-        );
+        await runRepl(session);
     } finally {
         store.close();
     }
