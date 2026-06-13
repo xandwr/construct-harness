@@ -151,14 +151,45 @@ export function memoryTools(store: MemoryStore): ToolDef[] {
     return [save, recall, forget];
 }
 
+/** Options controlling which memories auto-recall surfaces. */
+export interface RecallOptions {
+    /** Max memories to inject. Defaults to {@link DEFAULT_RECALL_LIMIT}. */
+    limit?: number;
+    /**
+     * The current turn's text. When given, memories are ranked by lexical
+     * relevance to it (FTS/bm25) rather than by global importance — so recall
+     * surfaces what's relevant to *this* turn. Falls back to importance order
+     * when omitted or when nothing matches.
+     */
+    query?: string;
+}
+
 /**
- * Render the most relevant memories as a system-prompt fragment, or `null` when
- * the store is empty. Callers append the returned text to their system message
- * so the model starts each run already aware of what it knows.
+ * Render the memories worth recalling as a system-prompt fragment, or `null`
+ * when the store is empty. Callers append the returned text to their system
+ * message so the model starts each run already aware of what it knows.
+ *
+ * Pass the user's current turn as `query` to get turn-relevant recall: it ranks
+ * by lexical match, and only falls back to importance order when there's no
+ * query or no memory matches it.
+ *
+ * Back-compat: also accepts a bare number as the second argument, meaning
+ * `{ limit }` with no query — the original signature.
  */
-export function recallContext(store: MemoryStore, limit = DEFAULT_RECALL_LIMIT): string | null {
-    const memories = store.all({ limit });
+export function recallContext(
+    store: MemoryStore,
+    options: RecallOptions | number = {},
+): string | null {
+    const opts: RecallOptions = typeof options === "number" ? { limit: options } : options;
+    const limit = opts.limit ?? DEFAULT_RECALL_LIMIT;
+    const query = typeof opts.query === "string" ? opts.query.trim() : "";
+
+    // Relevance first; fall back to importance order when the query is empty or
+    // matches nothing, so recall is never worse than the old behavior.
+    let memories = query ? store.searchRelevant(query, { limit }) : [];
+    if (memories.length === 0) memories = store.all({ limit });
     if (memories.length === 0) return null;
+
     const lines = memories.map((m) => {
         const tags = m.tags.length ? ` [${m.tags.join(", ")}]` : "";
         return `- (#${m.id})${tags} ${m.content}`;

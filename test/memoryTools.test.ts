@@ -171,7 +171,7 @@ test("recallContext renders memories with id and tags", () => {
     store.close();
 });
 
-test("recallContext honors its limit", () => {
+test("recallContext honors its limit (bare-number back-compat form)", () => {
     const store = freshStore();
     for (let i = 0; i < DEFAULT_RECALL_LIMIT + 5; i++) {
         store.save(new Memory({ content: `m${i}`, created: i }));
@@ -179,6 +179,50 @@ test("recallContext honors its limit", () => {
     const text = recallContext(store, 3);
     assert.ok(text);
     assert.equal(text.split("\n").length - 1, 3); // 1 header line + 3 bullets
+    store.close();
+});
+
+test("recallContext with a query surfaces turn-relevant, not just important, memories", () => {
+    const store = freshStore();
+    // Higher importance, but unrelated to the turn.
+    store.save(new Memory({ content: "the office wifi password is hunter2", importance: 0.95 }));
+    // Lower importance, but exactly what the turn is about. Porter stemming
+    // links "allergies" here to "allergy" in the query.
+    store.save(new Memory({ content: "user has several food allergies", importance: 0.2 }));
+
+    // Relevance must win over importance: the allergy note ranks above the more
+    // "important" wifi note. (Stopword-ish shared tokens may still pull the wifi
+    // note in; the contract is ordering, so assert the allergy line comes first.)
+    const text = recallContext(store, { query: "what food allergy should I cook around?" });
+    assert.ok(text);
+    assert.match(text, /food allergies/);
+    const allergyAt = text.indexOf("allergies");
+    const wifiAt = text.indexOf("wifi password");
+    assert.ok(wifiAt === -1 || allergyAt < wifiAt, "allergy note should rank before wifi note");
+    store.close();
+});
+
+test("recallContext falls back to importance order when the query matches nothing", () => {
+    const store = freshStore();
+    store.save(new Memory({ content: "alpha", importance: 0.3 }));
+    store.save(new Memory({ content: "beta", importance: 0.9 }));
+
+    // Query shares no token with any memory: don't return empty — fall back.
+    const text = recallContext(store, { query: "zzz nonexistent terms" });
+    assert.ok(text);
+    assert.match(text, /beta/); // most important first, since relevance was a wash
+    assert.match(text, /alpha/);
+    store.close();
+});
+
+test("recallContext with no query keeps the old importance-ordered behavior", () => {
+    const store = freshStore();
+    store.save(new Memory({ content: "low", importance: 0.1 }));
+    store.save(new Memory({ content: "high", importance: 0.9 }));
+    const text = recallContext(store, { limit: 1 });
+    assert.ok(text);
+    assert.match(text, /high/);
+    assert.doesNotMatch(text, /low/);
     store.close();
 });
 

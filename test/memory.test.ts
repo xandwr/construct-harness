@@ -283,6 +283,82 @@ test("search and tag filter compose", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Relevance search (FTS5 / bm25)
+// ---------------------------------------------------------------------------
+
+test("searchRelevant ranks by lexical match, not importance", () => {
+    const store = freshStore();
+    // The dentist note is *more important* but unrelated to the query; the
+    // oat-milk note is less important but a direct match and must rank first.
+    store.save(mem("call the dentist about a filling", { importance: 0.9 }));
+    store.save(mem("user likes oat milk in coffee", { importance: 0.1 }));
+
+    // The milk note must rank first — bm25 relevance beats the dentist note's
+    // higher importance. (Both may appear: stopword-ish tokens like "the" can
+    // make the dentist note a weak match; what matters is that it ranks below.)
+    const hits = store.searchRelevant("what milk does the user prefer?");
+    assert.ok(hits.length >= 1);
+    assert.equal(hits[0].content, "user likes oat milk in coffee");
+    store.close();
+});
+
+test("searchRelevant matches any shared token (sentence query)", () => {
+    const store = freshStore();
+    store.save(mem("deploys happen on fridays"));
+    store.save(mem("the staging database is read-only"));
+    store.save(mem("completely unrelated"));
+
+    const hits = store
+        .searchRelevant("remind me how the database deploy works")
+        .map((m) => m.content)
+        .sort();
+    assert.deepEqual(hits, ["deploys happen on fridays", "the staging database is read-only"]);
+    store.close();
+});
+
+test("searchRelevant returns nothing for a token-less query", () => {
+    const store = freshStore();
+    store.save(mem("something"));
+    assert.deepEqual(store.searchRelevant("   "), []);
+    assert.deepEqual(store.searchRelevant("!!! ??? ..."), []);
+    store.close();
+});
+
+test("searchRelevant treats FTS operators as literal terms, not syntax", () => {
+    const store = freshStore();
+    store.save(mem("notes about oranges"));
+    // Bareword AND/OR/NOT and punctuation would be FTS operators if unescaped;
+    // here they must be harmless and simply find the 'oranges' token.
+    assert.doesNotThrow(() => store.searchRelevant('oranges AND "(*:'));
+    const hits = store.searchRelevant("oranges NOT apples").map((m) => m.content);
+    assert.deepEqual(hits, ["notes about oranges"]);
+    store.close();
+});
+
+test("searchRelevant composes with tag filtering and honors limit", () => {
+    const store = freshStore();
+    store.save(mem("milk for work", { tags: ["chore"] }));
+    store.save(mem("milk at home", { tags: ["home"] }));
+    const hits = store.searchRelevant("milk", { tags: ["chore"] }).map((m) => m.content);
+    assert.deepEqual(hits, ["milk for work"]);
+    assert.equal(store.searchRelevant("milk", { limit: 1 }).length, 1);
+    store.close();
+});
+
+test("the FTS index follows updates and deletes", () => {
+    const store = freshStore();
+    const saved = store.save(mem("originally about penguins"));
+    // After an update, the old term stops matching and the new one starts.
+    store.update(saved.id, { content: "now about walruses" });
+    assert.deepEqual(store.searchRelevant("penguins"), []);
+    assert.equal(store.searchRelevant("walruses")[0]?.content, "now about walruses");
+    // After delete, nothing matches.
+    store.delete(saved.id);
+    assert.deepEqual(store.searchRelevant("walruses"), []);
+    store.close();
+});
+
+// ---------------------------------------------------------------------------
 // Robustness: corrupt rows, lifecycle, mutation-before-save
 // ---------------------------------------------------------------------------
 
@@ -315,6 +391,7 @@ test("operations on a closed store throw MemoryError", () => {
     assert.throws(() => store.all(), MemoryError);
     assert.throws(() => store.count(), MemoryError);
     assert.throws(() => store.save(mem("b")), MemoryError);
+    assert.throws(() => store.searchRelevant("a"), MemoryError);
     // close is idempotent
     assert.doesNotThrow(() => store.close());
 });

@@ -100,6 +100,48 @@ const MIGRATIONS: ReadonlyArray<{ name: string; up: (db: DatabaseSync) => void }
             `);
         },
     },
+    {
+        // Full-text index over content, so recall can rank by lexical relevance
+        // (bm25) instead of only importance/recency. The FTS table is an
+        // external-content index ("content='memory'"): it stores no copy of the
+        // text itself, just the inverted index, and reads the real text back
+        // from `memory` via rowid. Triggers keep it in lockstep with writes.
+        name: "add fts5 full-text index over content",
+        up(db) {
+            db.exec(`
+                -- The porter stemmer folds morphological variants together
+                -- ("allergies" matches "allergic", "deploys" matches "deploy"),
+                -- which is what makes turn-relevant recall robust to the exact
+                -- wording a user happens to use.
+                CREATE VIRTUAL TABLE memory_fts USING fts5(
+                    content,
+                    content='memory',
+                    content_rowid='id',
+                    tokenize='porter'
+                );
+
+                -- Keep the index in sync. For UPDATE/DELETE we first push a
+                -- 'delete' row (the special INSERT below) to retract the old
+                -- terms, then index the new content.
+                CREATE TRIGGER memory_ai AFTER INSERT ON memory BEGIN
+                    INSERT INTO memory_fts (rowid, content) VALUES (new.id, new.content);
+                END;
+                CREATE TRIGGER memory_ad AFTER DELETE ON memory BEGIN
+                    INSERT INTO memory_fts (memory_fts, rowid, content)
+                        VALUES ('delete', old.id, old.content);
+                END;
+                CREATE TRIGGER memory_au AFTER UPDATE ON memory BEGIN
+                    INSERT INTO memory_fts (memory_fts, rowid, content)
+                        VALUES ('delete', old.id, old.content);
+                    INSERT INTO memory_fts (rowid, content) VALUES (new.id, new.content);
+                END;
+
+                -- Backfill any rows that predate the index.
+                INSERT INTO memory_fts (rowid, content)
+                    SELECT id, content FROM memory;
+            `);
+        },
+    },
 ];
 
 /** The schema version this build of the code expects. */
@@ -428,6 +470,47 @@ export class MemoryStore {
         return this.query(needle.length ? needle : null, opts);
     }
 
+    /**
+     * Rank memories by lexical relevance to `text` using the FTS5 index (bm25),
+     * with importance as a gentle tiebreak. This is what auto-recall wants: rows
+     * most relevant to *this turn*, not the globally most-important rows.
+     *
+     * Unlike {@link search} (substring `LIKE`), matching here is token-based —
+     * the query is reduced to its word tokens and OR-matched, so a whole
+     * sentence still finds memories that share any meaningful term. A query with
+     * no usable tokens (or no FTS hits) yields an empty array; callers that want
+     * a fallback should handle that themselves.
+     */
+    searchRelevant(text: string, opts: QueryOptions = {}): Memory[] {
+        this.assertOpen();
+        const match = toFtsQuery(text);
+        if (match === null) return [];
+
+        const limit = clampLimit(opts.limit);
+        const offset = Math.max(0, Math.floor(opts.offset ?? 0));
+        const filterTags = normalizeTags(opts.tags);
+
+        const where: string[] = ["memory_fts MATCH ?"];
+        const params: unknown[] = [match];
+        for (const tag of filterTags) {
+            where.push(`m.tags LIKE ? ESCAPE '\\'`);
+            params.push(`%"${escapeLike(tag)}"%`);
+        }
+
+        // bm25() is ascending (more-negative = better), so order by it directly,
+        // then let importance break ties among comparably-relevant rows.
+        const sql =
+            `SELECT m.* FROM memory_fts ` +
+            `JOIN memory m ON m.id = memory_fts.rowid ` +
+            `WHERE ${where.join(" AND ")} ` +
+            `ORDER BY bm25(memory_fts), m.importance IS NULL, m.importance DESC ` +
+            `LIMIT ? OFFSET ?`;
+        params.push(limit, offset);
+
+        const rows = this.db.prepare(sql).all(...(params as never[])) as unknown as MemoryRow[];
+        return rows.map(rowToMemory);
+    }
+
     private query(needle: string | null, opts: QueryOptions): Memory[] {
         this.assertOpen();
         const limit = clampLimit(opts.limit);
@@ -530,3 +613,28 @@ function clampLimit(limit: number | undefined): number {
 function escapeLike(s: string): string {
     return s.replace(/[\\%_]/g, (c) => `\\${c}`);
 }
+
+/**
+ * Turn free text into a safe FTS5 MATCH query.
+ *
+ * Raw user text can't go straight into MATCH: characters like `"`, `*`, `:`,
+ * `(`, `-`, and the bareword `AND`/`OR`/`NOT` are FTS operators and would
+ * either throw a syntax error or change the query's meaning. So we extract
+ * alphanumeric word tokens, wrap each in double quotes (which makes it a
+ * literal string token, neutralizing operators), and OR them together — any
+ * shared term makes a memory a candidate, and bm25 sorts by how well it matches.
+ *
+ * Returns null when the text has no usable tokens, so the caller can treat that
+ * as "no query" rather than issuing an empty MATCH (which is itself an error).
+ */
+function toFtsQuery(text: string): string | null {
+    if (typeof text !== "string") return null;
+    const tokens = text.toLowerCase().match(/[\p{L}\p{N}]+/gu);
+    if (!tokens || tokens.length === 0) return null;
+    // Dedupe to keep the query compact; cap to bound pathological inputs.
+    const unique = [...new Set(tokens)].slice(0, MAX_FTS_TOKENS);
+    return unique.map((t) => `"${t}"`).join(" OR ");
+}
+
+/** Cap on tokens fed into a single FTS MATCH, to bound a giant prompt. */
+const MAX_FTS_TOKENS = 32;
