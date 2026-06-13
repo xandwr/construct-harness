@@ -1,4 +1,12 @@
-export enum RoleType { Tool = "tool", System = "system", Agent = "agent", User = "user" }
+export const RoleType = {
+    Tool: "tool",
+    System: "system",
+    Agent: "agent",
+    User: "user",
+} as const;
+
+export type RoleType = (typeof RoleType)[keyof typeof RoleType];
+
 
 export interface Sender {
     role: RoleType;
