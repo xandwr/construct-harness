@@ -7,7 +7,6 @@ export const RoleType = {
 
 export type RoleType = (typeof RoleType)[keyof typeof RoleType];
 
-
 export interface Sender {
     role: RoleType;
     name?: string;

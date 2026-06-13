@@ -29,7 +29,7 @@ export class Memory {
 
     update() {
         let now = Date.now();
-        if ((now - this.created) > 100000) {
+        if (now - this.created > 100000) {
             console.log("Outdated memory: ", this.content);
         }
     }
@@ -60,9 +60,7 @@ export class MemoryStore {
          VALUES (?, ?, ?, ?)`,
     );
     private getStmt = db.prepare(`SELECT * FROM memory WHERE id = ?`);
-    private allStmt = db.prepare(
-        `SELECT * FROM memory ORDER BY importance DESC, created DESC`,
-    );
+    private allStmt = db.prepare(`SELECT * FROM memory ORDER BY importance DESC, created DESC`);
     private deleteStmt = db.prepare(`DELETE FROM memory WHERE id = ?`);
 
     /** Persist a memory, assigning its real id from the database. */

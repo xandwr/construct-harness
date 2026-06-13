@@ -108,10 +108,22 @@ function toAnthropicContent(parts: ContentPart[]): Anthropic.ContentBlockParam[]
     });
 }
 
-/** Tool results are arbitrary JSON in the core; Anthropic wants text/blocks. */
-function stringifyResult(result: unknown): string {
+/** Tool results are arbitrary JSON in the core; Anthropic wants text/blocks.
+ *
+ *  A tool may return a value that doesn't serialize — a circular object, or one
+ *  with a throwing `toJSON`. We never let that crash the mapping: the model gets
+ *  a readable placeholder instead, and the loop keeps going. */
+export function stringifyResult(result: unknown): string {
     if (typeof result === "string") return result;
-    return JSON.stringify(result);
+    try {
+        const json = JSON.stringify(result);
+        // JSON.stringify(undefined) and stringify of a lone function return
+        // undefined; fall back to a printable form in that case.
+        return json ?? String(result);
+    } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        return `[unserializable tool result: ${reason}]`;
+    }
 }
 
 /** Map core tool definitions to Anthropic tools. The core's `run` is the

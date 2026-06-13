@@ -6,13 +6,17 @@ import type { ModelClient } from "./bridge/types.ts";
 const system: Message = {
     sender: { role: RoleType.System },
     timestamp: Date.now(),
-    content: [{ kind: "text", text: "You are a terse assistant. Use tools when asked about weather." }],
+    content: [
+        { kind: "text", text: "You are a terse assistant. Use tools when asked about weather." },
+    ],
 };
 
 const ask: Message = {
     sender: { role: RoleType.User },
     timestamp: Date.now(),
-    content: [{ kind: "text", text: "What's the weather in Dublin? Then tell me in one sentence." }],
+    content: [
+        { kind: "text", text: "What's the weather in Dublin? Then tell me in one sentence." },
+    ],
 };
 
 const weatherTool: ToolDef = {

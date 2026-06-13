@@ -1,21 +1,24 @@
 {
-  "name": "construct-harness",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "node --env-file-if-exists=.env src/index.ts"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "module",
-  "devDependencies": {
-    "@types/node": "^25.9.3",
-    "typescript": "^6.0.3"
-  },
-  "dependencies": {
-    "@anthropic-ai/sdk": "^0.104.1"
-  }
+    "name": "construct-harness",
+    "version": "1.0.0",
+    "description": "",
+    "main": "index.js",
+    "scripts": {
+        "test": "node --test 'test/**/*.test.ts'",
+        "dev": "node --env-file-if-exists=.env src/index.ts",
+        "format": "prettier --write .",
+        "format:check": "prettier --check ."
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "type": "module",
+    "devDependencies": {
+        "@types/node": "^25.9.3",
+        "prettier": "3.8.4",
+        "typescript": "^6.0.3"
+    },
+    "dependencies": {
+        "@anthropic-ai/sdk": "^0.104.1"
+    }
 }
