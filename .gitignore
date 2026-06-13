@@ -1,5 +1,11 @@
 **/node_modules
 
+# local sqlite databases
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
 # secrets
 .env
 .env.*
