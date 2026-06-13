@@ -25,6 +25,12 @@ const user = (text: string): Message => ({
     content: [{ kind: "text", text }],
 });
 
+const agent = (text: string): Message => ({
+    sender: { role: RoleType.Agent },
+    timestamp: 0,
+    content: [{ kind: "text", text }],
+});
+
 /** A tool that echoes its args and records every invocation. */
 function spyTool(name = "echo"): ToolDef & { invocations: unknown[] } {
     const invocations: unknown[] = [];
@@ -355,4 +361,75 @@ test("a tool with no object schema skips validation entirely", async () => {
 
     await runLoop(client, { messages: [user("go")], tools: [tool] });
     assert.deepEqual(tool.invocations, [42], "non-object schema passes args through unchecked");
+});
+
+// ── Cumulative usage & maxTurns signalling ───────────────────────────────────
+
+test("accumulates usage across every turn", async () => {
+    const tool = spyTool();
+    // Each FakeClient turn reports {input:1, output:1}; two turns → totals of 2.
+    const client = new FakeClient([callTurn("c1", "echo", {}), textTurn("done")]);
+
+    const res = await runLoop(client, { messages: [user("go")], tools: [tool] });
+
+    assert.equal(res.usage.turns, 2);
+    assert.equal(res.usage.inputTokens, 2);
+    assert.equal(res.usage.outputTokens, 2);
+});
+
+test("a clean completion does not set stoppedAtMaxTurns", async () => {
+    const client = new FakeClient([textTurn("done")]);
+    const res = await runLoop(client, { messages: [user("go")] });
+    assert.equal(res.stoppedAtMaxTurns, false);
+    assert.equal(res.compactions, 0);
+});
+
+test("stoppedAtMaxTurns is true when cut off mid tool loop", async () => {
+    const tool = spyTool();
+    const client = new FakeClient([callTurn("c1", "echo", {}), callTurn("c2", "echo", {})]);
+    const res = await runLoop(client, {
+        messages: [user("go")],
+        tools: [tool],
+        maxTurns: 2,
+    });
+    assert.equal(res.stoppedAtMaxTurns, true, "runaway tool loop should be flagged");
+    assert.equal(res.final.stopReason, "tool_use");
+});
+
+// ── Auto-compaction gate ─────────────────────────────────────────────────────
+
+test("compacts the conversation before a turn when it exceeds the threshold", async () => {
+    // A bulky opening user turn pushes the estimate over a tiny threshold, so
+    // the gate fires before the first generate. The first scripted turn is the
+    // summary; the second is the real model reply.
+    const big = user("x".repeat(5000));
+    const client = new FakeClient([textTurn("SUMMARY"), textTurn("answer")]);
+
+    const res = await runLoop(client, {
+        messages: [big, user("u1"), agent("a1"), user("u2"), agent("a2"), user("now answer")],
+        compaction: { thresholdTokens: 100, keepRecent: 2 },
+    });
+
+    assert.equal(res.compactions, 1, "should have compacted once");
+    // The summarizer turn + the real reply both count toward usage.
+    assert.ok(res.usage.turns >= 2);
+    // The conversation the loop carries forward contains the summary, not the
+    // bulky original.
+    const joined = res.messages
+        .flatMap((m) => m.content)
+        .filter((p): p is Extract<ContentPart, { kind: "text" }> => p.kind === "text")
+        .map((p) => p.text)
+        .join(" ");
+    assert.match(joined, /SUMMARY/);
+    assert.doesNotMatch(joined, /x{5000}/);
+});
+
+test("does not compact when under the threshold", async () => {
+    const client = new FakeClient([textTurn("done")]);
+    const res = await runLoop(client, {
+        messages: [user("short")],
+        compaction: { thresholdTokens: 1_000_000 },
+    });
+    assert.equal(res.compactions, 0);
+    assert.equal(client.calls.length, 1, "only the real generate, no summarizer call");
 });

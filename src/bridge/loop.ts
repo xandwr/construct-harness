@@ -12,6 +12,10 @@ import { RoleType } from "../types.ts";
 import type { ContentPart, Message, ToolDef, ToolCallPart } from "../types.ts";
 import { applyContext } from "../context.ts";
 import type { ContextProvider } from "../context.ts";
+import { compactConversation } from "../compaction.ts";
+import type { CompactionOptions } from "../compaction.ts";
+import { UsageTracker, estimateTokens } from "../usage.ts";
+import type { CumulativeUsage } from "../usage.ts";
 import type { GenerateParams, GenerateResult, ModelClient } from "./types.ts";
 
 export interface RunLoopParams extends GenerateParams {
@@ -25,15 +29,52 @@ export interface RunLoopParams extends GenerateParams {
      * history this returns. See {@link applyContext}.
      */
     context?: ContextProvider[];
+    /**
+     * Auto-compaction: keep a long-lived conversation under the context window
+     * by summarizing older turns once the estimated size crosses a threshold.
+     * Omit to disable (the loop never compacts on its own). See
+     * {@link CompactionConfig}.
+     *
+     * The gate runs *before* each `generate`, on the persistent conversation
+     * (not the per-turn context fold), so a compacted history carries forward to
+     * every subsequent turn — which is what an interactive session needs.
+     */
+    compaction?: CompactionConfig;
+}
+
+/** Controls the loop's auto-compaction gate. */
+export interface CompactionConfig extends CompactionOptions {
+    /**
+     * Estimated-token threshold that triggers compaction before a turn. When the
+     * running estimate of the conversation (see {@link estimateTokens}) exceeds
+     * this, the loop summarizes older turns before calling the model. There is
+     * no default — providing this object is what turns compaction on, and the
+     * threshold should be set below the model's real context window with headroom
+     * for the next turn's output.
+     */
+    thresholdTokens: number;
 }
 
 export interface RunLoopResult {
-    /** The full conversation, including every assistant turn and tool result. */
+    /** The full conversation, including every assistant turn and tool result.
+     *  If compaction ran, older turns appear here as their summary. */
     messages: Message[];
     /** The final model result (the turn that stopped without a tool call). */
     final: GenerateResult;
     /** Number of model turns actually taken. */
     turns: number;
+    /** Token totals across every turn of this run, including any summarization
+     *  turns compaction performed. */
+    usage: CumulativeUsage;
+    /**
+     * True when the loop stopped because it hit {@link RunLoopParams.maxTurns}
+     * while the model was still requesting tools — i.e. it was cut off, not done.
+     * Lets a caller distinguish a completed run from a runaway one without
+     * re-deriving it from `final.stopReason`.
+     */
+    stoppedAtMaxTurns: boolean;
+    /** How many times the loop compacted the conversation during this run. */
+    compactions: number;
 }
 
 /** Index tools by name for O(1) dispatch, rejecting duplicate names.
@@ -128,11 +169,28 @@ export async function runLoop(client: ModelClient, params: RunLoopParams): Promi
     const toolIndex = indexTools(params.tools);
     const context = params.context ?? [];
 
-    const messages = [...params.messages];
+    let messages = [...params.messages];
+    const usage = new UsageTracker();
     let final: GenerateResult | undefined;
     let turns = 0;
+    let stoppedAtMaxTurns = false;
+    let compactions = 0;
 
     while (turns < maxTurns) {
+        // Gate: before sending, compact the persistent conversation if our
+        // estimate says it's grown past the threshold. We mutate `messages`
+        // itself (not just the outgoing copy) so the compaction carries forward
+        // to every later turn — the whole point for a long-lived session. The
+        // summarizer's own turn is counted toward this run's usage.
+        if (params.compaction && estimateTokens(messages) > params.compaction.thresholdTokens) {
+            const compacted = await compactConversation(client, messages, params.compaction);
+            if (compacted.usage) usage.add(compacted.usage);
+            if (compacted.compacted) {
+                messages = compacted.messages;
+                compactions++;
+            }
+        }
+
         // Fold this turn's passive context (e.g. the current time) onto the
         // outgoing messages only — `messages` itself, and so the conversation we
         // return, stays free of per-turn injected content.
@@ -140,6 +198,7 @@ export async function runLoop(client: ModelClient, params: RunLoopParams): Promi
         const result = await client.generate({ ...params, messages: outgoing });
         turns++;
         final = result;
+        usage.add(result.usage);
         messages.push(result.message);
 
         // Only act on tool calls the provider actually signalled with
@@ -159,8 +218,20 @@ export async function runLoop(client: ModelClient, params: RunLoopParams): Promi
             timestamp: Date.now(),
             content: results,
         });
+
+        // If that was the last turn we're allowed and the model still wanted
+        // tools, we're cutting it off rather than letting it finish. Record that
+        // so the caller can tell a runaway from a clean completion.
+        if (turns >= maxTurns) stoppedAtMaxTurns = true;
     }
 
     // `final` is always set: the loop runs at least once (maxTurns ≥ 1).
-    return { messages, final: final!, turns };
+    return {
+        messages,
+        final: final!,
+        turns,
+        usage: usage.totals(),
+        stoppedAtMaxTurns,
+        compactions,
+    };
 }
