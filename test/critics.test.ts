@@ -15,13 +15,17 @@ import assert from "node:assert/strict";
 
 import {
     personaSystem,
+    renderStakes,
     critic,
     panel,
     panelVerify,
     majorityRule,
     unanimousRule,
+    dealStakes,
+    STAKE_POOL,
     type Personality,
     type CriticVerdict,
+    type Stake,
 } from "../src/critics.ts";
 import { FakeClient, textTurn } from "./helpers/fakeClient.ts";
 
@@ -57,6 +61,123 @@ test("personaSystem folds in every populated trait and the extra", () => {
     // The escape-hatch text lands after the standing instruction.
     assert.match(out, /cite a CWE number/);
     assert.ok(out.indexOf("PASS or FAIL") < out.indexOf("cite a CWE"));
+});
+
+// ── stakes: the scene a critic carries into the room ──────────────────────────
+
+test("renderStakes contributes nothing for a critic with nothing on the line", () => {
+    assert.equal(renderStakes(undefined), "");
+    assert.equal(renderStakes([]), "");
+});
+
+test("renderStakes frames the stakes as a scene, not a labelled list of biases", () => {
+    const out = renderStakes([
+        { riding: "the on-call gets paged at 3am", valence: "falsePass" },
+        { riding: "the team has waited three days", valence: "falseFail" },
+    ]);
+    // Each stake appears as its riding text...
+    assert.match(out, /the on-call gets paged at 3am/);
+    assert.match(out, /the team has waited three days/);
+    // ...inhabited in the second person...
+    assert.match(out, /depend on you/);
+    // ...but the valence is deliberately NOT spelled out — naming the bias would
+    // let the model perform it instead of feel it.
+    assert.doesNotMatch(out, /falsePass|falseFail|toward FAIL|toward PASS/);
+});
+
+test("personaSystem folds stakes in after the standing instruction, before extra", () => {
+    const p: Personality = {
+        name: "Mara",
+        role: "release captain",
+        stakes: [{ riding: "the quarter ships behind this merge", valence: "falseFail" }],
+        extra: "Cite a line number.",
+    };
+    const out = personaSystem(p);
+    assert.match(out, /the quarter ships behind this merge/);
+    // Order: standing PASS/FAIL instruction → stakes scene → extra.
+    assert.ok(out.indexOf("PASS or FAIL") < out.indexOf("the quarter ships"));
+    assert.ok(out.indexOf("the quarter ships") < out.indexOf("Cite a line number"));
+});
+
+test("personaSystem omits the stakes preamble when there are none", () => {
+    const out = personaSystem({ name: "Dana" });
+    assert.doesNotMatch(out, /depend on you getting this right/);
+});
+
+// ── STAKE_POOL: the deck dealStakes draws from ────────────────────────────────
+
+test("STAKE_POOL carries both valences so a deal can pull both ways", () => {
+    const pass = STAKE_POOL.filter((s) => s.valence === "falsePass").length;
+    const fail = STAKE_POOL.filter((s) => s.valence === "falseFail").length;
+    assert.ok(pass > 0, "needs falsePass stakes");
+    assert.ok(fail > 0, "needs falseFail stakes");
+    // Roughly balanced — a one-sided pool would bias every panel the same way.
+    assert.ok(Math.abs(pass - fail) <= 1, "pool should be near-evenly split");
+});
+
+// ── dealStakes: hand a persona random things to protect ───────────────────────
+
+/** A pinned RNG cycling through the given values, so a deal is deterministic. */
+function pinned(...values: number[]): () => number {
+    let i = 0;
+    return () => values[i++ % values.length]!;
+}
+
+test("dealStakes hands a persona stakes drawn from the pool", () => {
+    const dealt = dealStakes({ name: "Lee" }, { count: 2, random: pinned(0) });
+    assert.equal(dealt.stakes!.length, 2);
+    // Every dealt stake came from the pool (drawn, not invented).
+    for (const s of dealt.stakes!) {
+        assert.ok(STAKE_POOL.some((p) => p.riding === s.riding));
+    }
+    // It's a copy — the input persona is untouched.
+    assert.equal(dealt.name, "Lee");
+});
+
+test("dealStakes draws without replacement — no persona gets the same stake twice", () => {
+    // Draw the whole pool; every member must be distinct.
+    const dealt = dealStakes({ name: "Lee" }, { count: STAKE_POOL.length, random: pinned(0.5) });
+    const ridings = dealt.stakes!.map((s) => s.riding);
+    assert.equal(new Set(ridings).size, ridings.length, "no duplicates");
+    assert.equal(ridings.length, STAKE_POOL.length, "drew the whole pool");
+});
+
+test("dealStakes clamps count to the pool size", () => {
+    const dealt = dealStakes({ name: "Lee" }, { count: 999, random: pinned(0) });
+    assert.equal(dealt.stakes!.length, STAKE_POOL.length);
+});
+
+test("dealStakes with count 0 hands over nothing — a critic with no stake", () => {
+    const dealt = dealStakes({ name: "Lee" }, { count: 0, random: pinned(0) });
+    assert.deepEqual(dealt.stakes, []);
+});
+
+test("dealStakes replaces prior stakes rather than appending — a fresh deal each run", () => {
+    const carried: Personality = {
+        name: "Lee",
+        stakes: [{ riding: "an old worry", valence: "falsePass" }],
+    };
+    const dealt = dealStakes(carried, { count: 1, random: pinned(0) });
+    assert.equal(dealt.stakes!.length, 1);
+    assert.notEqual(dealt.stakes![0]!.riding, "an old worry");
+    // Original persona is not mutated.
+    assert.equal(carried.stakes![0]!.riding, "an old worry");
+});
+
+test("dealStakes is deterministic under a pinned RNG", () => {
+    const a = dealStakes({ name: "Lee" }, { count: 3, random: pinned(0.1, 0.9, 0.3) });
+    const b = dealStakes({ name: "Lee" }, { count: 3, random: pinned(0.1, 0.9, 0.3) });
+    assert.deepEqual(a.stakes, b.stakes);
+});
+
+test("dealStakes rejects a negative count", () => {
+    assert.throws(() => dealStakes({ name: "Lee" }, { count: -1 }), /count must be ≥ 0/);
+});
+
+test("dealStakes draws from a custom pool when given one", () => {
+    const pool: Stake[] = [{ riding: "only this", valence: "falseFail" }];
+    const dealt = dealStakes({ name: "Lee" }, { count: 1, pool, random: pinned(0) });
+    assert.equal(dealt.stakes![0]!.riding, "only this");
 });
 
 test("critic builds a Session whose system prompt is the rendered persona", () => {
