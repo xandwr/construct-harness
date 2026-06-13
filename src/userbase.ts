@@ -1,18 +1,20 @@
-export class UserId {
-    value: number;
+export class Group {
+    id: string;
 
-    constructor() {
-        this.value = 0;
+    constructor(id: string) {
+        this.id = id;
     }
 }
 
 export class User {
-    id: UserId;
+    id: number;
     name: string;
+    groups: Array<Group>;
 
-    constructor(name: string = "Guest") {
-        this.id = new UserId();
+    constructor(name: string = "Guest", groups: Array<Group> = []) {
+        this.id = 0;
         this.name = name;
+        this.groups = groups;
     }
 }
 
@@ -21,7 +23,7 @@ export class UserRegistry {
 
     constructor() {
         this.users = [
-            new User("John Doe"),
+            new User("John Doe", [new Group("wheel"), new Group("video")]),
             new User("Jane Doe")
         ];
     }
