@@ -359,6 +359,141 @@ test("the FTS index follows updates and deletes", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Vector / semantic search
+// ---------------------------------------------------------------------------
+
+/** A tiny normalized 2-D vector, for deterministic similarity tests. */
+function unit(x: number, y: number): Float32Array {
+    const len = Math.hypot(x, y) || 1;
+    return Float32Array.from([x / len, y / len]);
+}
+
+test("setEmbedding stores a vector and semanticSearch ranks by cosine", () => {
+    const store = freshStore();
+    const cat = store.save(mem("cats are great pets"));
+    const dog = store.save(mem("dogs are loyal companions"));
+    const car = store.save(mem("the engine needs oil"));
+
+    // Place the query near the cat vector, with the dog nearby and the car far.
+    store.setEmbedding(cat.id, unit(1, 0));
+    store.setEmbedding(dog.id, unit(0.9, 0.4));
+    store.setEmbedding(car.id, unit(-1, 0));
+
+    const hits = store.semanticSearch(unit(1, 0));
+    assert.deepEqual(
+        hits.map((h) => h.memory.content),
+        ["cats are great pets", "dogs are loyal companions", "the engine needs oil"],
+    );
+    // Top hit is an exact direction match → score ~1.
+    assert.ok(Math.abs(hits[0].score - 1) < 1e-6);
+    store.close();
+});
+
+test("setEmbedding refuses an orphan and reports it", () => {
+    const store = freshStore();
+    assert.equal(store.setEmbedding(999, unit(1, 0)), false);
+    store.close();
+});
+
+test("semanticSearch honors limit, offset, and tag filtering", () => {
+    const store = freshStore();
+    const a = store.save(mem("alpha", { tags: ["keep"] }));
+    const b = store.save(mem("beta", { tags: ["keep"] }));
+    const c = store.save(mem("gamma", { tags: ["skip"] }));
+    store.setEmbedding(a.id, unit(0.9, 0.4)); // a near the query
+    store.setEmbedding(b.id, unit(0.5, 0.9)); // b a bit further
+    store.setEmbedding(c.id, unit(1, 0)); // exact match — would rank top, but filtered out
+
+    // Tag filter drops gamma even though it's the closest; remaining ranked by similarity.
+    const tagged = store.semanticSearch(unit(1, 0), { tags: ["keep"] });
+    assert.deepEqual(
+        tagged.map((h) => h.memory.content),
+        ["alpha", "beta"],
+    );
+
+    // Unfiltered, gamma (exact match) ranks first; limit caps the result.
+    assert.equal(store.semanticSearch(unit(1, 0), { limit: 1 })[0].memory.content, "gamma");
+    // offset past the top hit returns the next-best, not gamma again.
+    const second = store.semanticSearch(unit(1, 0), { limit: 1, offset: 1 });
+    assert.equal(second.length, 1);
+    assert.equal(second[0].memory.content, "alpha");
+    store.close();
+});
+
+test("memories without an embedding are invisible to semanticSearch", () => {
+    const store = freshStore();
+    const a = store.save(mem("embedded"));
+    store.save(mem("not embedded"));
+    store.setEmbedding(a.id, unit(1, 0));
+    const hits = store.semanticSearch(unit(1, 0));
+    assert.deepEqual(
+        hits.map((h) => h.memory.content),
+        ["embedded"],
+    );
+    store.close();
+});
+
+test("hasEmbedding and idsMissingEmbedding track the backfill work-list", () => {
+    const store = freshStore();
+    const a = store.save(mem("a", { created: 1 }));
+    const b = store.save(mem("b", { created: 2 }));
+    assert.equal(store.hasEmbedding(a.id), false);
+    assert.deepEqual(store.idsMissingEmbedding().sort(), [a.id, b.id].sort());
+
+    store.setEmbedding(a.id, unit(1, 0));
+    assert.equal(store.hasEmbedding(a.id), true);
+    assert.deepEqual(store.idsMissingEmbedding(), [b.id]); // only the unembedded one
+    store.close();
+});
+
+test("deleting a memory cascades away its embedding", () => {
+    const store = freshStore();
+    const a = store.save(mem("doomed"));
+    store.setEmbedding(a.id, unit(1, 0));
+    assert.equal(store.hasEmbedding(a.id), true);
+    store.delete(a.id);
+    assert.equal(store.hasEmbedding(a.id), false);
+    assert.deepEqual(store.semanticSearch(unit(1, 0)), []);
+    store.close();
+});
+
+test("editing content invalidates the stale embedding; metadata edits keep it", () => {
+    const store = freshStore();
+    const a = store.save(mem("original content", { importance: 0.3 }));
+    store.setEmbedding(a.id, unit(1, 0));
+
+    // A metadata-only edit must NOT drop the (still-valid) embedding.
+    store.update(a.id, { importance: 0.9 });
+    assert.equal(store.hasEmbedding(a.id), true);
+
+    // A content edit invalidates it — the vector no longer matches the text.
+    store.update(a.id, { content: "completely different now" });
+    assert.equal(store.hasEmbedding(a.id), false);
+    assert.deepEqual(store.idsMissingEmbedding(), [a.id]);
+    store.close();
+});
+
+test("setEmbedding replaces an existing vector (upsert)", () => {
+    const store = freshStore();
+    const a = store.save(mem("x"));
+    store.setEmbedding(a.id, unit(1, 0));
+    store.setEmbedding(a.id, unit(0, 1));
+    const hits = store.semanticSearch(unit(0, 1));
+    assert.ok(Math.abs(hits[0].score - 1) < 1e-6);
+    store.close();
+});
+
+test("vector methods throw on a closed store", () => {
+    const store = freshStore();
+    const a = store.save(mem("x"));
+    store.setEmbedding(a.id, unit(1, 0));
+    store.close();
+    assert.throws(() => store.semanticSearch(unit(1, 0)), MemoryError);
+    assert.throws(() => store.setEmbedding(a.id, unit(1, 0)), MemoryError);
+    assert.throws(() => store.idsMissingEmbedding(), MemoryError);
+});
+
+// ---------------------------------------------------------------------------
 // Robustness: corrupt rows, lifecycle, mutation-before-save
 // ---------------------------------------------------------------------------
 

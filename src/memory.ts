@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { blobToVector, cosineSimilarity, vectorToBlob } from "./embeddings.ts";
 
 /**
  * Thrown when a memory fails validation before it ever reaches the database.
@@ -43,6 +44,14 @@ export interface QueryOptions {
 
 export const DEFAULT_LIMIT = 100;
 export const MAX_LIMIT = 1000;
+
+/** A memory paired with its cosine similarity to a query vector, from
+ *  {@link MemoryStore.semanticSearch}. Score is in roughly [-1, 1], higher =
+ *  more similar. */
+export interface SemanticHit {
+    memory: Memory;
+    score: number;
+}
 
 /** How long (ms) a writer waits on a locked db before giving up. */
 export const DEFAULT_BUSY_TIMEOUT = 5_000;
@@ -139,6 +148,42 @@ const MIGRATIONS: ReadonlyArray<{ name: string; up: (db: DatabaseSync) => void }
                 -- Backfill any rows that predate the index.
                 INSERT INTO memory_fts (rowid, content)
                     SELECT id, content FROM memory;
+            `);
+        },
+    },
+    {
+        // Vector index for semantic (meaning-based) recall. Each row holds one
+        // memory's embedding as a little-endian float32 BLOB plus its dimension,
+        // keyed by the memory's id. Unlike FTS, embeddings can't be computed in
+        // SQL — they require a network call to an embedding model — so rows are
+        // written explicitly by the application (see setEmbedding / backfill),
+        // NOT by an INSERT/UPDATE trigger.
+        //
+        // We still trigger on DELETE and on content UPDATE: a deleted memory's
+        // vector must go with it, and an edited memory's vector is now stale, so
+        // we drop it and let the application re-embed. This keeps the table from
+        // ever serving a vector that doesn't match the current content.
+        name: "add vector index for semantic search",
+        up(db) {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS memory_vec (
+                    rowid INTEGER PRIMARY KEY REFERENCES memory(id) ON DELETE CASCADE,
+                    dim   INTEGER NOT NULL,
+                    vec   BLOB NOT NULL
+                );
+
+                CREATE TRIGGER memory_vec_ad AFTER DELETE ON memory BEGIN
+                    DELETE FROM memory_vec WHERE rowid = old.id;
+                END;
+
+                -- Only invalidate the vector when the *content* actually changed;
+                -- a metadata-only edit (tags/importance) leaves the embedding
+                -- valid, so we avoid a needless re-embed.
+                CREATE TRIGGER memory_vec_au AFTER UPDATE OF content ON memory
+                    WHEN new.content <> old.content
+                BEGIN
+                    DELETE FROM memory_vec WHERE rowid = old.id;
+                END;
             `);
         },
     },
@@ -341,6 +386,10 @@ export class MemoryStore {
     private readonly deleteStmt;
     private readonly countStmt;
     private readonly clearStmt;
+    private readonly upsertVecStmt;
+    private readonly deleteVecStmt;
+    private readonly getVecStmt;
+    private readonly missingVecStmt;
     private closed = false;
 
     constructor(options: string | StoreOptions = "db.sqlite") {
@@ -355,6 +404,11 @@ export class MemoryStore {
 
         // Bound how long a writer waits on a lock before SQLITE_BUSY.
         this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(busyTimeout))}`);
+
+        // Honor the memory_vec → memory ON DELETE CASCADE (SQLite leaves foreign
+        // keys off per connection by default). The explicit delete trigger is a
+        // belt-and-braces backup, but the cascade is the contract.
+        this.db.exec(`PRAGMA foreign_keys = ON`);
 
         if (wantWal) {
             // journal_mode returns the resulting mode; confirm WAL actually took
@@ -384,6 +438,22 @@ export class MemoryStore {
         this.deleteStmt = this.db.prepare(`DELETE FROM memory WHERE id = ?`);
         this.countStmt = this.db.prepare(`SELECT COUNT(*) AS n FROM memory`);
         this.clearStmt = this.db.prepare(`DELETE FROM memory`);
+
+        this.upsertVecStmt = this.db.prepare(
+            `INSERT INTO memory_vec (rowid, dim, vec) VALUES (?, ?, ?)
+             ON CONFLICT(rowid) DO UPDATE SET dim = excluded.dim, vec = excluded.vec`,
+        );
+        this.deleteVecStmt = this.db.prepare(`DELETE FROM memory_vec WHERE rowid = ?`);
+        this.getVecStmt = this.db.prepare(`SELECT vec FROM memory_vec WHERE rowid = ?`);
+        // Memories with no (or a stale, hence absent) embedding yet — the
+        // backfill work-list. Newest first so recent memories get vectors soonest.
+        this.missingVecStmt = this.db.prepare(
+            `SELECT m.id FROM memory m
+             LEFT JOIN memory_vec v ON v.rowid = m.id
+             WHERE v.rowid IS NULL
+             ORDER BY m.created DESC
+             LIMIT ?`,
+        );
     }
 
     private assertOpen() {
@@ -509,6 +579,103 @@ export class MemoryStore {
 
         const rows = this.db.prepare(sql).all(...(params as never[])) as unknown as MemoryRow[];
         return rows.map(rowToMemory);
+    }
+
+    // ── Vector / semantic search ──────────────────────────────────────────────
+    //
+    // The store owns *storage and comparison* of embeddings, never their
+    // production: vectors are computed by an Embedder (a network call) and passed
+    // in, keeping this class synchronous and I/O-free of any model API.
+
+    /**
+     * Store (or replace) the embedding for a memory. Returns false if no memory
+     * with that id exists — we won't keep an orphan vector. The vector is
+     * expected to be L2-normalized (as {@link Embedder} guarantees) so that
+     * semantic ranking can use a plain dot product.
+     */
+    setEmbedding(id: number, vector: Float32Array): boolean {
+        this.assertOpen();
+        if (!this.get(id)) return false;
+        this.upsertVecStmt.run(id, vector.length, vectorToBlob(vector));
+        return true;
+    }
+
+    /** Drop a memory's embedding, e.g. before re-embedding. Returns whether a
+     *  row was removed. (DELETE/content-UPDATE on the memory does this too, via
+     *  trigger.) */
+    deleteEmbedding(id: number): boolean {
+        this.assertOpen();
+        return this.deleteVecStmt.run(id).changes > 0;
+    }
+
+    /** Whether a memory currently has a stored embedding. */
+    hasEmbedding(id: number): boolean {
+        this.assertOpen();
+        return this.getVecStmt.get(id) !== undefined;
+    }
+
+    /**
+     * Ids of memories with no current embedding — the backfill work-list. A
+     * memory loses its embedding when its content is edited (trigger), so this
+     * also surfaces rows whose vectors went stale and need recomputing. Newest
+     * first; bounded by `limit` (default {@link DEFAULT_LIMIT}).
+     */
+    idsMissingEmbedding(limit = DEFAULT_LIMIT): number[] {
+        this.assertOpen();
+        const rows = this.missingVecStmt.all(clampLimit(limit)) as Array<{ id: number }>;
+        return rows.map((r) => r.id);
+    }
+
+    /**
+     * Rank memories by semantic similarity to a query vector (cosine), highest
+     * first. This is the meaning-based counterpart to {@link searchRelevant}'s
+     * lexical match: it finds memories that mean the same thing even when they
+     * share no words with the query.
+     *
+     * The query vector must come from the same embedding model the stored
+     * vectors did — mismatched dimensions simply score 0 and drop out. Memories
+     * without an embedding are invisible here (embed them first via
+     * {@link setEmbedding} / a backfill).
+     *
+     * Implementation note: this scans every stored vector and ranks in JS. For a
+     * personal memory store (thousands of rows) that's microseconds; a larger
+     * corpus would want an ANN index, which is a future migration, not a rewrite
+     * of this signature.
+     */
+    semanticSearch(query: Float32Array, opts: QueryOptions = {}): SemanticHit[] {
+        this.assertOpen();
+        const limit = clampLimit(opts.limit);
+        const offset = Math.max(0, Math.floor(opts.offset ?? 0));
+        const filterTags = normalizeTags(opts.tags);
+
+        // Join the memory row in so we can apply the same tag filter as the other
+        // queries and reconstruct full Memory objects without a second lookup.
+        const where: string[] = [];
+        const params: unknown[] = [];
+        for (const tag of filterTags) {
+            where.push(`m.tags LIKE ? ESCAPE '\\'`);
+            params.push(`%"${escapeLike(tag)}"%`);
+        }
+        const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+        const sql =
+            `SELECT m.*, v.vec AS vec FROM memory_vec v ` +
+            `JOIN memory m ON m.id = v.rowid ${whereSql}`;
+
+        const rows = this.db.prepare(sql).all(...(params as never[])) as unknown as Array<
+            MemoryRow & { vec: Uint8Array }
+        >;
+
+        const scored: SemanticHit[] = [];
+        for (const row of rows) {
+            const score = cosineSimilarity(query, blobToVector(row.vec));
+            scored.push({ memory: rowToMemory(row), score });
+        }
+        // Highest similarity first; importance breaks ties among equally-similar
+        // memories (mirrors the lexical path's secondary sort).
+        scored.sort(
+            (a, b) => b.score - a.score || (b.memory.importance ?? 0) - (a.memory.importance ?? 0),
+        );
+        return scored.slice(offset, offset + limit);
     }
 
     private query(needle: string | null, opts: QueryOptions): Memory[] {

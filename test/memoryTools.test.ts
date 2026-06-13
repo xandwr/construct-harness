@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 
 import { MemoryStore, Memory } from "../src/memory.ts";
 import { memoryTools, recallContext, DEFAULT_RECALL_LIMIT } from "../src/memoryTools.ts";
+import { EmbeddingError, type Embedder } from "../src/embeddings.ts";
 import { runLoop } from "../src/bridge/loop.ts";
 import { RoleType } from "../src/types.ts";
 import type { Message, ToolDef, ToolResultPart } from "../src/types.ts";
@@ -19,6 +20,30 @@ import { FakeClient, callTurn, textTurn } from "./helpers/fakeClient.ts";
 
 function freshStore(): MemoryStore {
     return new MemoryStore(":memory:");
+}
+
+/**
+ * A deterministic, offline {@link Embedder}: it maps each text to a normalized
+ * vector via a caller-supplied table, so semantic ranking is fully predictable
+ * with no network. Unknown texts get a fixed "far" vector.
+ */
+function fakeEmbedder(
+    table: Record<string, [number, number]>,
+    opts: { fail?: boolean } = {},
+): Embedder {
+    const norm = ([x, y]: [number, number]): Float32Array => {
+        const len = Math.hypot(x, y) || 1;
+        return Float32Array.from([x / len, y / len]);
+    };
+    return {
+        provider: "fake",
+        model: "fake-2d",
+        dimensions: 2,
+        async embed(texts) {
+            if (opts.fail) throw new EmbeddingError("embedding service down");
+            return texts.map((t) => norm(table[t] ?? [-1, -1]));
+        },
+    };
 }
 
 /** Find a tool by name from the factory output. */
@@ -153,16 +178,16 @@ test("memory_forget rejects a non-numeric id", async () => {
 // recallContext
 // ---------------------------------------------------------------------------
 
-test("recallContext returns null for an empty store", () => {
+test("recallContext returns null for an empty store", async () => {
     const store = freshStore();
-    assert.equal(recallContext(store), null);
+    assert.equal(await recallContext(store), null);
     store.close();
 });
 
-test("recallContext renders memories with id and tags", () => {
+test("recallContext renders memories with id and tags", async () => {
     const store = freshStore();
     const saved = store.save(new Memory({ content: "remember this", tags: ["x", "y"] }));
-    const text = recallContext(store);
+    const text = await recallContext(store);
     assert.ok(text);
     assert.match(text, /Relevant things you remember:/);
     assert.match(text, new RegExp(`#${saved.id}`));
@@ -171,18 +196,18 @@ test("recallContext renders memories with id and tags", () => {
     store.close();
 });
 
-test("recallContext honors its limit (bare-number back-compat form)", () => {
+test("recallContext honors its limit (bare-number back-compat form)", async () => {
     const store = freshStore();
     for (let i = 0; i < DEFAULT_RECALL_LIMIT + 5; i++) {
         store.save(new Memory({ content: `m${i}`, created: i }));
     }
-    const text = recallContext(store, 3);
+    const text = await recallContext(store, 3);
     assert.ok(text);
     assert.equal(text.split("\n").length - 1, 3); // 1 header line + 3 bullets
     store.close();
 });
 
-test("recallContext with a query surfaces turn-relevant, not just important, memories", () => {
+test("recallContext with a query surfaces turn-relevant, not just important, memories", async () => {
     const store = freshStore();
     // Higher importance, but unrelated to the turn.
     store.save(new Memory({ content: "the office wifi password is hunter2", importance: 0.95 }));
@@ -193,7 +218,7 @@ test("recallContext with a query surfaces turn-relevant, not just important, mem
     // Relevance must win over importance: the allergy note ranks above the more
     // "important" wifi note. (Stopword-ish shared tokens may still pull the wifi
     // note in; the contract is ordering, so assert the allergy line comes first.)
-    const text = recallContext(store, { query: "what food allergy should I cook around?" });
+    const text = await recallContext(store, { query: "what food allergy should I cook around?" });
     assert.ok(text);
     assert.match(text, /food allergies/);
     const allergyAt = text.indexOf("allergies");
@@ -202,27 +227,109 @@ test("recallContext with a query surfaces turn-relevant, not just important, mem
     store.close();
 });
 
-test("recallContext falls back to importance order when the query matches nothing", () => {
+test("recallContext falls back to importance order when the query matches nothing", async () => {
     const store = freshStore();
     store.save(new Memory({ content: "alpha", importance: 0.3 }));
     store.save(new Memory({ content: "beta", importance: 0.9 }));
 
     // Query shares no token with any memory: don't return empty — fall back.
-    const text = recallContext(store, { query: "zzz nonexistent terms" });
+    const text = await recallContext(store, { query: "zzz nonexistent terms" });
     assert.ok(text);
     assert.match(text, /beta/); // most important first, since relevance was a wash
     assert.match(text, /alpha/);
     store.close();
 });
 
-test("recallContext with no query keeps the old importance-ordered behavior", () => {
+test("recallContext with no query keeps the old importance-ordered behavior", async () => {
     const store = freshStore();
     store.save(new Memory({ content: "low", importance: 0.1 }));
     store.save(new Memory({ content: "high", importance: 0.9 }));
-    const text = recallContext(store, { limit: 1 });
+    const text = await recallContext(store, { limit: 1 });
     assert.ok(text);
     assert.match(text, /high/);
     assert.doesNotMatch(text, /low/);
+    store.close();
+});
+
+// ---------------------------------------------------------------------------
+// Semantic recall (with an embedder)
+// ---------------------------------------------------------------------------
+
+test("memory_save embeds the saved memory when an embedder is configured", async () => {
+    const store = freshStore();
+    const embedder = fakeEmbedder({ "user loves espresso": [1, 0] });
+    const save = tool(memoryTools(store, embedder), "memory_save");
+    const res = (await save.run({ content: "user loves espresso" })) as { memory: { id: number } };
+    assert.equal(store.hasEmbedding(res.memory.id), true);
+    store.close();
+});
+
+test("memory_recall ranks by meaning, beating a lexically-closer but unrelated note", async () => {
+    const store = freshStore();
+    // Query "what caffeine does the user drink" shares the word "user" with the
+    // car note, but *means* the same as the coffee note. Vectors encode that:
+    // coffee is near the query direction, car is far.
+    const embedder = fakeEmbedder({
+        "user enjoys a strong coffee": [1, 0],
+        "user drives a fast car": [-1, 0.2],
+        "what caffeine does the user drink": [1, 0.05],
+    });
+    const tools = memoryTools(store, embedder);
+    const save = tool(tools, "memory_save");
+    await save.run({ content: "user enjoys a strong coffee" });
+    await save.run({ content: "user drives a fast car" });
+
+    const recall = tool(tools, "memory_recall");
+    const res = (await recall.run({ query: "what caffeine does the user drink" })) as {
+        memories: { content: string }[];
+    };
+    assert.equal(res.memories[0].content, "user enjoys a strong coffee");
+    store.close();
+});
+
+test("memory_recall falls back to lexical when embedding fails", async () => {
+    const store = freshStore();
+    const embedder = fakeEmbedder({}, { fail: true });
+    const tools = memoryTools(store, embedder);
+    // Save with a failing embedder: the memory still persists (no vector).
+    const save = tool(tools, "memory_save");
+    const saved = (await save.run({ content: "the deploy runs on fridays" })) as {
+        saved: boolean;
+        memory: { id: number };
+    };
+    assert.equal(saved.saved, true);
+    assert.equal(store.hasEmbedding(saved.memory.id), false);
+
+    // Recall still works via FTS even though the embedder throws.
+    const recall = tool(tools, "memory_recall");
+    const res = (await recall.run({ query: "when does the deploy happen" })) as {
+        memories: { content: string }[];
+    };
+    assert.equal(res.memories[0]?.content, "the deploy runs on fridays");
+    store.close();
+});
+
+test("recallContext uses semantic ranking when given an embedder", async () => {
+    const store = freshStore();
+    const embedder = fakeEmbedder({
+        "user is vegetarian": [1, 0],
+        "user owns a sailboat": [-1, 0],
+        "what can I cook for the user": [1, 0.1],
+    });
+    const a = store.save(new Memory({ content: "user is vegetarian" }));
+    const b = store.save(new Memory({ content: "user owns a sailboat" }));
+    store.setEmbedding(a.id, (await embedder.embed(["user is vegetarian"]))[0]);
+    store.setEmbedding(b.id, (await embedder.embed(["user owns a sailboat"]))[0]);
+
+    const text = await recallContext(store, {
+        query: "what can I cook for the user",
+        embedder,
+    });
+    assert.ok(text);
+    const vegAt = text.indexOf("vegetarian");
+    const boatAt = text.indexOf("sailboat");
+    assert.ok(vegAt !== -1);
+    assert.ok(boatAt === -1 || vegAt < boatAt, "vegetarian note should rank first");
     store.close();
 });
 
