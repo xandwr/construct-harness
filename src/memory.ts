@@ -44,6 +44,23 @@ export interface QueryOptions {
 export const DEFAULT_LIMIT = 100;
 export const MAX_LIMIT = 1000;
 
+/** How long (ms) a writer waits on a locked db before giving up. */
+export const DEFAULT_BUSY_TIMEOUT = 5_000;
+
+/** Tuning knobs for {@link MemoryStore}'s underlying database. */
+export interface StoreOptions {
+    /** Path to the sqlite file, or `:memory:` for an ephemeral store. */
+    location?: string;
+    /** Writer lock wait in ms before SQLITE_BUSY. Defaults to {@link DEFAULT_BUSY_TIMEOUT}. */
+    busyTimeout?: number;
+    /**
+     * Enable Write-Ahead Logging for concurrent readers + one writer.
+     * Defaults to true for file-backed stores; always off (and meaningless)
+     * for `:memory:`, which keeps a private per-connection database.
+     */
+    wal?: boolean;
+}
+
 export class Memory {
     id: number;
     content: string;
@@ -183,9 +200,14 @@ function parseTags(raw: string | null): string[] {
  * The database is injectable: pass a path (default `db.sqlite`) or `:memory:`
  * for an isolated, ephemeral store — which is what the tests use so they never
  * touch disk or share state. Construct one, use it, and {@link close} it.
+ *
+ * File-backed stores run in WAL mode by default, so many readers and a single
+ * writer can work concurrently without blocking each other, and a configurable
+ * busy-timeout keeps a momentarily-locked writer from failing outright.
  */
 export class MemoryStore {
     private readonly db: DatabaseSync;
+    private readonly walEnabled: boolean;
     private readonly insertStmt;
     private readonly getStmt;
     private readonly updateStmt;
@@ -194,8 +216,34 @@ export class MemoryStore {
     private readonly clearStmt;
     private closed = false;
 
-    constructor(location = "db.sqlite") {
+    constructor(options: string | StoreOptions = "db.sqlite") {
+        const opts: StoreOptions = typeof options === "string" ? { location: options } : options;
+        const location = opts.location ?? "db.sqlite";
+        const busyTimeout = opts.busyTimeout ?? DEFAULT_BUSY_TIMEOUT;
+        // WAL is pointless for an in-memory db (private per connection), so it
+        // only ever applies to file-backed stores.
+        const wantWal = (opts.wal ?? true) && location !== ":memory:";
+
         this.db = new DatabaseSync(location);
+
+        // Bound how long a writer waits on a lock before SQLITE_BUSY.
+        this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(busyTimeout))}`);
+
+        if (wantWal) {
+            // journal_mode returns the resulting mode; confirm WAL actually took
+            // (it can silently fall back, e.g. on some network filesystems).
+            const row = this.db.prepare(`PRAGMA journal_mode = WAL`).get() as {
+                journal_mode?: string;
+            };
+            this.walEnabled = row?.journal_mode?.toLowerCase() === "wal";
+            if (this.walEnabled) {
+                // NORMAL is the standard, durable-enough pairing with WAL.
+                this.db.exec(`PRAGMA synchronous = NORMAL`);
+            }
+        } else {
+            this.walEnabled = false;
+        }
+
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS memory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -355,9 +403,35 @@ export class MemoryStore {
         return Number(this.clearStmt.run().changes);
     }
 
-    /** Release the underlying database handle. Idempotent. */
+    /** Whether this store is actually running in WAL mode. */
+    get wal(): boolean {
+        return this.walEnabled;
+    }
+
+    /**
+     * Fold the WAL back into the main database file and truncate it. No-op when
+     * WAL isn't active. Useful before backing up the file or to cap WAL growth
+     * under a long-running writer.
+     */
+    checkpoint(): void {
+        this.assertOpen();
+        if (!this.walEnabled) return;
+        this.db.exec(`PRAGMA wal_checkpoint(TRUNCATE)`);
+    }
+
+    /**
+     * Release the underlying database handle. Idempotent. Checkpoints first so a
+     * file-backed store doesn't leave a populated `-wal` sidecar behind.
+     */
     close() {
         if (this.closed) return;
+        if (this.walEnabled) {
+            try {
+                this.db.exec(`PRAGMA wal_checkpoint(TRUNCATE)`);
+            } catch {
+                // Best-effort: a checkpoint failure must not prevent close.
+            }
+        }
         this.closed = true;
         this.db.close();
     }

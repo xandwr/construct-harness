@@ -9,6 +9,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
     Memory,
@@ -20,6 +23,19 @@ import {
     DEFAULT_LIMIT,
     MAX_LIMIT,
 } from "../src/memory.ts";
+
+/**
+ * Run `fn` with a path to a fresh temp directory, cleaned up afterward. Used by
+ * the WAL tests, which need a real on-disk file (WAL is a no-op for `:memory:`).
+ */
+function withTempDir(fn: (dir: string) => void): void {
+    const dir = mkdtempSync(join(tmpdir(), "memstore-"));
+    try {
+        fn(dir);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+}
 
 /** Fresh isolated store per test; caller closes it (or lets the process exit). */
 function freshStore(): MemoryStore {
@@ -308,4 +324,109 @@ test("separate stores do not share state", () => {
     assert.equal(b.count(), 0);
     a.close();
     b.close();
+});
+
+// ---------------------------------------------------------------------------
+// WAL mode & concurrency
+// ---------------------------------------------------------------------------
+
+test("file-backed store enables WAL by default", () => {
+    withTempDir((dir) => {
+        const store = new MemoryStore(join(dir, "wal.sqlite"));
+        assert.equal(store.wal, true);
+        store.close();
+    });
+});
+
+test(":memory: store never uses WAL", () => {
+    const store = new MemoryStore(":memory:");
+    assert.equal(store.wal, false);
+    store.close();
+});
+
+test("wal:false opts a file-backed store out of WAL", () => {
+    withTempDir((dir) => {
+        const store = new MemoryStore({ location: join(dir, "nowal.sqlite"), wal: false });
+        assert.equal(store.wal, false);
+        store.close();
+    });
+});
+
+test("StoreOptions form configures location like the string form", () => {
+    withTempDir((dir) => {
+        const path = join(dir, "opts.sqlite");
+        const a = new MemoryStore({ location: path });
+        a.save(mem("persisted", { importance: 0.5 }));
+        a.close();
+
+        // Reopen the same file: data survived, so location was honored.
+        const b = new MemoryStore(path);
+        assert.equal(b.count(), 1);
+        assert.equal(b.all()[0]?.content, "persisted");
+        b.close();
+    });
+});
+
+test("a concurrent reader sees a writer's committed rows under WAL", () => {
+    withTempDir((dir) => {
+        const path = join(dir, "concurrent.sqlite");
+        const writer = new MemoryStore(path);
+        const reader = new MemoryStore(path);
+        assert.equal(writer.wal, true);
+        assert.equal(reader.wal, true);
+
+        writer.save(mem("from writer"));
+        // Second connection reads the committed row without blocking.
+        assert.equal(reader.count(), 1);
+        assert.equal(reader.all()[0]?.content, "from writer");
+
+        writer.close();
+        reader.close();
+    });
+});
+
+test("checkpoint folds the WAL back and is safe to call repeatedly", () => {
+    withTempDir((dir) => {
+        const path = join(dir, "ckpt.sqlite");
+        const store = new MemoryStore(path);
+        for (let i = 0; i < 50; i++) store.save(mem(`m${i}`));
+        assert.doesNotThrow(() => store.checkpoint());
+        assert.doesNotThrow(() => store.checkpoint());
+        // data intact after checkpointing
+        assert.equal(store.count(), 50);
+        store.close();
+    });
+});
+
+test("checkpoint is a no-op on a non-WAL store", () => {
+    const store = new MemoryStore(":memory:");
+    assert.doesNotThrow(() => store.checkpoint());
+    store.close();
+});
+
+test("close checkpoints so no populated -wal sidecar is left behind", () => {
+    withTempDir((dir) => {
+        const path = join(dir, "sidecar.sqlite");
+        const store = new MemoryStore(path);
+        for (let i = 0; i < 20; i++) store.save(mem(`m${i}`));
+        store.close();
+        // TRUNCATE checkpoint on close leaves the -wal file empty (0 bytes) or
+        // absent; either way it must not still hold committed pages.
+        const walPath = `${path}-wal`;
+        if (existsSync(walPath)) {
+            assert.equal(statSync(walPath).size, 0);
+        }
+        // Reopening still sees every row, proving the data reached the main db.
+        const reopened = new MemoryStore(path);
+        assert.equal(reopened.count(), 20);
+        reopened.close();
+    });
+});
+
+test("checkpoint throws on a closed store", () => {
+    withTempDir((dir) => {
+        const store = new MemoryStore(join(dir, "closed.sqlite"));
+        store.close();
+        assert.throws(() => store.checkpoint(), MemoryError);
+    });
 });
