@@ -40,7 +40,7 @@ test("personaSystem renders only the fields that are present", () => {
     assert.doesNotMatch(out, /Your standards:/);
     assert.doesNotMatch(out, /Your expertise/);
     // The standing "judge in character / end with PASS or FAIL" instruction is
-    // always present — it's what makes the persona a verifier.
+    // always present: it's what makes the persona a verifier.
     assert.match(out, /PASS or FAIL/);
 });
 
@@ -80,7 +80,7 @@ test("renderStakes frames the stakes as a scene, not a labelled list of biases",
     assert.match(out, /the team has waited three days/);
     // ...inhabited in the second person...
     assert.match(out, /depend on you/);
-    // ...but the valence is deliberately NOT spelled out — naming the bias would
+    // ...but the valence is deliberately NOT spelled out: naming the bias would
     // let the model perform it instead of feel it.
     assert.doesNotMatch(out, /falsePass|falseFail|toward FAIL|toward PASS/);
 });
@@ -111,7 +111,7 @@ test("STAKE_POOL carries both valences so a deal can pull both ways", () => {
     const fail = STAKE_POOL.filter((s) => s.valence === "falseFail").length;
     assert.ok(pass > 0, "needs falsePass stakes");
     assert.ok(fail > 0, "needs falseFail stakes");
-    // Roughly balanced — a one-sided pool would bias every panel the same way.
+    // Roughly balanced: a one-sided pool would bias every panel the same way.
     assert.ok(Math.abs(pass - fail) <= 1, "pool should be near-evenly split");
 });
 
@@ -130,11 +130,11 @@ test("dealStakes hands a persona stakes drawn from the pool", () => {
     for (const s of dealt.stakes!) {
         assert.ok(STAKE_POOL.some((p) => p.riding === s.riding));
     }
-    // It's a copy — the input persona is untouched.
+    // It's a copy: the input persona is untouched.
     assert.equal(dealt.name, "Lee");
 });
 
-test("dealStakes draws without replacement — no persona gets the same stake twice", () => {
+test("dealStakes draws without replacement: no persona gets the same stake twice", () => {
     // Draw the whole pool; every member must be distinct.
     const dealt = dealStakes({ name: "Lee" }, { count: STAKE_POOL.length, random: pinned(0.5) });
     const ridings = dealt.stakes!.map((s) => s.riding);
@@ -147,12 +147,12 @@ test("dealStakes clamps count to the pool size", () => {
     assert.equal(dealt.stakes!.length, STAKE_POOL.length);
 });
 
-test("dealStakes with count 0 hands over nothing — a critic with no stake", () => {
+test("dealStakes with count 0 hands over nothing: a critic with no stake", () => {
     const dealt = dealStakes({ name: "Lee" }, { count: 0, random: pinned(0) });
     assert.deepEqual(dealt.stakes, []);
 });
 
-test("dealStakes replaces prior stakes rather than appending — a fresh deal each run", () => {
+test("dealStakes replaces prior stakes rather than appending: a fresh deal each run", () => {
     const carried: Personality = {
         name: "Lee",
         stakes: [{ riding: "an old worry", valence: "falsePass" }],
@@ -184,7 +184,7 @@ test("critic builds a Session whose system prompt is the rendered persona", () =
     const p: Personality = { name: "Lee", role: "the on-call paged at 3am" };
     const session = critic(p, { client: new FakeClient([]) });
     // The Session doesn't expose its config, but it must have been constructed
-    // without throwing and be ready to verify — exercised end-to-end below.
+    // without throwing and be ready to verify: exercised end-to-end below.
     assert.ok(session);
 });
 
@@ -282,7 +282,7 @@ test("panelVerify folds every critic's reasoning into one Verdict rationale", as
     const v = await panelVerify(ROSTER, { client }, "work", { concurrency: 1 });
     assert.equal(v.ok, true); // 2-1 majority
     // The rationale attributes each opinion by persona name.
-    assert.match(v.rationale, /Hawk: PASS — Looks safe\. PASS/);
-    assert.match(v.rationale, /Pragmatist: PASS — Good enough\. PASS/);
-    assert.match(v.rationale, /Pedant: FAIL — Missing a guard\. FAIL/);
+    assert.match(v.rationale, /Hawk: PASS: Looks safe\. PASS/);
+    assert.match(v.rationale, /Pragmatist: PASS: Good enough\. PASS/);
+    assert.match(v.rationale, /Pedant: FAIL: Missing a guard\. FAIL/);
 });

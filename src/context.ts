@@ -1,12 +1,12 @@
 /**
- * Passive context — content the harness folds into each model turn without the
+ * Passive context: content the harness folds into each model turn without the
  * model (or the caller) asking for it.
  *
  * Two things motivate this module:
  *
  *  1. Some context is *temporal*: it must be recomputed every turn because its
  *     value changes as the conversation runs (the current date and time is the
- *     canonical example — by the time a tool loop returns, minutes have passed).
+ *     canonical example: by the time a tool loop returns, minutes have passed).
  *     A static system `Message` built once, before {@link runLoop}, would freeze
  *     that value at boot.
  *
@@ -16,7 +16,7 @@
  * Both are "passive context providers": pure functions of a {@link ContextScope}
  * that return a {@link ContextContribution}, or `undefined` to contribute
  * nothing this turn. The loop evaluates them just before each `generate`, so the
- * conversation history the caller holds stays clean — the injected content lives
+ * conversation history the caller holds stays clean: the injected content lives
  * only on the wire, recomputed per turn.
  *
  * This module speaks only core types and has no provider or I/O dependency, in
@@ -29,7 +29,7 @@ import type { Message } from "./types.ts";
 /**
  * What a provider sees when it's asked to contribute. Deliberately minimal: the
  * conversation so far (read-only) and the turn index. Providers that need the
- * wall clock read it themselves — passing a frozen "now" in here would defeat
+ * wall clock read it themselves: passing a frozen "now" in here would defeat
  * the whole point for temporal providers, which must observe time advancing.
  */
 export interface ContextScope {
@@ -47,7 +47,7 @@ export interface ContextScope {
  *    right channel for ambient guidance and facts (temporal awareness included):
  *    it rides the cached prefix shape providers already use and doesn't clutter
  *    the turn array.
- *  - `messages` are injected into the outgoing turn array for this turn — use
+ *  - `messages` are injected into the outgoing turn array for this turn: use
  *    this only when the content must read as a conversational turn rather than
  *    system guidance (rare; most passive context belongs in `system`).
  */
@@ -58,7 +58,7 @@ export interface ContextContribution {
 
 /**
  * A passive context provider: pure, synchronous, named. Returning `undefined`
- * means "nothing to add this turn" and is distinct from returning empty text —
+ * means "nothing to add this turn" and is distinct from returning empty text:
  * it lets a provider stay silent when it has nothing relevant (e.g. a provider
  * gated on conversation state).
  *
@@ -77,7 +77,7 @@ export interface ContextProvider {
 /**
  * Fold a turn's passive context onto the outgoing message list.
  *
- * Returns a *new* array — the caller's conversation is never mutated. System
+ * Returns a *new* array: the caller's conversation is never mutated. System
  * contributions are appended to the conversation's existing system guidance as
  * additional `role: "system"` turns (the Anthropic mapper concatenates all
  * system text, so order within the system channel is append-order). Message
@@ -131,7 +131,7 @@ export interface TemporalOptions {
      * IANA timezone (e.g. `"Europe/Dublin"`) the time is rendered in. Defaults
      * to the host's resolved local timezone, so the harness reflects wherever it
      * runs. An invalid zone falls back to the host default rather than throwing
-     * — passive context must never break a turn.
+     *: passive context must never break a turn.
      */
     timeZone?: string;
     /** Locale for formatting. Defaults to `"en-US"` for stable, readable output

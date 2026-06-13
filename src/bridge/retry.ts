@@ -5,8 +5,8 @@
  * controls and can reason about: one that keys off the normalized
  * {@link HarnessError} taxonomy (retry only what's `retryable`), honors a
  * provider's `retry-after` hint when present, and otherwise backs off
- * exponentially with jitter. {@link withRetry} wraps any async thunk — a
- * `generate` call, the start of a `stream` — in that policy.
+ * exponentially with jitter. {@link withRetry} wraps any async thunk: a
+ * `generate` call, the start of a `stream`: in that policy.
  *
  * Determinism: backoff jitter draws from an injectable `random` (default
  * `Math.random`), so tests can pin it. Sleeping is likewise injectable so tests
@@ -66,7 +66,7 @@ export function backoffDelay(
  * Run `fn`, retrying on retryable {@link HarnessError}s per the policy.
  *
  * Stops and rethrows immediately on a non-retryable error (auth, bad request,
- * refusal, cancel) — retrying those only wastes time and tokens. After the last
+ * refusal, cancel): retrying those only wastes time and tokens. After the last
  * attempt, rethrows the final error. A thrown value that isn't a
  * {@link HarnessError} is treated as non-retryable and rethrown as-is: the
  * policy only acts on errors a provider has already classified.
@@ -84,8 +84,8 @@ export async function withRetry<T>(fn: () => Promise<T>, options: RetryOptions =
             return await fn();
         } catch (err) {
             lastError = err;
-            // Only a classified, retryable error is eligible. Anything else —
-            // including a raw error that escaped classification — propagates.
+            // Only a classified, retryable error is eligible. Anything else:
+            // including a raw error that escaped classification: propagates.
             if (!(err instanceof HarnessError) || !err.retryable) throw err;
             // No attempts left: give up with the real error.
             if (attempt >= maxAttempts) throw err;

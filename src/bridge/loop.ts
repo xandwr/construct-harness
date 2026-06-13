@@ -1,5 +1,5 @@
 /**
- * The agentic loop — a provider-neutral driver over {@link ModelClient}.
+ * The agentic loop: a provider-neutral driver over {@link ModelClient}.
  *
  * Given a conversation and a tool set, this runs turns until the model stops
  * requesting tools: each time the model emits `tool_call` parts, the loop
@@ -24,7 +24,7 @@ export interface RunLoopParams extends GenerateParams {
     /**
      * Passive context providers, evaluated just before every `generate` call.
      * Their contributions (current date/time, standing reminders, …) are folded
-     * onto the outgoing messages for that turn only — recomputed each turn so
+     * onto the outgoing messages for that turn only: recomputed each turn so
      * temporal values stay current and never leaking into the conversation
      * history this returns. See {@link applyContext}.
      */
@@ -37,7 +37,7 @@ export interface RunLoopParams extends GenerateParams {
      *
      * The gate runs *before* each `generate`, on the persistent conversation
      * (not the per-turn context fold), so a compacted history carries forward to
-     * every subsequent turn — which is what an interactive session needs.
+     * every subsequent turn: which is what an interactive session needs.
      */
     compaction?: CompactionConfig;
 }
@@ -48,7 +48,7 @@ export interface CompactionConfig extends CompactionOptions {
      * Estimated-token threshold that triggers compaction before a turn. When the
      * running estimate of the conversation (see {@link estimateTokens}) exceeds
      * this, the loop summarizes older turns before calling the model. There is
-     * no default — providing this object is what turns compaction on, and the
+     * no default: providing this object is what turns compaction on, and the
      * threshold should be set below the model's real context window with headroom
      * for the next turn's output.
      */
@@ -68,7 +68,7 @@ export interface RunLoopResult {
     usage: CumulativeUsage;
     /**
      * True when the loop stopped because it hit {@link RunLoopParams.maxTurns}
-     * while the model was still requesting tools — i.e. it was cut off, not done.
+     * while the model was still requesting tools: i.e. it was cut off, not done.
      * Lets a caller distinguish a completed run from a runaway one without
      * re-deriving it from `final.stopReason`.
      */
@@ -100,7 +100,7 @@ function toolCalls(message: Message): ToolCallPart[] {
 }
 
 /** Build an error `tool_result` for a call. Centralizes the shape so every
- *  failure path — unknown tool, bad args, thrown tool — looks the same to the
+ *  failure path: unknown tool, bad args, thrown tool: looks the same to the
  *  model. */
 function errorResult(callId: string, message: string): ContentPart {
     return { kind: "tool_result", callId, result: message, isError: true };
@@ -110,8 +110,8 @@ function errorResult(callId: string, message: string): ContentPart {
  *  top-level shape its JSON Schema declares.
  *
  *  This is deliberately *not* a full JSON Schema validator: it catches the
- *  malformed calls a model actually produces — non-object args where an object
- *  is required, and missing `required` properties — without pulling in a schema
+ *  malformed calls a model actually produces: non-object args where an object
+ *  is required, and missing `required` properties: without pulling in a schema
  *  library. Anything it can't reason about (nested types, formats) it lets
  *  through to the tool, which remains the final authority on its own input.
  *  Returns an error string, or `null` when the args are acceptable. */
@@ -138,7 +138,7 @@ function validateArgs(schema: unknown, args: unknown): string | null {
 
 /** Execute one tool call, capturing bad args and thrown errors as a
  *  `tool_result` part. A rejected or throwing tool becomes an error result the
- *  model can see and react to — it never crashes the loop. */
+ *  model can see and react to: it never crashes the loop. */
 async function runTool(call: ToolCallPart, tools: Map<string, ToolDef>): Promise<ContentPart> {
     const def = tools.get(call.name);
     if (!def) {
@@ -183,7 +183,7 @@ async function compactGate(
 /**
  * Run the tools a completed assistant turn requested and build the `user` turn
  * of results to append. Returns null when the turn isn't a clean `tool_use` stop
- * or carries no calls — in which case the loop should terminate. A `max_tokens`
+ * or carries no calls: in which case the loop should terminate. A `max_tokens`
  * turn may carry a half-emitted tool_call whose args were cut off; treating only
  * a clean `tool_use` stop as actionable keeps us from dispatching it. Shared by
  * both loops.
@@ -208,7 +208,7 @@ async function runToolTurn(
  * Drive a model + tools to completion.
  *
  * Each iteration calls {@link ModelClient.generate}, appends the assistant
- * turn, and — if it requested tools — runs them all (in parallel) and appends
+ * turn, and: if it requested tools: runs them all (in parallel) and appends
  * one user turn of `tool_result`s before looping. Stops when the model returns
  * without tool calls or {@link RunLoopParams.maxTurns} is hit.
  */
@@ -228,13 +228,13 @@ export async function runLoop(client: ModelClient, params: RunLoopParams): Promi
         // Gate: before sending, compact the persistent conversation if our
         // estimate says it's grown past the threshold. We reassign `messages`
         // itself (not just the outgoing copy) so the compaction carries forward
-        // to every later turn — the whole point for a long-lived session.
+        // to every later turn: the whole point for a long-lived session.
         const gated = await compactGate(client, messages, params, usage);
         messages = gated.messages;
         if (gated.compacted) compactions++;
 
         // Fold this turn's passive context (e.g. the current time) onto the
-        // outgoing messages only — `messages` itself, and so the conversation we
+        // outgoing messages only: `messages` itself, and so the conversation we
         // return, stays free of per-turn injected content.
         const outgoing = applyContext(messages, context, turns);
         const result = await client.generate({ ...params, messages: outgoing });
@@ -270,7 +270,7 @@ export async function runLoop(client: ModelClient, params: RunLoopParams): Promi
  * Events a streaming run emits, in core vocabulary. A superset of the bridge's
  * {@link CoreDelta}: the model's own deltas pass through unchanged (so a consumer
  * can print text as it arrives), and the loop adds events for the things the
- * bridge can't know about — compaction and the tool lifecycle. Every run ends
+ * bridge can't know about: compaction and the tool lifecycle. Every run ends
  * with exactly one `loop_done` carrying the full {@link RunLoopResult}.
  */
 export type LoopEvent =
@@ -288,11 +288,11 @@ export type LoopEvent =
  * {@link LoopEvent}s as they happen so a caller (e.g. an interactive REPL) can
  * render text token-by-token and show tool activity live. Compaction, usage
  * accounting, the tool loop, and the max-turns cut-off all behave exactly as in
- * {@link runLoop} — this is the same control flow, observed.
+ * {@link runLoop}: this is the same control flow, observed.
  *
  * The model's `stream` ends each turn with a `done` delta carrying the assembled
  * {@link GenerateResult}; we use that as the turn result (it never crosses to the
- * consumer as a `done` — the consumer gets per-turn text deltas and a single
+ * consumer as a `done`: the consumer gets per-turn text deltas and a single
  * terminal `loop_done`). Tools requested by a turn are run between turns, with
  * `tool_start`/`tool_end` bracketing each.
  */

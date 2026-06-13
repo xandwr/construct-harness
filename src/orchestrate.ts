@@ -1,5 +1,5 @@
 /**
- * Loops — driving Constructs without a human in the seat.
+ * Loops: driving Constructs without a human in the seat.
  *
  * Where {@link Session} is the thing a *person* talks to (a REPL feeds it one
  * user turn at a time), a Loop is the thing that talks to a Session *for* you:
@@ -16,11 +16,11 @@
  *  - {@link fanout}, {@link verify} and {@link orchestrate} sit on top: run many
  *    independent Constructs in parallel (bounded concurrency), check each one's
  *    output with a verifier Construct, and merge the survivors. The single-
- *    Construct case is just `orchestrate` with one task — the layers compose.
+ *    Construct case is just `orchestrate` with one task: the layers compose.
  *
  * Like the rest of `src/`, this speaks only core types and {@link Session}; it
  * knows nothing about a provider. A Session with no store is a fine Construct to
- * loop — memory is orthogonal.
+ * loop: memory is orthogonal.
  */
 
 import { Session } from "./session.ts";
@@ -43,7 +43,7 @@ export interface LoopStep {
 
 /** How a {@link loop} run ended. */
 export type LoopStopReason =
-    /** The `done` predicate returned true — the goal was reached. */
+    /** The `done` predicate returned true: the goal was reached. */
     | "done"
     /** Hit {@link LoopOptions.maxIterations} without `done` ever holding. */
     | "maxIterations";
@@ -59,19 +59,19 @@ export interface LoopOptions {
     done(step: LoopStep): boolean | Promise<boolean>;
     /**
      * The prompt to send for the *next* iteration, given the turn that didn't
-     * satisfy `done`. This is where you steer — "address the failing test", "you
+     * satisfy `done`. This is where you steer: "address the failing test", "you
      * still have TODOs, continue". Not called once `done` holds. May be async.
      */
     next(step: LoopStep): string | Promise<string>;
     /**
      * Hard cap on iterations, so a `done` that never fires can't run forever.
-     * The Loop's only cost bound (we deliberately do no token accounting here —
+     * The Loop's only cost bound (we deliberately do no token accounting here:
      * iterations are the knob). Must be ≥ 1. Default 10.
      */
     maxIterations?: number;
     /**
      * Optional observer for every {@link LoopEvent} the underlying Session
-     * emits, across all iterations — so a REPL or TUI can render the Loop's work
+     * emits, across all iterations: so a REPL or TUI can render the Loop's work
      * live exactly as it renders an interactive turn. The Loop itself needs only
      * the per-turn {@link TurnResult}, so this is purely for display.
      */
@@ -83,9 +83,9 @@ export interface LoopResult {
     /** Why the loop stopped. */
     stopReason: LoopStopReason;
     /** The final turn the Construct produced (the one `done` was last checked
-     *  against). Always set — a loop runs at least one iteration. */
+     *  against). Always set: a loop runs at least one iteration. */
     final: TurnResult;
-    /** Every turn produced, in order — `turns.length` is the iteration count. */
+    /** Every turn produced, in order: `turns.length` is the iteration count. */
     turns: TurnResult[];
     /** Convenience: turns produced (1-based max iteration reached). */
     iterations: number;
@@ -117,14 +117,14 @@ async function drive(
  *
  * Sends `task`, then evaluates `done` against the result. If the goal isn't met
  * and iterations remain, it asks `next` for the follow-up prompt and sends that
- * into the *same* Session — so the Construct keeps its full conversation and
+ * into the *same* Session: so the Construct keeps its full conversation and
  * memory across iterations, exactly as if a person had typed the follow-ups.
  * Stops the moment `done` holds, or when `maxIterations` is reached.
  *
  * The Session is the caller's: `loop` neither constructs nor disposes it, so the
  * same Construct can be looped more than once, or talked to interactively after.
  *
- * @throws RangeError if `maxIterations < 1` — a loop must run at least once, and
+ * @throws RangeError if `maxIterations < 1`: a loop must run at least once, and
  *   a zero/negative cap is a caller bug, not a no-op we should swallow.
  */
 export async function loop(
@@ -176,7 +176,7 @@ export async function loop(
 /**
  * A factory that mints a *fresh* Construct for one fan-out branch.
  *
- * Each branch must get its own {@link Session} so the branches are independent —
+ * Each branch must get its own {@link Session} so the branches are independent:
  * sharing one Session would entangle their conversations and serialize them
  * through one history. The factory receives the branch's task and index, so it
  * can specialize the Construct per branch (different system prompt, tools, …) if
@@ -191,7 +191,7 @@ export function spawnFrom(config: SessionConfig): Spawn {
 }
 
 /** One branch's outcome. A branch that threw is captured here as `error` with a
- *  null `result`, rather than rejecting the whole batch — same discipline as the
+ *  null `result`, rather than rejecting the whole batch: same discipline as the
  *  loop's tool handling: an independent failure is data, not a crash. */
 export interface BranchResult {
     /** The task this branch was given. */
@@ -223,7 +223,7 @@ export interface FanoutOptions {
  * Run many Constructs in parallel, one per task, with bounded concurrency.
  *
  * Each task gets a fresh Construct from `spawn` and is driven by a single send
- * (the fan-out unit is "one Construct, one task" — loop *within* a branch by
+ * (the fan-out unit is "one Construct, one task": loop *within* a branch by
  * having `spawn` hand back a Session you then drive, or compose with
  * {@link loop} in the caller). Branches are independent: one throwing is caught
  * and surfaced as a {@link BranchResult} with an `error`, never sinking its
@@ -279,7 +279,7 @@ export async function fanout(
 export interface Verdict {
     /** Whether the candidate passed the verifier's bar. */
     ok: boolean;
-    /** The verifier Construct's full reply, so a caller can show *why* — the
+    /** The verifier Construct's full reply, so a caller can show *why*: the
      *  rationale, not just the bit. */
     rationale: string;
 }
@@ -288,7 +288,7 @@ export interface Verdict {
 export interface VerifyOptions {
     /**
      * Decide pass/fail from the verifier Construct's reply text. The default
-     * treats a reply that contains "PASS" (and not "FAIL") as ok — pair it with
+     * treats a reply that contains "PASS" (and not "FAIL") as ok: pair it with
      * a verifier system prompt that ends its verdict with PASS or FAIL. Override
      * to parse whatever convention your verifier uses.
      */
@@ -302,7 +302,7 @@ export interface VerifyOptions {
 }
 
 /** Default verdict parse: PASS present and FAIL absent. Case-sensitive so prose
- *  that merely discusses "fail" doesn't trip it — the verifier emits the tokens
+ *  that merely discusses "fail" doesn't trip it: the verifier emits the tokens
  *  deliberately. */
 function defaultDecide(replyText: string): boolean {
     return replyText.includes("PASS") && !replyText.includes("FAIL");
@@ -319,7 +319,7 @@ function defaultVerifyPrompt(candidate: string): string {
 /**
  * Check a candidate with a verifier Construct.
  *
- * Spawns nothing itself — the caller passes a `verifier` Session so the verifier
+ * Spawns nothing itself: the caller passes a `verifier` Session so the verifier
  * can carry its own system prompt (the skeptic instructions) and, if desired,
  * accumulate context across several `verify` calls. Runs one send and maps the
  * reply to a {@link Verdict} via `decide`.
@@ -370,9 +370,9 @@ export interface OrchestrateOptions {
 
 /** The result of an {@link orchestrate} run. */
 export interface OrchestrateResult {
-    /** Every branch with its verdict, in input order — the full record. */
+    /** Every branch with its verdict, in input order: the full record. */
     branches: VerifiedBranch[];
-    /** Just the branches that produced work AND passed verification — the
+    /** Just the branches that produced work AND passed verification: the
      *  trustworthy output. */
     confirmed: VerifiedBranch[];
 }
@@ -382,12 +382,12 @@ export interface OrchestrateResult {
  * survivors.
  *
  * This is the "I write Loops and the Loops do the implementation" shape end to
- * end — you supply *what* to do (the tasks) and *how to trust it* (the verifier
+ * end: you supply *what* to do (the tasks) and *how to trust it* (the verifier
  * and its bar), and the orchestration runs the Constructs and the checks without
  * you adjudicating each one. The single-Construct case (`tasks.length === 1`) is
  * just this with one branch, so there's one primitive, not two.
  *
- * Verification runs as each branch finishes its work — a branch that threw is
+ * Verification runs as each branch finishes its work: a branch that threw is
  * carried through with a null verdict (nothing to check), never verified, and
  * excluded from `confirmed`.
  */
@@ -404,7 +404,7 @@ export async function orchestrate(
     });
 
     // Stage 2: verify the branches that produced something, with the same
-    // concurrency bound. A failed branch has nothing to verify — pass it through
+    // concurrency bound. A failed branch has nothing to verify: pass it through
     // with a null verdict so the input-order record stays complete.
     const branches: VerifiedBranch[] = new Array(worked.length);
     let nextIndex = 0;

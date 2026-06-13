@@ -4,12 +4,12 @@
  * Two jobs the harness needs but the bridge deliberately doesn't do:
  *
  *  1. The bridge reports {@link Usage} for a *single* turn. A long-lived session
- *     runs many turns, so something has to *accumulate* them — total input,
+ *     runs many turns, so something has to *accumulate* them: total input,
  *     output, and cache-read tokens across the whole run, for cost control and
  *     telemetry. {@link UsageTracker} is that accumulator.
  *
  *  2. To decide *when* to compact, the loop needs a running estimate of how big
- *     the conversation has grown — before it sends it and gets a real
+ *     the conversation has grown: before it sends it and gets a real
  *     `input_tokens` back (by which point an over-limit request has already
  *     failed). {@link estimateTokens} is a deliberately crude, synchronous,
  *     dependency-free heuristic for that gate. It is NOT a tokenizer and never

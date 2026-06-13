@@ -50,7 +50,7 @@ test("cosineSimilarity returns 0 for mismatched lengths or a zero vector", () =>
 });
 
 // ---------------------------------------------------------------------------
-// OpenAIEmbedder — config
+// OpenAIEmbedder: config
 // ---------------------------------------------------------------------------
 
 test("OpenAIEmbedder requires a key and defaults model/dimensions", () => {
@@ -72,7 +72,7 @@ test("OpenAIEmbedder rejects dimensions above the model's native size", () => {
 });
 
 // ---------------------------------------------------------------------------
-// OpenAIEmbedder — request/response over a fake fetch
+// OpenAIEmbedder: request/response over a fake fetch
 // ---------------------------------------------------------------------------
 
 /** Build a fake fetch that returns a fixed-length unit vector per input,
@@ -189,7 +189,7 @@ test("embedOne returns the single vector for one input", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// OpenAIEmbedder — error paths
+// OpenAIEmbedder: error paths
 // ---------------------------------------------------------------------------
 
 test("a non-2xx response becomes an EmbeddingError carrying status + detail", async () => {

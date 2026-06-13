@@ -1,7 +1,7 @@
 /**
  * Integration test: the {@link AnthropicClient} retry path.
  *
- * We don't hit the network — we replace the client's underlying SDK
+ * We don't hit the network: we replace the client's underlying SDK
  * `messages.create` with a stub that fails a couple of times before succeeding,
  * and assert the client retries (with injected, instant sleep) and ultimately
  * returns a mapped {@link GenerateResult}. This proves the retry policy, the

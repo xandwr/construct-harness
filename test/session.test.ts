@@ -51,7 +51,7 @@ test("persists conversation across sends, without the system turn", async () => 
     await send(session, "two");
 
     const history = session.history();
-    // user, assistant, user, assistant — no system turn persisted.
+    // user, assistant, user, assistant: no system turn persisted.
     assert.equal(history.length, 4);
     assert.ok(
         history.every((m) => m.sender.role !== RoleType.System),

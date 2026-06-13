@@ -1,18 +1,50 @@
 {
     "name": "construct-harness",
     "version": "1.0.0",
-    "description": "",
-    "main": "index.js",
+    "description": "A small, provider-neutral TypeScript harness for long-lived agents (Constructs): hybrid SQLite memory, a streaming tool loop, and an adversarial critic panel.",
+    "type": "module",
+    "main": "./src/mod.ts",
+    "types": "./src/mod.ts",
+    "exports": {
+        ".": "./src/mod.ts",
+        "./testing": "./src/testing.ts"
+    },
+    "bin": {
+        "construct": "./src/index.ts"
+    },
+    "files": [
+        "src",
+        "README.md",
+        "LICENSE"
+    ],
     "scripts": {
-        "test": "node --test 'test/**/*.test.ts'",
+        "start": "node --env-file-if-exists=.env src/index.ts",
         "dev": "node --env-file-if-exists=.env src/index.ts",
+        "test": "node --test 'test/**/*.test.ts'",
+        "typecheck": "tsc -p tsconfig.json",
         "format": "prettier --write .",
         "format:check": "prettier --check ."
     },
-    "keywords": [],
-    "author": "",
+    "keywords": [
+        "agent",
+        "ai-agent",
+        "llm",
+        "anthropic",
+        "claude",
+        "memory",
+        "long-term-memory",
+        "sqlite",
+        "embeddings",
+        "semantic-search",
+        "multi-agent",
+        "llm-as-judge",
+        "typescript"
+    ],
+    "author": "Xander Pickering",
     "license": "ISC",
-    "type": "module",
+    "engines": {
+        "node": ">=23.6.0"
+    },
     "devDependencies": {
         "@types/node": "^25.9.3",
         "prettier": "3.8.4",

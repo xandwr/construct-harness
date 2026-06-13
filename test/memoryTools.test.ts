@@ -232,7 +232,7 @@ test("recallContext falls back to importance order when the query matches nothin
     store.save(new Memory({ content: "alpha", importance: 0.3 }));
     store.save(new Memory({ content: "beta", importance: 0.9 }));
 
-    // Query shares no token with any memory: don't return empty — fall back.
+    // Query shares no token with any memory: don't return empty: fall back.
     const text = await recallContext(store, { query: "zzz nonexistent terms" });
     assert.ok(text);
     assert.match(text, /beta/); // most important first, since relevance was a wash
@@ -370,7 +370,7 @@ test("the loop surfaces a save validation failure as a non-error result", async 
     const res = await runLoop(client, { messages: [user("save blank")], tools });
 
     // The tool handled the bad input itself, so it's a normal result the model
-    // can read — not a thrown error that aborts the call.
+    // can read: not a thrown error that aborts the call.
     const [result] = toolResults(res.messages);
     assert.equal(result.callId, "c1");
     assert.notEqual(result.isError, true);

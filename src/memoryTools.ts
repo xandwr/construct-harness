@@ -5,7 +5,7 @@
  *  - {@link memoryTools} builds `ToolDef`s the model can call to save, recall,
  *    and forget memories during a run.
  *  - {@link recallContext} pulls the most relevant memories up front so the
- *    harness can inject them into the system prompt — passive recall the model
+ *    harness can inject them into the system prompt: passive recall the model
  *    benefits from without having to ask.
  *
  * The tools speak plain JSON in and out: their `run` results are objects the
@@ -78,9 +78,9 @@ async function embedIfPossible(
  * The shared recall ranking, used by both the `memory_recall` tool and
  * {@link recallContext}. Order of preference:
  *   1. Semantic (cosine) match, when an embedder is configured and the query
- *      embeds successfully — finds memories that *mean* the same thing.
- *   2. Lexical (FTS/bm25) match — shared words.
- *   3. Importance/recency order — when there's no query or nothing matched.
+ *      embeds successfully: finds memories that *mean* the same thing.
+ *   2. Lexical (FTS/bm25) match: shared words.
+ *   3. Importance/recency order: when there's no query or nothing matched.
  * Each step falls through to the next so recall is never worse than before
  * embeddings existed.
  */
@@ -123,7 +123,7 @@ async function recallMemories(
  *
  * Pass an {@link Embedder} to enable semantic recall: saved memories are
  * embedded so `memory_recall` can match by *meaning* (cosine similarity), not
- * just shared words. Embedding is best-effort — if the embedding service fails,
+ * just shared words. Embedding is best-effort: if the embedding service fails,
  * the save still succeeds and recall transparently falls back to lexical (FTS)
  * then importance order, so the harness never loses a memory or a turn to an
  * embedding outage.
@@ -133,7 +133,7 @@ export function memoryTools(store: MemoryStore, embedder?: Embedder): ToolDef[] 
         name: "memory_save",
         description:
             "Save a durable memory for future conversations. Use for stable facts, " +
-            "preferences, and decisions worth remembering — not transient chatter.",
+            "preferences, and decisions worth remembering: not transient chatter.",
         parameters: {
             type: "object",
             properties: {
@@ -229,8 +229,8 @@ export interface RecallOptions {
     limit?: number;
     /**
      * The current turn's text. When given, memories are ranked by relevance to
-     * it — semantically if an {@link embedder} is provided, otherwise lexically
-     * (FTS/bm25) — rather than by global importance, so recall surfaces what's
+     * it: semantically if an {@link embedder} is provided, otherwise lexically
+     * (FTS/bm25): rather than by global importance, so recall surfaces what's
      * relevant to *this* turn. Falls back to importance order when omitted or
      * when nothing matches.
      */
@@ -256,7 +256,7 @@ export interface RecallOptions {
  * no embedder it still awaits but does no I/O beyond the synchronous store.
  *
  * Back-compat: also accepts a bare number as the second argument, meaning
- * `{ limit }` with no query — the original signature.
+ * `{ limit }` with no query: the original signature.
  */
 export async function recallContext(
     store: MemoryStore,

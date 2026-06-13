@@ -1,5 +1,5 @@
 /**
- * Session — a long-lived, interactive Construct.
+ * Session: a long-lived, interactive Construct.
  *
  * Where {@link runLoop} drives a single task to completion, a Session is the
  * persistent thing a user *talks to*: it holds the conversation across many
@@ -7,8 +7,8 @@
  * each turn, streams the model's reply token-by-token, and commits the result
  * back into its own history so the next turn builds on it.
  *
- * It speaks only core types and the bridge interface — the same discipline as
- * the rest of `src/` — so it works against any {@link ModelClient}. Memory is
+ * It speaks only core types and the bridge interface: the same discipline as
+ * the rest of `src/`: so it works against any {@link ModelClient}. Memory is
  * optional: with no store, a Session is just a streaming chat with context.
  */
 
@@ -76,7 +76,7 @@ export class Session {
     private readonly cfg: SessionConfig;
     private readonly tools: ToolDef[];
     private readonly context: ContextProvider[];
-    /** The durable conversation — user/assistant/tool turns only. The system
+    /** The durable conversation: user/assistant/tool turns only. The system
      *  turn is rebuilt per send (recall is turn-relevant), so it is NOT stored
      *  here; it's prepended at send time and never persisted. */
     private conversation: Message[] = [];
@@ -95,7 +95,7 @@ export class Session {
     }
 
     /** Drop all conversation history, starting the Construct fresh. Memory in
-     *  the store is untouched — only the in-session transcript is cleared. */
+     *  the store is untouched: only the in-session transcript is cleared. */
     reset(): void {
         this.conversation = [];
     }
@@ -106,7 +106,7 @@ export class Session {
      * Builds this turn's system prompt (base guidance + memory relevant to the
      * message), appends the user turn to the durable conversation, then streams
      * a {@link runLoopStream} run. The system turn is folded in only for this
-     * run — recall is recomputed next turn against the next message — so it is
+     * run: recall is recomputed next turn against the next message: so it is
      * never persisted into {@link history}. On completion the assistant turn(s)
      * and any tool turns are committed back to the conversation.
      *

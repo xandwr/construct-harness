@@ -3,8 +3,8 @@
  *
  * Compaction summarizes older turns through the model itself, so we drive it
  * with the scripted {@link FakeClient}: the next scripted turn is the "summary"
- * the fake model returns. We assert on what gets summarized vs. kept, and — most
- * importantly — that a tool_call is never split from its tool_result.
+ * the fake model returns. We assert on what gets summarized vs. kept, and: most
+ * importantly: that a tool_call is never split from its tool_result.
  */
 
 import { test } from "node:test";
@@ -90,7 +90,7 @@ test("system messages are preserved and never summarized", async () => {
 test("never orphans a tool_result from its tool_call across the boundary", async () => {
     // Build: u0,a0, then an assistant tool_call, then its tool_result, then
     // a recent pair. With keepRecent=2 the naive split would keep the
-    // tool_result but summarize its tool_call — an orphan. The boundary must
+    // tool_result but summarize its tool_call: an orphan. The boundary must
     // snap back to keep the call too.
     const msgs: Message[] = [
         user("u0"),

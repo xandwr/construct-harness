@@ -1,8 +1,8 @@
 /**
  * Tests for the streaming loop driver ({@link runLoopStream}).
  *
- * It must reproduce runLoop's control flow exactly — tool dispatch, max-turns
- * cut-off, compaction, usage — while *observing* it through {@link LoopEvent}s.
+ * It must reproduce runLoop's control flow exactly: tool dispatch, max-turns
+ * cut-off, compaction, usage: while *observing* it through {@link LoopEvent}s.
  * We drive it with the streaming {@link FakeClient} so it's deterministic.
  */
 

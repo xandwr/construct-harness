@@ -5,7 +5,7 @@
  * the harness shouldn't have to pattern-match on directly: doing so would leak
  * Anthropic vocabulary into the loop and the REPL, the exact coupling the bridge
  * exists to prevent. Instead, each provider classifies its own failures into a
- * {@link HarnessError} — a small, stable set of {@link ErrorKind}s plus the one
+ * {@link HarnessError}: a small, stable set of {@link ErrorKind}s plus the one
  * fact the retry policy actually needs: whether the failure is worth retrying,
  * and after how long.
  *
@@ -19,21 +19,21 @@
  * The normalized failure categories. Chosen so the retry policy and a
  * user-facing message can both be derived from the `kind` alone:
  *
- *  - `rate_limit` — throttled (HTTP 429). Retryable; usually carries a
+ *  - `rate_limit`: throttled (HTTP 429). Retryable; usually carries a
  *    retry-after.
- *  - `overloaded` — the provider is temporarily overloaded (Anthropic's 529 /
+ *  - `overloaded`: the provider is temporarily overloaded (Anthropic's 529 /
  *    `overloaded_error`). Retryable.
- *  - `server` — a 5xx the provider didn't label more specifically. Retryable.
- *  - `network` — transport failure (connection reset/refused, DNS). Retryable.
- *  - `timeout` — the request timed out. Retryable.
- *  - `auth` — bad/missing key or insufficient permission (401/403). NOT
- *    retryable — retrying sends the same bad credential.
- *  - `invalid_request` — the request itself is malformed (400/404/422). NOT
- *    retryable — the same request fails the same way.
- *  - `refusal` — the model declined to respond. NOT a transport error and not
+ *  - `server`: a 5xx the provider didn't label more specifically. Retryable.
+ *  - `network`: transport failure (connection reset/refused, DNS). Retryable.
+ *  - `timeout`: the request timed out. Retryable.
+ *  - `auth`: bad/missing key or insufficient permission (401/403). NOT
+ *    retryable: retrying sends the same bad credential.
+ *  - `invalid_request`: the request itself is malformed (400/404/422). NOT
+ *    retryable: the same request fails the same way.
+ *  - `refusal`: the model declined to respond. NOT a transport error and not
  *    retryable; surfaced so a caller can distinguish it from a crash.
- *  - `canceled` — the caller aborted the request. NOT retryable.
- *  - `unknown` — anything we couldn't classify. NOT retryable by default, so an
+ *  - `canceled`: the caller aborted the request. NOT retryable.
+ *  - `unknown`: anything we couldn't classify. NOT retryable by default, so an
  *    unrecognized error never spins the retry loop.
  */
 export type ErrorKind =

@@ -1,5 +1,5 @@
 /**
- * Context compaction — keep a long-lived conversation under the model's context
+ * Context compaction: keep a long-lived conversation under the model's context
  * window by summarizing its older turns.
  *
  * An interactive Construct accumulates turns and tool results without bound;
@@ -9,7 +9,7 @@
  * thread of conversation is untouched.
  *
  * The summary is produced by the model itself, through the same provider-neutral
- * {@link ModelClient} the loop already uses — so compaction works against any
+ * {@link ModelClient} the loop already uses: so compaction works against any
  * provider and needs no extra dependency.
  *
  * Two invariants make this safe to drop into the loop:
@@ -83,7 +83,7 @@ function resultIds(message: Message): Set<string> {
  *
  * The hazard: the message just before the boundary emitted tool_calls, and the
  * first kept message answers them with tool_results. Summarizing the call but
- * keeping the result leaves a result with no call — a wire error. We walk the
+ * keeping the result leaves a result with no call: a wire error. We walk the
  * boundary back past any leading tool-result turn whose calls live in the turn
  * before it, so the kept tail always starts on a self-contained turn.
  */
@@ -141,7 +141,7 @@ function safeJson(value: unknown): string {
 
 /** The instruction we give the model to summarize the older turns. Phrased to
  *  preserve the things a resumed conversation actually needs: decisions, facts
- *  established, open threads — not a play-by-play. */
+ *  established, open threads: not a play-by-play. */
 const SUMMARY_SYSTEM =
     "You are compacting an ongoing conversation to fit a context window. " +
     "Write a concise summary of the transcript below that preserves everything " +
@@ -159,7 +159,7 @@ const SUMMARY_SYSTEM =
  * context rather than something the user said.
  *
  * Returns `compacted: false` (and the input unchanged) when there's nothing
- * worth summarizing — i.e. the non-system history already fits within
+ * worth summarizing: i.e. the non-system history already fits within
  * `keepRecent`. Summarization uses {@link ModelClient.generate}; a failure
  * propagates to the caller, which should decide whether to proceed uncompacted.
  */
@@ -216,7 +216,7 @@ export async function compactConversation(
         .trim();
 
     // A summarizer that returned nothing usable would lose history if we dropped
-    // the turns anyway — bail and keep the originals. We still report the usage:
+    // the turns anyway: bail and keep the originals. We still report the usage:
     // the call happened and cost tokens even though it produced no summary.
     if (!summaryText) {
         return { messages, compacted: false, summarizedCount: 0, usage: result.usage };

@@ -3,7 +3,7 @@
  *
  * These cross the wire format both ways and are the second half of the "agent
  * tool stuff": if a tool_call or tool_result is mapped wrong, the loop's
- * id-correlation breaks even though the loop logic is fine. No SDK calls here —
+ * id-correlation breaks even though the loop logic is fine. No SDK calls here:
  * every function under test is pure and exported for exactly this reason.
  */
 
@@ -16,6 +16,7 @@ import {
     fromAnthropicMessage,
     toStopReason,
     stringifyResult,
+    ANTHROPIC_CAPABILITIES,
 } from "../src/bridge/anthropic.ts";
 import { RoleType } from "../src/types.ts";
 import type { Message, ToolDef } from "../src/types.ts";
@@ -210,4 +211,29 @@ test("a tool_call round-trips Anthropic → core → Anthropic with id intact", 
     assert.equal(block.type, "tool_use");
     assert.equal(block.id, "call_xyz", "id must survive the round trip for result correlation");
     assert.deepEqual(block.input, { k: "v" });
+});
+
+// ── Capability honesty ──────────────────────────────────────────────────────
+
+test("advertised serverTools capability matches what toAnthropicTools emits", () => {
+    const tools: ToolDef[] = [
+        {
+            name: "echo",
+            description: "echoes",
+            parameters: { type: "object", properties: {} },
+            run: async (x) => x,
+        },
+    ];
+    const mapped = toAnthropicTools(tools) ?? [];
+
+    // A server tool is a typed block (e.g. { type: "web_search_20250305" });
+    // a custom tool has no `type`. The client only ever emits custom tools, so
+    // the capability flag must not claim otherwise.
+    const emitsServerTool = mapped.some((t) => "type" in (t as Record<string, unknown>));
+    assert.equal(emitsServerTool, false, "no server-tool block is emitted");
+    assert.equal(
+        ANTHROPIC_CAPABILITIES.serverTools,
+        false,
+        "serverTools must stay false while only custom tools are emitted",
+    );
 });

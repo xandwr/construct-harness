@@ -3,7 +3,7 @@
  *
  * Every store is backed by an in-memory SQLite database (`:memory:`), so the
  * suite never touches disk, never shares state between tests, and is fully
- * deterministic — `created` timestamps are injected rather than read from the
+ * deterministic: `created` timestamps are injected rather than read from the
  * clock wherever ordering or staleness matters.
  */
 
@@ -293,7 +293,7 @@ test("searchRelevant ranks by lexical match, not importance", () => {
     store.save(mem("call the dentist about a filling", { importance: 0.9 }));
     store.save(mem("user likes oat milk in coffee", { importance: 0.1 }));
 
-    // The milk note must rank first — bm25 relevance beats the dentist note's
+    // The milk note must rank first: bm25 relevance beats the dentist note's
     // higher importance. (Both may appear: stopword-ish tokens like "the" can
     // make the dentist note a weak match; what matters is that it ranks below.)
     const hits = store.searchRelevant("what milk does the user prefer?");
@@ -402,7 +402,7 @@ test("semanticSearch honors limit, offset, and tag filtering", () => {
     const c = store.save(mem("gamma", { tags: ["skip"] }));
     store.setEmbedding(a.id, unit(0.9, 0.4)); // a near the query
     store.setEmbedding(b.id, unit(0.5, 0.9)); // b a bit further
-    store.setEmbedding(c.id, unit(1, 0)); // exact match — would rank top, but filtered out
+    store.setEmbedding(c.id, unit(1, 0)); // exact match: would rank top, but filtered out
 
     // Tag filter drops gamma even though it's the closest; remaining ranked by similarity.
     const tagged = store.semanticSearch(unit(1, 0), { tags: ["keep"] });
@@ -466,7 +466,7 @@ test("editing content invalidates the stale embedding; metadata edits keep it", 
     store.update(a.id, { importance: 0.9 });
     assert.equal(store.hasEmbedding(a.id), true);
 
-    // A content edit invalidates it — the vector no longer matches the text.
+    // A content edit invalidates it: the vector no longer matches the text.
     store.update(a.id, { content: "completely different now" });
     assert.equal(store.hasEmbedding(a.id), false);
     assert.deepEqual(store.idsMissingEmbedding(), [a.id]);

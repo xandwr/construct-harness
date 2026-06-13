@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { AnthropicClient } from "./bridge/anthropic.ts";
 import type { ModelClient } from "./bridge/types.ts";
 import { MemoryStore } from "./memory.ts";
@@ -6,7 +7,7 @@ import { Session } from "./session.ts";
 import { runRepl } from "./repl.ts";
 
 const BASE_SYSTEM =
-    "You are a helpful, concise assistant — a long-lived Construct that remembers " +
+    "You are a helpful, concise assistant: a long-lived Construct that remembers " +
     "across conversations. Save durable facts and preferences with memory_save, and " +
     "recall them with memory_recall. Don't save transient chatter.";
 
@@ -14,7 +15,7 @@ const BASE_SYSTEM =
  * Construct the cloud embedder when an OpenAI key is configured, else return
  * undefined so the harness runs with purely lexical recall. A bad key surfaces
  * later, on first use, as a caught {@link EmbeddingError} (recall degrades
- * gracefully) — construction only needs the key to be present.
+ * gracefully): construction only needs the key to be present.
  */
 function makeEmbedder(): Embedder | undefined {
     if (!process.env.OPENAI_API_KEY && !process.env.OPENAI_ADMIN_KEY) return undefined;
@@ -64,7 +65,7 @@ const DEFAULT_COMPACT_AT = 120_000;
 
 async function main() {
     if (!process.env.ANTHROPIC_API_KEY) {
-        console.log("harness boot — no ANTHROPIC_API_KEY set, skipping live session.");
+        console.log("harness boot: no ANTHROPIC_API_KEY set, skipping live session.");
         console.log("bridge wired:", new AnthropicClient().provider);
         return;
     }

@@ -171,7 +171,7 @@ test("stops at maxTurns even if the model keeps requesting tools", async () => {
 
     assert.equal(res.turns, 2);
     assert.equal(client.calls.length, 2);
-    // final is the 2nd turn, which still requested a tool — caller can detect
+    // final is the 2nd turn, which still requested a tool: caller can detect
     // the runaway via stopReason === "tool_use".
     assert.equal(res.final.stopReason, "tool_use");
 });
@@ -252,7 +252,7 @@ test("no context providers leaves the messages untouched", async () => {
 
 // ── Truncation handling ─────────────────────────────────────────────────────
 
-test("a max_tokens turn is terminal — its partial tool_call is NOT executed", async () => {
+test("a max_tokens turn is terminal: its partial tool_call is NOT executed", async () => {
     // A turn truncated by max_tokens may carry a half-emitted tool_call whose
     // args were cut off. The loop must not dispatch it; it stops and lets the
     // caller see stopReason === "max_tokens".

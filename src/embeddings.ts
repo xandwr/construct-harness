@@ -1,18 +1,18 @@
 /**
- * Embeddings — turn text into vectors for semantic (meaning-based) recall.
+ * Embeddings: turn text into vectors for semantic (meaning-based) recall.
  *
  * The {@link Embedder} interface is provider-neutral on purpose, mirroring the
  * bridge's {@link ModelClient}: the {@link MemoryStore} knows how to *store* and
  * *compare* vectors but never how to *produce* them, so swapping OpenAI for a
  * local model later touches only this file. {@link OpenAIEmbedder} is the first
  * implementation, calling OpenAI's hosted `/v1/embeddings` endpoint over plain
- * `fetch` (no SDK dependency — the request shape is tiny and stable).
+ * `fetch` (no SDK dependency: the request shape is tiny and stable).
  *
  * Vectors are returned L2-normalized, so a downstream dot product *is* cosine
  * similarity. The store relies on that invariant.
  */
 
-/** Thrown when embedding fails — bad config, a transport error, or a bad
+/** Thrown when embedding fails: bad config, a transport error, or a bad
  *  response. Callers can `instanceof`-check to distinguish it from storage
  *  errors and decide whether to degrade gracefully (e.g. fall back to FTS). */
 export class EmbeddingError extends Error {
@@ -49,7 +49,7 @@ export async function embedOne(embedder: Embedder, text: string): Promise<Float3
 
 /**
  * Cosine similarity of two vectors. When both are L2-normalized (as everything
- * {@link Embedder} returns), this reduces to a dot product — but we guard the
+ * {@link Embedder} returns), this reduces to a dot product: but we guard the
  * general case so a stray un-normalized vector can't silently skew ranking.
  * Returns a value in roughly [-1, 1]; 0 for a zero-length or mismatched vector.
  */

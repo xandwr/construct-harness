@@ -1,5 +1,5 @@
 /**
- * An interactive REPL over a {@link Session} — the harness's "talk to the
+ * An interactive REPL over a {@link Session}: the harness's "talk to the
  * Construct" entrypoint.
  *
  * Reads lines from stdin, streams each reply to stdout token-by-token, and shows
@@ -7,7 +7,7 @@
  * session-level actions a transcript can't: `/reset`, `/history`, `/exit`.
  *
  * This is deliberately thin: all the conversation, memory, and streaming logic
- * lives in {@link Session}. The REPL only owns the terminal — reading input and
+ * lives in {@link Session}. The REPL only owns the terminal: reading input and
  * rendering the {@link LoopEvent} stream.
  */
 

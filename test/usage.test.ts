@@ -71,7 +71,7 @@ test("estimateTokens counts tool-call and tool-result parts", () => {
     assert.ok(estimateTokens(withTool) > 2 * 4);
 });
 
-test("estimateTokens errs high — over-counts relative to chars/4", () => {
+test("estimateTokens errs high: over-counts relative to chars/4", () => {
     // The gate wants to fire early, so the estimate should exceed the common
     // ~4-chars/token rule of thumb for plain prose.
     const text = "a".repeat(400);

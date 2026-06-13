@@ -1,5 +1,5 @@
 /**
- * Tests for {@link classifyAnthropicError} — the Anthropic-specific mapping from
+ * Tests for {@link classifyAnthropicError}: the Anthropic-specific mapping from
  * raw SDK errors to the neutral {@link HarnessError} taxonomy.
  *
  * We construct real SDK error instances (no network) and assert the resulting

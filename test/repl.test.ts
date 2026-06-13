@@ -126,7 +126,7 @@ test("ends cleanly on EOF without /exit", async () => {
 });
 
 test("renders a HarnessError with its kind and keeps the REPL alive", async () => {
-    // A client whose stream throws a classified error — the REPL should report
+    // A client whose stream throws a classified error: the REPL should report
     // the kind, not crash, and continue to the next prompt.
     const throwing: ModelClient = {
         provider: "x",

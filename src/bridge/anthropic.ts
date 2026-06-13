@@ -1,5 +1,5 @@
 /**
- * Anthropic — the first {@link ModelClient} implementation.
+ * Anthropic: the first {@link ModelClient} implementation.
  *
  * This is the only module in the bridge that imports a provider SDK. It owns
  * every Anthropic-specific fact: that `system` is a top-level field rather than
@@ -51,7 +51,13 @@ export const ANTHROPIC_CAPABILITIES: ProviderCapabilities = {
     thinking: true,
     effort: true,
     promptCaching: true,
-    serverTools: true,
+    // Anthropic the *provider* hosts server-side tools (web search, code
+    // execution), but this client does not wire them yet: toAnthropicTools only
+    // emits custom {name, description, input_schema} tools, and AnthropicOptions
+    // exposes no server-tool knob. Every other flag here maps to something the
+    // client actually does, so we keep this one honest and false until the
+    // wiring exists. Flip it the same commit that emits a server-tool block.
+    serverTools: false,
     streaming: true,
 };
 
@@ -61,7 +67,7 @@ export const ANTHROPIC_CAPABILITIES: ProviderCapabilities = {
  *
  *  Anthropic keeps system guidance top-level rather than in the turn array, so
  *  we lift every `role: "system"` text part out and concatenate it. The rest
- *  map turn-for-turn. This function is pure — no SDK, no I/O. */
+ *  map turn-for-turn. This function is pure: no SDK, no I/O. */
 export function toAnthropicMessages(messages: Message[]): {
     system: string | undefined;
     messages: Anthropic.MessageParam[];
@@ -114,7 +120,7 @@ function toAnthropicContent(parts: ContentPart[]): Anthropic.ContentBlockParam[]
 
 /** Tool results are arbitrary JSON in the core; Anthropic wants text/blocks.
  *
- *  A tool may return a value that doesn't serialize — a circular object, or one
+ *  A tool may return a value that doesn't serialize: a circular object, or one
  *  with a throwing `toJSON`. We never let that crash the mapping: the model gets
  *  a readable placeholder instead, and the loop keeps going. */
 export function stringifyResult(result: unknown): string {
@@ -252,7 +258,7 @@ function kindForStatus(status: number): ErrorKind {
 export function classifyAnthropicError(err: unknown): HarnessError {
     if (err instanceof HarnessError) return err;
 
-    // Caller aborted (AbortController) — not a transport failure, never retried.
+    // Caller aborted (AbortController): not a transport failure, never retried.
     if (err instanceof Anthropic.APIUserAbortError) {
         return new HarnessError("request canceled", {
             kind: "canceled",
@@ -307,7 +313,7 @@ export interface AnthropicClientConfig {
      * Harness-level retry policy for `generate` and stream-start. Pass `false`
      * to disable (the SDK still does its own internal retries); omit for the
      * defaults in {@link withRetry}. We set the SDK's own `maxRetries` to 0 so
-     * retries aren't applied twice — this layer is the single, observable retry
+     * retries aren't applied twice: this layer is the single, observable retry
      * point, keying off the neutral {@link HarnessError} taxonomy.
      */
     retry?: RetryOptions | false;
@@ -322,7 +328,7 @@ export class AnthropicClient implements ModelClient {
     private readonly retry: RetryOptions | false;
 
     constructor(config: AnthropicClientConfig = {}) {
-        // maxRetries: 0 — this client owns retries (see `retry`), so the SDK's
+        // maxRetries: 0: this client owns retries (see `retry`), so the SDK's
         // own retry loop would otherwise double up and hide the classified error.
         this.sdk = new Anthropic({
             ...(config.apiKey ? { apiKey: config.apiKey } : {}),
@@ -392,7 +398,7 @@ export class AnthropicClient implements ModelClient {
         // the act of opening the stream *and pulling its first event* as one
         // unit: that's the window where a retry is safe (no delta emitted yet).
         // Once the first event is in hand, a later mid-stream failure can't be
-        // retried without duplicating emitted text — it's classified and
+        // retried without duplicating emitted text: it's classified and
         // rethrown below for the loop/REPL to handle.
         const toolIdByIndex = new Map<number, string>();
         // Open the stream and pull its first event as one retried unit, holding

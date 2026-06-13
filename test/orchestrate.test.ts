@@ -13,18 +13,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { Session } from "../src/session.ts";
-import {
-    loop,
-    fanout,
-    verify,
-    orchestrate,
-    spawnFrom,
-    type LoopStep,
-} from "../src/orchestrate.ts";
+import { loop, fanout, verify, orchestrate, spawnFrom, type LoopStep } from "../src/orchestrate.ts";
 import type { TurnResult } from "../src/session.ts";
 import { FakeClient, textTurn, callTurn } from "./helpers/fakeClient.ts";
 
-/** A Session over a one-reply scripted client — the minimal Construct. */
+/** A Session over a one-reply scripted client: the minimal Construct. */
 function constructSaying(...replies: string[]): Session {
     return new Session({ client: new FakeClient(replies.map(textTurn)), system: "S" });
 }
@@ -76,7 +69,7 @@ test("loop stops at maxIterations when done never holds", async () => {
     assert.equal(res.stopReason, "maxIterations");
     assert.equal(res.iterations, 3);
     // next() is not consulted after the final allowed iteration, so only 3 sends
-    // happened — the client still has turns "d"/"e" unused, which is fine.
+    // happened: the client still has turns "d"/"e" unused, which is fine.
 });
 
 test("loop sums usage across every iteration", async () => {
@@ -148,7 +141,7 @@ test("fanout runs one Construct per task and returns results in input order", as
 
 test("fanout isolates a throwing branch as an error result, not a batch failure", async () => {
     // A client with an empty script throws on first send ("called more times than
-    // scripted") — a clean way to make exactly one branch fail.
+    // scripted"): a clean way to make exactly one branch fail.
     const res = await fanout(["ok0", "boom1", "ok2"], (task) => {
         if (task === "boom1") return new Session({ client: new FakeClient([]), system: "S" });
         return constructSaying("fine");
@@ -234,8 +227,7 @@ test("verify sends the candidate through the prompt builder", async () => {
         prompt: (c) => `check this: ${c}`,
     });
     // The wire saw the wrapped candidate.
-    const wire = client.calls[0]!.messages
-        .flatMap((m) => m.content)
+    const wire = client.calls[0]!.messages.flatMap((m) => m.content)
         .filter((p): p is { kind: "text"; text: string } => p.kind === "text")
         .map((p) => p.text)
         .join(" ");
@@ -314,7 +306,7 @@ test("orchestrate tags events with their branch and phase", async () => {
 });
 
 test("orchestrate works with a Construct that uses tools mid-branch", async () => {
-    // A worker branch that calls a tool then answers — proves the branch drive
+    // A worker branch that calls a tool then answers: proves the branch drive
     // runs the full agentic loop, not just one model turn.
     const noop = {
         name: "noop",

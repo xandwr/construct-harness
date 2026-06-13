@@ -83,12 +83,12 @@ export class MigrationError extends Error {
  * `i` to version `i + 1` (1-indexed: MIGRATIONS[0] produces schema version 1).
  *
  * Rules that keep this honest:
- *  - APPEND ONLY. Never edit or reorder a published migration — add a new one.
+ *  - APPEND ONLY. Never edit or reorder a published migration: add a new one.
  *    Changing history would make already-migrated databases silently wrong.
  *  - Each `up` runs inside a transaction managed by {@link migrate}; it should
  *    not BEGIN/COMMIT itself.
  *  - Migration 1 is written defensively (IF NOT EXISTS) so it adopts pre-
- *    versioning databases — those created before user_version was tracked
+ *    versioning databases: those created before user_version was tracked
  *    already have the table and simply advance to version 1 as a no-op.
  */
 const MIGRATIONS: ReadonlyArray<{ name: string; up: (db: DatabaseSync) => void }> = [
@@ -155,7 +155,7 @@ const MIGRATIONS: ReadonlyArray<{ name: string; up: (db: DatabaseSync) => void }
         // Vector index for semantic (meaning-based) recall. Each row holds one
         // memory's embedding as a little-endian float32 BLOB plus its dimension,
         // keyed by the memory's id. Unlike FTS, embeddings can't be computed in
-        // SQL — they require a network call to an embedding model — so rows are
+        // SQL: they require a network call to an embedding model: so rows are
         // written explicitly by the application (see setEmbedding / backfill),
         // NOT by an INSERT/UPDATE trigger.
         //
@@ -198,7 +198,7 @@ export const SCHEMA_VERSION = MIGRATIONS.length;
  * resulting version.
  *
  * Refuses to touch a database whose version is *newer* than this code knows
- * about — that means an older binary opened a future schema, and proceeding
+ * about: that means an older binary opened a future schema, and proceeding
  * could corrupt it. Fail loudly instead.
  */
 function migrate(db: DatabaseSync): number {
@@ -369,7 +369,7 @@ function parseTags(raw: string | null): string[] {
  * SQLite-backed store for {@link Memory} objects.
  *
  * The database is injectable: pass a path (default `db.sqlite`) or `:memory:`
- * for an isolated, ephemeral store — which is what the tests use so they never
+ * for an isolated, ephemeral store: which is what the tests use so they never
  * touch disk or share state. Construct one, use it, and {@link close} it.
  *
  * File-backed stores run in WAL mode by default, so many readers and a single
@@ -445,7 +445,7 @@ export class MemoryStore {
         );
         this.deleteVecStmt = this.db.prepare(`DELETE FROM memory_vec WHERE rowid = ?`);
         this.getVecStmt = this.db.prepare(`SELECT vec FROM memory_vec WHERE rowid = ?`);
-        // Memories with no (or a stale, hence absent) embedding yet — the
+        // Memories with no (or a stale, hence absent) embedding yet: the
         // backfill work-list. Newest first so recent memories get vectors soonest.
         this.missingVecStmt = this.db.prepare(
             `SELECT m.id FROM memory m
@@ -545,7 +545,7 @@ export class MemoryStore {
      * with importance as a gentle tiebreak. This is what auto-recall wants: rows
      * most relevant to *this turn*, not the globally most-important rows.
      *
-     * Unlike {@link search} (substring `LIKE`), matching here is token-based —
+     * Unlike {@link search} (substring `LIKE`), matching here is token-based:
      * the query is reduced to its word tokens and OR-matched, so a whole
      * sentence still finds memories that share any meaningful term. A query with
      * no usable tokens (or no FTS hits) yields an empty array; callers that want
@@ -589,7 +589,7 @@ export class MemoryStore {
 
     /**
      * Store (or replace) the embedding for a memory. Returns false if no memory
-     * with that id exists — we won't keep an orphan vector. The vector is
+     * with that id exists: we won't keep an orphan vector. The vector is
      * expected to be L2-normalized (as {@link Embedder} guarantees) so that
      * semantic ranking can use a plain dot product.
      */
@@ -615,7 +615,7 @@ export class MemoryStore {
     }
 
     /**
-     * Ids of memories with no current embedding — the backfill work-list. A
+     * Ids of memories with no current embedding: the backfill work-list. A
      * memory loses its embedding when its content is edited (trigger), so this
      * also surfaces rows whose vectors went stale and need recomputing. Newest
      * first; bounded by `limit` (default {@link DEFAULT_LIMIT}).
@@ -633,7 +633,7 @@ export class MemoryStore {
      * share no words with the query.
      *
      * The query vector must come from the same embedding model the stored
-     * vectors did — mismatched dimensions simply score 0 and drop out. Memories
+     * vectors did: mismatched dimensions simply score 0 and drop out. Memories
      * without an embedding are invisible here (embed them first via
      * {@link setEmbedding} / a backfill).
      *
@@ -788,7 +788,7 @@ function escapeLike(s: string): string {
  * `(`, `-`, and the bareword `AND`/`OR`/`NOT` are FTS operators and would
  * either throw a syntax error or change the query's meaning. So we extract
  * alphanumeric word tokens, wrap each in double quotes (which makes it a
- * literal string token, neutralizing operators), and OR them together — any
+ * literal string token, neutralizing operators), and OR them together: any
  * shared term makes a memory a candidate, and bm25 sorts by how well it matches.
  *
  * Returns null when the text has no usable tokens, so the caller can treat that

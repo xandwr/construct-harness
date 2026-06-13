@@ -2,8 +2,8 @@
  * The provider-agnostic bridge contract.
  *
  * This module is the boundary between the harness's static core (`../types.ts`)
- * and any concrete model API. It imports *only* from the core — never from a
- * provider SDK — so that the core stays the single source of truth for what a
+ * and any concrete model API. It imports *only* from the core: never from a
+ * provider SDK: so that the core stays the single source of truth for what a
  * message is, and providers remain interchangeable implementations beneath it.
  *
  * A provider supplies one thing: a `ModelClient`. Anthropic is the first.
