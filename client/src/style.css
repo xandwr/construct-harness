@@ -1,5 +1,17 @@
 @import 'tailwindcss';
 
+/* The instrument's typeface: BigBlueTerm437, the IBM PC / DOS code-page 437
+   terminal face (Nerd Font Mono build, so glyph widths are fixed and the icon
+   range is present). Bundled into the build so the site renders identically
+   without the font installed on the host. */
+@font-face {
+	font-family: 'BigBlueTerm437';
+	src: url('$lib/assets/fonts/BigBlueTerm437NerdFontMono-Regular.ttf') format('truetype');
+	font-weight: normal;
+	font-style: normal;
+	font-display: swap;
+}
+
 /* Cold, deep, desaturated. The accent is light leaking out of something large,
    used sparingly. No decoration lives here; the only soft thing in the whole
    interface is the breath on the mark. */
@@ -15,9 +27,10 @@
 	--color-glow: #8fb3c4;
 	--color-glow-soft: #121a20;
 
-	/* terminal: one mono family for everything. the typeface does not emote. */
-	--font-sans: ui-monospace, 'SF Mono', 'JetBrains Mono', 'Fira Code', Menlo, monospace;
-	--font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', 'Fira Code', Menlo, monospace;
+	/* terminal: one mono family for everything. the typeface does not emote.
+	   BigBlueTerm437 leads; the rest are fallbacks until the face loads. */
+	--font-sans: 'BigBlueTerm437', ui-monospace, 'SF Mono', 'JetBrains Mono', 'Fira Code', Menlo, monospace;
+	--font-mono: 'BigBlueTerm437', ui-monospace, 'SF Mono', 'JetBrains Mono', 'Fira Code', Menlo, monospace;
 
 	/* square by default. no rounded corners anywhere. */
 	--radius-sm: 0px;
