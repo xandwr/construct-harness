@@ -21,9 +21,20 @@
  * result drops straight into a `tool_result` part) and never throws out of `run`:
  * a command that fails, times out, or can't be spawned comes back as a structured
  * result the model can read and react to, not an exception that crashes the loop.
+ *
+ * Because commands run through the user's *actual* login shell ($SHELL), the
+ * dialect that works isn't always bash/POSIX: a fish user needs `set -x X 1` and
+ * `a; and b`, not `export X=1` and `a && b`. So the tool description names the
+ * live shell (and OS) and tells the model to write in that shell's syntax. We
+ * don't translate or teach each dialect; we just hand the model the one fact it's
+ * missing and let it infer the syntax it already knows. The name comes from the
+ * same {@link loginShell} the command runs through, so guidance and execution
+ * can't drift apart, and it adapts automatically as the user's $SHELL changes.
  */
 
 import { spawn } from "node:child_process";
+import { basename } from "node:path";
+import { platform } from "node:os";
 import type { ToolDef } from "./types.ts";
 
 /** The tool name the model sees. The doubled underscores read as a namespace
@@ -97,6 +108,38 @@ function loginShell(): string {
     return process.env.SHELL || "/bin/sh";
 }
 
+/** The shell's short name (its binary's basename, e.g. "fish", "zsh", "bash"),
+ *  which is all the model needs to pick the right dialect. Derived from the same
+ *  {@link loginShell} the command actually runs through, so what we *tell* the
+ *  model and what we *execute on* can never drift apart. */
+function shellName(): string {
+    // basename strips the path and any version suffix is rare enough to ignore;
+    // "/usr/bin/fish" → "fish", "/bin/sh" → "sh".
+    return basename(loginShell());
+}
+
+/**
+ * Describe the live shell environment for the tool description, so the model
+ * authors commands in the *right* dialect instead of defaulting to bash/POSIX
+ * and tripping over a non-POSIX shell. The classic trap is fish: `export X=1`,
+ * `a && b`, and `$(...)` all differ (`set -x X 1`, `a; and b`, `(...)`), so a
+ * bash-shaped command silently does the wrong thing or errors. We don't try to
+ * teach the model each dialect; we just name the shell and OS and let it infer
+ * the syntax it already knows, which is the whole point of this goal.
+ *
+ * Returns a sentence ready to append to the tool description, kept to one line
+ * so it adds context without bloating the prompt.
+ */
+function shellEnvNote(): string {
+    const name = shellName();
+    const os = platform(); // "linux", "darwin", "win32", …
+    return (
+        `The user's shell is ${name} on ${os}; write the command in ${name} syntax ` +
+        `(its own quoting, variables, and control operators), not assuming bash/POSIX. ` +
+        `For example, ${name === "fish" ? "fish uses 'set -x VAR value' and 'a; and b', not 'export VAR=value' and 'a && b'" : "constructs like variable assignment, exports, and conditionals can differ between shells"}.`
+    );
+}
+
 /** Options for {@link shellTools}. */
 export interface ShellToolsOptions {
     /** Default timeout in ms for a command that doesn't set its own. Defaults to
@@ -133,19 +176,21 @@ export function shellTools(options: ShellToolsOptions = {}): ToolDef[] {
             "files, their tools, their working directory), not a sandbox: use it to " +
             "run the project's tests, read or edit real files, drive a CLI, or inspect " +
             "the actual system. The command runs through the user's shell, so pipes, " +
-            "redirects, globs, and `&&` work as written. For disposable computation " +
-            "that doesn't need to touch this machine, prefer the sandboxed code " +
-            "execution tool instead. A non-zero exit code is returned as data, not an " +
-            "error: read it and react.",
+            "redirects, globs, and control operators work as written. For disposable " +
+            "computation that doesn't need to touch this machine, prefer the sandboxed " +
+            "code execution tool instead. A non-zero exit code is returned as data, " +
+            "not an error: read it and react. " +
+            shellEnvNote(),
         parameters: {
             type: "object",
             properties: {
                 command: {
                     type: "string",
                     description:
-                        "The shell command to run, exactly as you'd type it at a " +
-                        "prompt (a full command line, e.g. 'npm test' or " +
-                        "'grep -n TODO src/*.ts | head').",
+                        "The shell command to run, exactly as you'd type it at the " +
+                        `user's ${shellName()} prompt (a full command line, e.g. ` +
+                        "'npm test' or 'grep -n TODO src/*.ts | head'), in that " +
+                        "shell's syntax.",
                 },
                 cwd: {
                     type: "string",

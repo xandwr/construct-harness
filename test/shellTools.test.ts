@@ -60,6 +60,63 @@ test("shellTools exposes a single use__user__shell tool", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Shell-dialect awareness: the tool description names the *actual* shell so the
+// model authors syntax in that shell's dialect instead of defaulting to bash.
+// The shell is read from $SHELL (the same source the command runs through), so
+// we drive these by swapping $SHELL and rebuilding the tool. `command` is the
+// JSON-schema fragment for that parameter.
+// ---------------------------------------------------------------------------
+
+/** Build the tool with $SHELL forced to `shellPath`, restoring it after. */
+function shellWith(shellPath: string | undefined): ToolDef {
+    const saved = process.env.SHELL;
+    try {
+        if (shellPath === undefined) delete process.env.SHELL;
+        else process.env.SHELL = shellPath;
+        return tool(shellTools(), USER_SHELL_TOOL);
+    } finally {
+        if (saved === undefined) delete process.env.SHELL;
+        else process.env.SHELL = saved;
+    }
+}
+
+test("the description names the user's actual shell so the model picks its dialect", () => {
+    const fish = shellWith("/usr/bin/fish");
+    assert.match(fish.description, /fish/);
+    // Fish gets a concrete syntax example, since its divergence from bash is the
+    // classic failure this whole feature exists to prevent.
+    assert.match(fish.description, /set -x VAR value/);
+    assert.match(fish.description, /a; and b/);
+
+    const zsh = shellWith("/bin/zsh");
+    assert.match(zsh.description, /zsh/);
+    assert.doesNotMatch(zsh.description, /fish/);
+
+    const bash = shellWith("/bin/bash");
+    assert.match(bash.description, /bash/);
+});
+
+test("the command parameter description is shell-aware too", () => {
+    const fish = shellWith("/usr/bin/fish");
+    const props = (fish.parameters as { properties: Record<string, { description: string }> })
+        .properties;
+    assert.match(props.command.description, /fish prompt/);
+});
+
+test("falls back to a sane shell name when $SHELL is unset", () => {
+    const none = shellWith(undefined);
+    // loginShell() falls back to /bin/sh, so the model is told it's targeting sh.
+    assert.match(none.description, /\bsh\b/);
+});
+
+test("the description no longer claims `&&` works universally", () => {
+    // `&&` is exactly the bash-ism that breaks in fish; the generic description
+    // must not present it as portable.
+    const fish = shellWith("/usr/bin/fish");
+    assert.doesNotMatch(fish.description, /`&&` work as written/);
+});
+
+// ---------------------------------------------------------------------------
 // Happy path
 // ---------------------------------------------------------------------------
 

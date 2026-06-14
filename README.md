@@ -39,7 +39,10 @@ provider-hosted web search / fetch / code execution it can run server-side
 counterpart to that sandboxed code execution, a `use__user__shell` tool that runs
 commands on the user's _real_ machine, with the harness process's own privileges,
 so it can run the project's tests, read or edit actual files, and drive the user's
-CLIs ([`src/shellTools.ts`](src/shellTools.ts)). Its reasoning trace streams
+CLIs ([`src/shellTools.ts`](src/shellTools.ts)) — and because those commands go
+through the user's actual login shell, the tool tells the Construct which shell
+(and OS) it's on, so it writes fish, zsh, or bash syntax rather than assuming
+bash. Its reasoning trace streams
 through to the UI as a collapsible block. None of this is auto-magic: each is a
 tool or a passive context provider you opt into when wiring the `Session`.
 
