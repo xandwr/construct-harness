@@ -29,3 +29,19 @@ export function clock(ms: number): string {
     const d = new Date(ms);
     return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
+
+/** The exact event time, seconds-precise: "jun 12 18:40:07". Where {@link clock}
+ *  and {@link shortWhen} round to the minute, this is for the event log, which
+ *  records the precise moment a thing happened; pair with {@link iso} as a hover
+ *  title for the full machine-readable timestamp. */
+export function exactWhen(ms: number): string {
+    const d = new Date(ms);
+    const time = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    return `${MONTHS[d.getMonth()]} ${d.getDate()} ${time}`;
+}
+
+/** The full ISO-8601 timestamp, for a hover title or copy: nothing rounded, the
+ *  exact millisecond and timezone offset. */
+export function iso(ms: number): string {
+    return new Date(ms).toISOString();
+}

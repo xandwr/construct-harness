@@ -2,6 +2,7 @@
 	import AppHeader from '$lib/AppHeader.svelte';
 	import { APPS } from '$lib/apps';
 	import { getLog, ApiError, type WireEvent } from '$lib/api';
+	import { exactWhen, iso } from '$lib/time';
 
 	const app = APPS.find((a) => a.id === 'log')!;
 
@@ -61,6 +62,9 @@
 					class="flex gap-3 border-b border-border/40 px-4 py-1.5 hover:bg-surface"
 				>
 					<span class="text-faint w-6 shrink-0 text-right">{e.id}</span>
+					<span class="text-faint w-28 shrink-0 tabular-nums lowercase" title={iso(e.ts)}
+						>{exactWhen(e.ts)}</span
+					>
 					<span class="text-faint w-20 shrink-0">{e.kind}</span>
 					<span class="text-faint w-12 shrink-0">{e.role ?? ''}</span>
 					<span class="{kindColor[e.kind] ?? 'text-text'} min-w-0 wrap-break-word">{e.content}</span>
@@ -69,6 +73,9 @@
 				<!-- No session to link to (e.g. a system event); render it inert. -->
 				<div class="flex gap-3 border-b border-border/40 px-4 py-1.5">
 					<span class="text-faint w-6 shrink-0 text-right">{e.id}</span>
+					<span class="text-faint w-28 shrink-0 tabular-nums lowercase" title={iso(e.ts)}
+						>{exactWhen(e.ts)}</span
+					>
 					<span class="text-faint w-20 shrink-0">{e.kind}</span>
 					<span class="text-faint w-12 shrink-0">{e.role ?? ''}</span>
 					<span class="{kindColor[e.kind] ?? 'text-text'} min-w-0 wrap-break-word">{e.content}</span>
