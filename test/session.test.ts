@@ -143,6 +143,106 @@ test("reset clears history", async () => {
     assert.equal(session.history().length, 0);
 });
 
+// ── Working mind: pushed continuity across sends ──────────────────────────────
+
+/** The concatenated system text on a given recorded model call. The working mind
+ *  rides the system channel, so this is where it shows up on the wire. */
+function wireSystemOf(client: FakeClient, call: number): string {
+    return client.calls[call]!.messages.filter((m) => m.sender.role === RoleType.System)
+        .flatMap((m) => m.content)
+        .filter((p): p is Extract<typeof p, { kind: "text" }> => p.kind === "text")
+        .map((p) => p.text)
+        .join("\n\n");
+}
+
+test("the working mind carries a turn's reply forward onto the next turn's wire", async () => {
+    const client = new FakeClient([
+        textTurn("The retry policy is the likely culprit here."),
+        textTurn("ok"),
+    ]);
+    const session = new Session({ client, system: "S" });
+
+    // Turn 1: nothing is held yet, so the first call carries no working mind.
+    await send(session, "what's wrong?");
+    assert.doesNotMatch(wireSystemOf(client, 0), /on your mind/i);
+
+    // Turn 2: the tail of turn 1's reply is now held and pushed, unbidden, even
+    // though turn 2's message ("thanks") shares nothing with it.
+    await send(session, "thanks");
+    const wire = wireSystemOf(client, 1);
+    assert.match(wire, /on your mind/i);
+    assert.match(wire, /retry policy is the likely culprit/);
+});
+
+test("the working mind never leaks into durable history", async () => {
+    const client = new FakeClient([textTurn("a landed thought"), textTurn("b")]);
+    const session = new Session({ client, system: "S" });
+    await send(session, "u1");
+    await send(session, "u2");
+    // The mind rides the wire only; history holds just the real turns.
+    const historyText = session
+        .history()
+        .flatMap((m) => m.content)
+        .filter((p): p is Extract<typeof p, { kind: "text" }> => p.kind === "text")
+        .map((p) => p.text)
+        .join("\n");
+    assert.doesNotMatch(historyText, /on your mind/i);
+    assert.ok(session.history().every((m) => m.sender.role !== RoleType.System));
+});
+
+test("workingMind:false disables the pushed mind entirely", async () => {
+    const client = new FakeClient([textTurn("a thought that landed"), textTurn("ok")]);
+    const session = new Session({ client, system: "S", workingMind: false });
+    await send(session, "u1");
+    await send(session, "u2");
+    assert.doesNotMatch(wireSystemOf(client, 1), /on your mind/i);
+});
+
+test("a surfaced memory stays warm into a next turn whose message doesn't match it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "wm-warm-"));
+    try {
+        const store = new MemoryStore(join(dir, "mem.db"));
+        const embedder = fakeEmbedder({
+            "user is allergic to peanuts": [1, 0],
+            "the deploy runs on Fridays": [0, 1],
+            // Turn 1 query points squarely at the allergy memory; turn 2 leans
+            // toward the deploy memory and away from the allergy.
+            "what can I cook for them?": [1, 0.05],
+            "anyway, is the release out?": [0, 1],
+        });
+        // Two unrelated memories, embedded on save so semantic recall ranks them
+        // (without a stored vector, recall falls back to importance/recency).
+        const allergy = store.save({ content: "user is allergic to peanuts" });
+        const deploy = store.save({ content: "the deploy runs on Fridays" });
+        store.setEmbedding(allergy.id, (await embedder.embed([allergy.content]))[0]!);
+        store.setEmbedding(deploy.id, (await embedder.embed([deploy.content]))[0]!);
+        const client = new FakeClient([textTurn("a salad works"), textTurn("sure")]);
+        const session = new Session({
+            client,
+            system: "S",
+            store,
+            embedder,
+            // Recall one memory per turn so turn 1 surfaces only the allergy.
+            recallLimit: 1,
+        });
+
+        await send(session, "what can I cook for them?");
+        // Turn 2's message pulls the *deploy* memory via recall, not the allergy.
+        // Pull-based recall would therefore drop the allergy this turn — but the
+        // working mind kept it warm from turn 1, so it's still in front of the
+        // model. That's the glass-pane fix: what surfaced stays up a while.
+        await send(session, "anyway, is the release out?");
+
+        const wire = wireSystemOf(client, 1);
+        // Recall pulled deploy; the warm band still carries the allergy forward.
+        assert.match(wire, /Relevant things you remember:[\s\S]*deploy runs on Fridays/);
+        assert.match(wire, /still warm[\s\S]*allergic to peanuts/i);
+        store.close();
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("a store wires memory tools and the model can save", async () => {
     const store = new MemoryStore(":memory:");
     try {

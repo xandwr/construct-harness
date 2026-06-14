@@ -459,16 +459,34 @@ export async function recallContext(
     store: MemoryStore,
     options: RecallOptions | number = {},
 ): Promise<string | null> {
+    return (await recallContextDetailed(store, options)).text;
+}
+
+/**
+ * Like {@link recallContext}, but also returns the {@link Memory} objects that
+ * surfaced, not just the rendered fragment. The Session uses this to feed its
+ * working mind's warm-memory band (a memory that surfaced is kept warm a while
+ * after) without running recall twice: one query, both the prose for the system
+ * prompt and the structured memories for the mind.
+ *
+ * `text` is exactly what {@link recallContext} returns (the fragment, or `null`
+ * when nothing surfaced); `memories` is the same set the fragment was rendered
+ * from, in the order they ranked.
+ */
+export async function recallContextDetailed(
+    store: MemoryStore,
+    options: RecallOptions | number = {},
+): Promise<{ text: string | null; memories: Memory[] }> {
     const opts: RecallOptions = typeof options === "number" ? { limit: options } : options;
     const limit = opts.limit ?? DEFAULT_RECALL_LIMIT;
     const query = typeof opts.query === "string" ? opts.query : "";
 
     const memories = await recallMemories(store, opts.embedder, query, { limit });
-    if (memories.length === 0) return null;
+    if (memories.length === 0) return { text: null, memories };
 
     const lines = memories.map((m) => {
         const tags = m.tags.length ? ` [${m.tags.join(", ")}]` : "";
         return `- (#${m.id})${tags} ${m.content}`;
     });
-    return `Relevant things you remember:\n${lines.join("\n")}`;
+    return { text: `Relevant things you remember:\n${lines.join("\n")}`, memories };
 }

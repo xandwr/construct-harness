@@ -19,8 +19,10 @@ import type { CompactionConfig, LoopEvent } from "./bridge/loop.ts";
 import type { ModelClient, ProviderOptions } from "./bridge/types.ts";
 import type { ContextProvider } from "./context.ts";
 import { temporalContext } from "./context.ts";
+import { WorkingMind, workingMindContext } from "./workingMind.ts";
+import type { WorkingMindOptions } from "./workingMind.ts";
 import { MemoryStore, MAX_LIMIT } from "./memory.ts";
-import { memoryTools, recallContext } from "./memoryTools.ts";
+import { memoryTools, recallContextDetailed } from "./memoryTools.ts";
 import { eventTools, embedEventIfPossible } from "./eventTools.ts";
 import { goalTools, goalContext } from "./goalTools.ts";
 import { GoalStore } from "./goals.ts";
@@ -87,6 +89,23 @@ export interface SessionConfig {
      *  Construct always knows the current date/time; pass `[]` to disable, or
      *  your own list to replace it. */
     context?: ContextProvider[];
+    /**
+     * The working mind: a small, evolving set of the Construct's recent state
+     * (the tail of its own train of thought, and memories that recently
+     * surfaced) pushed onto *every* turn so it doesn't wake up cold each message.
+     * Unlike turn-relevant recall, which pulls memories that match the current
+     * message, this is push: it's present whether or not the message matches,
+     * decaying by recency + reinforcement so it stays small and live. See
+     * {@link WorkingMind}.
+     *
+     * On by default: the continuity it gives is the point. Pass `false` to
+     * disable (useful for A/B-ing the effect, or for a stateless one-shot
+     * Session), or pass {@link WorkingMindOptions} to tune decay/floor/cap. When
+     * a caller supplies their own `context` list, the working-mind provider is
+     * still appended unless this is `false`, so opting out of the default context
+     * doesn't silently drop the mind.
+     */
+    workingMind?: boolean | WorkingMindOptions;
     /** Auto-compaction config, forwarded to the loop. Omit to disable. */
     compaction?: CompactionConfig;
     /** Per-turn tool/turn cap, forwarded to the loop. */
@@ -138,6 +157,12 @@ export class Session {
      *  turn is rebuilt per send (recall is turn-relevant), so it is NOT stored
      *  here; it's prepended at send time and never persisted. */
     private conversation: Message[] = [];
+    /** The Construct's live working mind, pushed onto every turn via the
+     *  working-mind context provider. Undefined when disabled. Fed each `send`
+     *  from the turn's reply tail and the memories that surfaced, then ticked to
+     *  age everything by one turn. In-process by design: it's working memory, not
+     *  the durable journal (which lives in {@link events} / the store). */
+    private readonly mind?: WorkingMind;
     /** In-flight, fire-and-forget event embeds. An appended message is embedded
      *  off the turn's hot path (embedding is a network call; the turn must not
      *  block on it), so we track the promises here. {@link flushEmbeddings} awaits
@@ -167,10 +192,23 @@ export class Session {
         // Default context: the temporal provider, plus a goal provider when a goal
         // store is configured so active goals stand in front of the model each
         // turn. A caller-supplied `context` replaces this whole list.
-        this.context = config.context ?? [
+        const baseContext = config.context ?? [
             temporalContext(),
             ...(config.goals ? [goalContext(config.goals, this.sessionId)] : []),
         ];
+        // The working mind is orthogonal to the context *list*: it's the
+        // Construct's own recent state, on by default. So it's appended even when
+        // a caller supplies their own `context` (replacing the defaults shouldn't
+        // silently drop the mind) — unless explicitly disabled with `false`.
+        if (config.workingMind === false) {
+            this.mind = undefined;
+            this.context = baseContext;
+        } else {
+            this.mind = new WorkingMind(
+                typeof config.workingMind === "object" ? config.workingMind : {},
+            );
+            this.context = [...baseContext, workingMindContext(this.mind)];
+        }
         this.startedAt = this.resolveStart();
     }
 
@@ -420,6 +458,19 @@ export class Session {
                 // Commit the durable conversation: everything the run produced
                 // except the system turn we prepended (which is rebuilt per turn).
                 this.conversation = r.messages.filter((m) => m.sender.role !== RoleType.System);
+                // Feed the working mind from this turn, then age it one turn. The
+                // tail of the Construct's own reply is carried forward as live
+                // train-of-thought (where it landed, not the whole essay), so the
+                // next turn comes to with its recent reasoning already in front of
+                // it. The warm-memory band was fed during buildSystem; ticking
+                // here, after both, ages everything by exactly one turn. Both the
+                // feed and the tick live inside loop_done so a turn that errors
+                // before completing never ages the mind on work that didn't land.
+                if (this.mind) {
+                    const tail = trainOfThoughtTail(reply);
+                    if (tail) this.mind.note("thought", tail);
+                    this.mind.tick();
+                }
                 result = {
                     text: assistantText.trim(),
                     modelTurns: r.turns,
@@ -542,12 +593,23 @@ export class Session {
     private async buildSystem(query: string): Promise<Message> {
         let text = this.cfg.system;
         if (this.cfg.store) {
-            const recalled = await recallContext(this.cfg.store, {
+            const recalled = await recallContextDetailed(this.cfg.store, {
                 query,
                 embedder: this.cfg.embedder,
                 limit: this.cfg.recallLimit,
             });
-            if (recalled) text = `${text}\n\n${recalled}`;
+            if (recalled.text) text = `${text}\n\n${recalled.text}`;
+            // A memory that surfaced this turn is kept warm in the working mind
+            // for a while after, so it doesn't blink out the instant the next
+            // message stops matching it. Keyed by store id so the same memory
+            // resurfacing refreshes its warmth rather than stacking. Done here
+            // because this is where recall happens; the warmth is aged by the
+            // tick at the end of the turn.
+            if (this.mind) {
+                for (const m of recalled.memories) {
+                    this.mind.note("memory", m.content, `m${m.id}`);
+                }
+            }
         }
         return {
             sender: { role: RoleType.System },
@@ -555,6 +617,47 @@ export class Session {
             content: [{ kind: "text", text }],
         };
     }
+}
+
+/** How many characters of a reply's tail to carry forward as train-of-thought.
+ *  Enough to hold where the Construct landed (its conclusion, the thing it would
+ *  pick up from), not so much that the band becomes a transcript echo. */
+const THOUGHT_TAIL_CHARS = 320;
+
+/**
+ * Extract the tail of a reply to carry forward as the Construct's recent train
+ * of thought: where it landed, not the whole essay. We take the last paragraph
+ * (the conclusion is what a follow-up builds on); if that's still long, the last
+ * sentence or so within {@link THOUGHT_TAIL_CHARS}. Returns "" for an empty reply
+ * (nothing was thought), which the caller skips.
+ *
+ * This is deliberately a dumb, deterministic slice, not a model-authored
+ * summary: the working mind holds the Construct's *own* words, never the
+ * harness's paraphrase of them. A blunt tail of its real reply is honest; a
+ * pretty summary would be a fake of its mind.
+ */
+function trainOfThoughtTail(reply: string): string {
+    const trimmed = reply.trim();
+    if (!trimmed) return "";
+    // Last non-empty paragraph: the conversation's natural unit of "where it
+    // ended up". Blank-line separated, matching how the model paragraphs prose.
+    const paras = trimmed
+        .split(/\n\s*\n/)
+        .map((p) => p.trim())
+        .filter(Boolean);
+    const last = paras[paras.length - 1] ?? trimmed;
+    if (last.length <= THOUGHT_TAIL_CHARS) return last;
+    // Still long: keep the final whole sentences that fit, so we cut on a
+    // boundary rather than mid-word. Fall back to trimming the leading partial
+    // word if there's no sentence break in range.
+    const window = last.slice(-THOUGHT_TAIL_CHARS);
+    const fromSentence = window.search(/[.!?]\s+\S/);
+    if (fromSentence !== -1) {
+        const tail = window.slice(fromSentence + 1).trim();
+        if (tail) return tail;
+    }
+    const wordCut = window.indexOf(" ");
+    return (wordCut !== -1 ? window.slice(wordCut + 1) : window).trim() || window;
 }
 
 /** A short, unique id for a Session's events when the caller didn't pin one.

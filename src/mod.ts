@@ -47,8 +47,10 @@ export * from "./noteTools.ts";
 // tool.
 export * from "./shellTools.ts";
 
-// Context engineering: passive context, compaction, usage accounting.
+// Context engineering: passive context, the pushed working mind, compaction,
+// usage accounting.
 export * from "./context.ts";
+export * from "./workingMind.ts";
 export * from "./compaction.ts";
 export * from "./usage.ts";
 
