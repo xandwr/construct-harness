@@ -15,6 +15,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { createHandler, resolveServerTools, SessionPool } from "../src/server.ts";
 import { BUILTIN_COMMANDS } from "../src/commands.ts";
@@ -125,6 +128,33 @@ function makeDeps(client: FakeClient) {
     };
 }
 
+/** Like {@link makeDeps}, but over a single shared on-disk database file the way
+ *  the real server wires it (one file, one schema). Needed where a cross-store
+ *  foreign key must resolve — memory provenance references events(id), which only
+ *  works when the memory and event tables live in the SAME database, not two
+ *  separate `:memory:` handles. The caller's close() also removes the temp dir. */
+function makeSharedDeps(client: FakeClient) {
+    const dir = mkdtempSync(join(tmpdir(), "server-shared-"));
+    const path = join(dir, "db.sqlite");
+    const store = new MemoryStore(path);
+    const events = new EventStore(path);
+    const goals = new GoalStore(path);
+    const sessions = new SessionPool(() => ({ client, system: "be brief", store, events, goals }));
+    return {
+        store,
+        events,
+        goals,
+        sessions,
+        client,
+        close() {
+            events.close();
+            goals.close();
+            store.close();
+            rmSync(dir, { recursive: true, force: true });
+        },
+    };
+}
+
 /** The default (boot) session's id — what a chat with no `session` lands on, and
  *  what the read endpoints flag as live. The pool seeds exactly one at start. */
 function defaultId(deps: { sessions: SessionPool }): string {
@@ -171,6 +201,13 @@ test("GET /api/memories returns the curated store in wire shape", async () => {
     assert.equal(body.memories.length, 1);
     assert.equal(body.memories[0].content, "Deploys go out on Fridays.");
     assert.deepEqual(body.memories[0].tags, ["ops"]);
+    // The enriched curation fields are present: strength, surfacing, provenance,
+    // embedding. A fresh memory has full-ish strength, never surfaced, no
+    // provenance, no embedding (no embedder wired here).
+    assert.equal(typeof body.memories[0].strength, "number");
+    assert.equal(body.memories[0].lastSurfaced, null);
+    assert.equal(body.memories[0].provenance, null);
+    assert.equal(body.memories[0].hasEmbedding, false);
 });
 
 test("GET /api/commands returns the slash-command catalogue", async () => {
@@ -671,6 +708,112 @@ test("DELETE /api/goals/:id removes a goal; a missing id is a 404", async () => 
     assert.equal(deps.goals.get(g.id), undefined);
 
     const again = await call(deps, bodyReq("DELETE", `/api/goals/${g.id}`));
+    assert.equal(again.status, 404);
+    deps.close();
+});
+
+// ── Memory curation ──────────────────────────────────────────────────────────
+
+test("GET /api/memories/:id returns detail with provenance and the source event", async () => {
+    // Provenance is a foreign key from memory_meta to events(id); it only resolves
+    // when both tables share one database, so this test wires the stores over one
+    // shared file the way the real server does.
+    const deps = makeSharedDeps(new FakeClient([]));
+    // Append an event and point a memory's provenance at it, the way the agent's
+    // curation does as it runs.
+    const ev = deps.events.append({
+        kind: "message",
+        role: "user",
+        content: "we deploy on Fridays, never weekends",
+        session: "s_deploy",
+    });
+    const m = deps.store.save(new Memory({ content: "deploys are Fridays", tags: ["ops"] }));
+    deps.store.setProvenance(m.id, ev.id);
+
+    const { status, json } = await call(deps, getReq(`/api/memories/${m.id}`));
+    assert.equal(status, 200);
+    assert.equal(json.memory.content, "deploys are Fridays");
+    assert.equal(json.memory.provenance.eventId, ev.id);
+    assert.equal(json.memory.provenance.session, "s_deploy");
+    // Detail carries the source event itself for the "curated from" view.
+    assert.ok(json.sourceEvent, "source event present");
+    assert.match(json.sourceEvent.content, /never weekends/);
+    deps.close();
+});
+
+test("GET /api/memories/:id is a 404 for a missing or non-numeric id", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    assert.equal((await call(deps, getReq("/api/memories/999999"))).status, 404);
+    assert.equal((await call(deps, getReq("/api/memories/abc"))).status, 404);
+    deps.close();
+});
+
+test("PUT /api/memories/:id edits content, tags, and importance", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const m = deps.store.save(new Memory({ content: "rough", tags: ["x"], importance: 0.2 }));
+
+    const edited = await call(
+        deps,
+        bodyReq(
+            "PUT",
+            `/api/memories/${m.id}`,
+            JSON.stringify({ content: "sharpened", tags: ["ops", "deploy"], importance: 0.9 }),
+        ),
+    );
+    assert.equal(edited.status, 200);
+    assert.equal(edited.json.memory.content, "sharpened");
+    assert.deepEqual(edited.json.memory.tags, ["ops", "deploy"]);
+    assert.equal(edited.json.memory.importance, 0.9);
+    // Persisted.
+    assert.equal(deps.store.get(m.id)!.content, "sharpened");
+    deps.close();
+});
+
+test("PUT /api/memories/:id can clear importance with null", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const m = deps.store.save(new Memory({ content: "c", importance: 0.5 }));
+    const res = await call(
+        deps,
+        bodyReq("PUT", `/api/memories/${m.id}`, JSON.stringify({ importance: null })),
+    );
+    assert.equal(res.status, 200);
+    assert.equal(res.json.memory.importance, null);
+    deps.close();
+});
+
+test("PUT /api/memories/:id rejects bad fields and an empty patch", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const m = deps.store.save(new Memory({ content: "c" }));
+    // Empty patch.
+    assert.equal(
+        (await call(deps, bodyReq("PUT", `/api/memories/${m.id}`, JSON.stringify({})))).status,
+        400,
+    );
+    // Bad tags.
+    assert.equal(
+        (await call(deps, bodyReq("PUT", `/api/memories/${m.id}`, JSON.stringify({ tags: "ops" }))))
+            .status,
+        400,
+    );
+    // Missing id.
+    assert.equal(
+        (await call(deps, bodyReq("PUT", "/api/memories/999999", JSON.stringify({ content: "x" }))))
+            .status,
+        404,
+    );
+    deps.close();
+});
+
+test("DELETE /api/memories/:id forgets a memory; a missing id is a 404", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const m = deps.store.save(new Memory({ content: "forget me" }));
+
+    const removed = await call(deps, bodyReq("DELETE", `/api/memories/${m.id}`));
+    assert.equal(removed.status, 200);
+    assert.equal(removed.json.deleted, true);
+    assert.equal(deps.store.get(m.id), undefined);
+
+    const again = await call(deps, bodyReq("DELETE", `/api/memories/${m.id}`));
     assert.equal(again.status, 404);
     deps.close();
 });

@@ -37,7 +37,10 @@ export interface SessionSummary {
     live: boolean;
 }
 
-/** A curated memory, as `/api/memories` returns it. */
+/** A curated memory, as `/api/memories` returns it, enriched with the curation
+ *  signals the Memory page surfaces. `strength` is the decayed value ranking
+ *  actually uses; `provenance` points at the event (and its conversation) the
+ *  memory was curated from, when known. */
 export interface WireMemory {
     id: number;
     content: string;
@@ -45,6 +48,10 @@ export interface WireMemory {
     importance: number | null;
     created: number;
     updated: number;
+    strength: number;
+    lastSurfaced: number | null;
+    provenance: { eventId: number; session: string | null } | null;
+    hasEmbedding: boolean;
 }
 
 /** A knowledge-base note in the list (summary) shape: no body. */
@@ -181,11 +188,38 @@ export function getEvents(
     return getJson(`/api/events?session=${encodeURIComponent(session)}`, fetchFn);
 }
 
-/** The curated memory store, ordered by importance then recency. */
+/** The curated memory store, ordered by importance then recency. Optional `q`
+ *  full-text search. Each memory carries its strength / provenance / embedding. */
 export function getMemories(
+    opts: { q?: string } = {},
     fetchFn?: typeof fetch,
 ): Promise<{ memories: WireMemory[]; total: number }> {
-    return getJson("/api/memories", fetchFn);
+    const qs = opts.q ? `?q=${encodeURIComponent(opts.q)}` : "";
+    return getJson(`/api/memories${qs}`, fetchFn);
+}
+
+/** One memory in detail, plus the source event it was curated from (when it has
+ *  provenance and that event still exists in the log). */
+export function getMemory(
+    id: number,
+    fetchFn?: typeof fetch,
+): Promise<{ memory: WireMemory; sourceEvent: WireEvent | null }> {
+    return getJson(`/api/memories/${id}`, fetchFn);
+}
+
+/** Edit a memory by id: revise its content, tags, and/or importance (null clears
+ *  importance). Only the provided fields change. */
+export function updateMemory(
+    id: number,
+    patch: { content?: string; tags?: string[]; importance?: number | null },
+    fetchFn?: typeof fetch,
+): Promise<{ memory: WireMemory }> {
+    return writeJson("PUT", `/api/memories/${id}`, patch, fetchFn);
+}
+
+/** Forget a memory by id. */
+export function deleteMemory(id: number, fetchFn?: typeof fetch): Promise<{ deleted: boolean }> {
+    return writeJson("DELETE", `/api/memories/${id}`, undefined, fetchFn);
 }
 
 /** The raw event log, newest first. */

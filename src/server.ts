@@ -22,7 +22,9 @@
  *                                  a past conversation); reply streams as SSE.
  *  - `GET  /api/events?session=` — one conversation's transcript, oldest first.
  *  - `GET  /api/sessions`        — conversation list (id + preview + count).
- *  - `GET  /api/memories`        — the curated memory store.
+ *  - `GET  /api/memories`        — the curated memory store (enriched with
+ *                                  strength/provenance/embedding); `PUT`/`DELETE`
+ *                                  `/api/memories/:id` to edit or forget one.
  *  - `GET  /api/log`            — the raw event log, newest first.
  *  - `GET  /api/dreams`          — the accumulated dreams, newest first.
  *  - `POST /api/dreams`          — run N dreams now (a disposable persona faces a
@@ -47,7 +49,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { AnthropicClient, type ServerToolName } from "./bridge/anthropic.ts";
 import { HarnessError, type ErrorKind } from "./bridge/errors.ts";
 import type { ModelClient } from "./bridge/types.ts";
-import { MemoryStore } from "./memory.ts";
+import { MemoryStore, Memory, MemoryError } from "./memory.ts";
 import { EventStore, type Event } from "./events.ts";
 import { backfillEventEmbeddings } from "./eventTools.ts";
 import { GoalStore, Goal, GoalError, isGoalStatus, type GoalStatus } from "./goals.ts";
@@ -548,6 +550,42 @@ function dreamEventToJson(e: Event) {
         // The persona's choice rides in the event content (FTS-searchable there).
         choice: e.content,
         sourceMemoryIds: sources,
+    };
+}
+
+/**
+ * Serialize a memory for the wire, enriched with the curation signals the
+ * Memory page surfaces: its effective (decayed) strength right now, when it last
+ * surfaced, its provenance (the event it was curated from, and that event's
+ * session), and whether it carries an embedding. The provenance event is looked
+ * up over the shared {@link EventStore} so the page can offer a jump to the
+ * source conversation. `now` is threaded so every memory in one list reads its
+ * strength against the same instant.
+ */
+function memoryToJson(m: Memory, deps: Pick<ServerDeps, "store" | "events">, now = Date.now()) {
+    const eventId = deps.store.provenanceOf(m.id);
+    // Resolve the provenance event's session (for the deep-link) when the event
+    // still exists in the log. A nulled/missing link leaves both null.
+    const sourceEvent = eventId !== undefined ? deps.events.get(eventId) : undefined;
+    return {
+        id: m.id,
+        content: m.content,
+        tags: m.tags,
+        importance: m.importance ?? null,
+        created: m.created,
+        updated: m.updated,
+        // The decayed strength ranking actually uses, not the raw stored number,
+        // so the page shows what the Construct effectively feels about this memory.
+        strength: deps.store.strengthOf(m.id, now) ?? m.strength,
+        lastSurfaced: m.lastSurfaced ?? null,
+        provenance:
+            eventId === undefined
+                ? null
+                : {
+                      eventId,
+                      session: sourceEvent?.session ?? null,
+                  },
+        hasEmbedding: deps.store.hasEmbedding(m.id),
     };
 }
 
@@ -1253,6 +1291,149 @@ async function handleContext(res: ServerResponse, deps: ServerDeps, url: URL): P
     sendJson(res, 200, inspection);
 }
 
+// ── Memory curation routes ───────────────────────────────────────────────────
+
+/**
+ * Handle every `/api/memories` and `/api/memories/:id` request: the read and
+ * curation surface over the {@link MemoryStore}, the human counterpart to the
+ * agent's memory_save/forget tools. Where the agent curates its own memory as it
+ * runs, this lets a human inspect and correct that curation: see each memory's
+ * earned strength and provenance, sharpen its text or tags, or forget it.
+ *
+ *  - GET    /api/memories            list (optional `q` search), each enriched
+ *                                    with strength / lastSurfaced / provenance /
+ *                                    embedding-present.
+ *  - GET    /api/memories/:id        one memory (same enriched shape) plus the
+ *                                    source event when it has provenance.
+ *  - PUT    /api/memories/:id        edit { content?, tags?, importance? }.
+ *  - DELETE /api/memories/:id        forget it.
+ *
+ * Strength is read against one shared `now` per request so a list ranks
+ * consistently. Mirrors {@link handleGoals}: writes translate {@link MemoryError}
+ * into a clean 400.
+ */
+async function handleMemories(
+    req: IncomingMessage,
+    res: ServerResponse,
+    deps: ServerDeps,
+    url: URL,
+    path: string,
+): Promise<void> {
+    const now = Date.now();
+
+    if (path === "/api/memories") {
+        if (req.method === "GET") {
+            const limit = clampPage(url.searchParams.get("limit"), DEFAULT_PAGE, 1000);
+            const q = url.searchParams.get("q");
+            const rows = (q ? deps.store.search(q, { limit }) : deps.store.all({ limit })).map(
+                (m) => memoryToJson(m, deps, now),
+            );
+            sendJson(res, 200, { memories: rows, total: deps.store.count() });
+            return;
+        }
+        sendJson(res, 405, { error: `method ${req.method} not allowed on /api/memories` });
+        return;
+    }
+
+    // The item endpoint: /api/memories/:id (detail, update, delete).
+    const idText = decodeURIComponent(path.slice("/api/memories/".length));
+    const id = Number(idText);
+    if (!idText || !Number.isInteger(id) || id <= 0) {
+        sendJson(res, 404, { error: "memory not found" });
+        return;
+    }
+
+    if (req.method === "GET") {
+        const memory = deps.store.get(id);
+        if (!memory) {
+            sendJson(res, 404, { error: "memory not found" });
+            return;
+        }
+        // Detail adds the source event itself (content + when) so the page can show
+        // what the memory was curated from without a second round-trip.
+        const base = memoryToJson(memory, deps, now);
+        const sourceEvent =
+            base.provenance && base.provenance.eventId !== undefined
+                ? deps.events.get(base.provenance.eventId)
+                : undefined;
+        sendJson(res, 200, {
+            memory: base,
+            sourceEvent: sourceEvent ? eventToJson(sourceEvent) : null,
+        });
+        return;
+    }
+
+    if (req.method === "PUT") {
+        const body = await readJsonObject(req);
+        if (!body) {
+            sendJson(res, 400, { error: "invalid JSON body" });
+            return;
+        }
+        const patch: Partial<Pick<Memory, "content" | "tags" | "importance">> = {};
+        if (body.content !== undefined) {
+            if (typeof body.content !== "string") {
+                sendJson(res, 400, { error: "content must be a string" });
+                return;
+            }
+            patch.content = body.content;
+        }
+        if (body.tags !== undefined) {
+            if (!Array.isArray(body.tags) || body.tags.some((t) => typeof t !== "string")) {
+                sendJson(res, 400, { error: "tags must be an array of strings" });
+                return;
+            }
+            patch.tags = body.tags as string[];
+        }
+        if (body.importance !== undefined) {
+            // null clears importance (the key stays present, so the store's update
+            // sees a deliberate clear); a number sets it. Anything else is a 400.
+            if (body.importance !== null && typeof body.importance !== "number") {
+                sendJson(res, 400, { error: "importance must be a number or null" });
+                return;
+            }
+            patch.importance = body.importance === null ? undefined : body.importance;
+        }
+        if (Object.keys(patch).length === 0) {
+            sendJson(res, 400, { error: "provide content, tags, and/or importance to update" });
+            return;
+        }
+        try {
+            const updated = deps.store.update(id, patch, now);
+            if (!updated) {
+                sendJson(res, 404, { error: `no memory with id ${id}` });
+                return;
+            }
+            sendJson(res, 200, { memory: memoryToJson(updated, deps, now) });
+        } catch (err) {
+            sendMemoryError(res, err);
+        }
+        return;
+    }
+
+    if (req.method === "DELETE") {
+        const removed = deps.store.delete(id);
+        if (!removed) {
+            sendJson(res, 404, { error: `no memory with id ${id}` });
+            return;
+        }
+        sendJson(res, 200, { deleted: true });
+        return;
+    }
+
+    sendJson(res, 405, { error: `method ${req.method} not allowed on ${path}` });
+}
+
+/** Map a {@link MemoryError} (bad input the store refused) to a 400; anything
+ *  else is a real 500. Mirrors {@link sendGoalError}. */
+function sendMemoryError(res: ServerResponse, err: unknown): void {
+    if (err instanceof MemoryError) {
+        sendJson(res, 400, { error: err.message });
+        return;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    sendJson(res, 500, { error: message });
+}
+
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /** Build the request handler over a set of deps. Pure routing: it owns no
@@ -1327,20 +1508,10 @@ export function createHandler(deps: ServerDeps) {
                 return;
             }
 
-            if (req.method === "GET" && path === "/api/memories") {
-                const limit = clampPage(url.searchParams.get("limit"), DEFAULT_PAGE, 1000);
-                const q = url.searchParams.get("q");
-                const rows = (q ? deps.store.search(q, { limit }) : deps.store.all({ limit })).map(
-                    (m) => ({
-                        id: m.id,
-                        content: m.content,
-                        tags: m.tags,
-                        importance: m.importance ?? null,
-                        created: m.created,
-                        updated: m.updated,
-                    }),
-                );
-                sendJson(res, 200, { memories: rows, total: deps.store.count() });
+            // Memory: list/detail reads plus the human curation writes (edit,
+            // forget), each memory enriched with strength / provenance / embedding.
+            if (path === "/api/memories" || path.startsWith("/api/memories/")) {
+                await handleMemories(req, res, deps, url, path);
                 return;
             }
 
