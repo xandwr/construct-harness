@@ -21,6 +21,7 @@ import { RoleType } from "../src/types.ts";
 import type { ToolDef } from "../src/types.ts";
 import { MemoryStore } from "../src/memory.ts";
 import { EventStore } from "../src/events.ts";
+import { DREAM_EVENT_KIND } from "../src/dreaming.ts";
 import { GoalStore } from "../src/goals.ts";
 import { EmbeddingError, type Embedder } from "../src/embeddings.ts";
 import { FakeClient, callTurn, textTurn } from "./helpers/fakeClient.ts";
@@ -394,6 +395,127 @@ test("a tool turn logs the call and its result, correlated by id", async () => {
         assert.equal(call.correlation, result.correlation);
         assert.equal(result.kind, "tool_result");
         assert.match(result.content, /"ok":true/);
+    } finally {
+        events.close();
+    }
+});
+
+/** Append a dream to the log the way the dream loop does: choice in `content`,
+ *  the structured record in `meta`. Dreams are not session-scoped. */
+function seedDream(
+    events: EventStore,
+    opts: { name: string; role?: string; scenario: string; choice: string; ts?: number },
+): void {
+    events.append({
+        kind: DREAM_EVENT_KIND,
+        role: "agent",
+        content: opts.choice,
+        ts: opts.ts,
+        meta: {
+            persona: { name: opts.name, ...(opts.role ? { role: opts.role } : {}) },
+            scenario: opts.scenario,
+            sourceMemoryIds: [],
+        },
+    });
+}
+
+test("an events log wires the dream_recall tool by default", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        const client = new FakeClient([
+            callTurn("c1", "dream_recall", { query: "rule" }),
+            textTurn("ok"),
+        ]);
+        seedDream(events, {
+            name: "Mara",
+            scenario: "bend a rule?",
+            choice: "held the line",
+            ts: 1,
+        });
+        const session = new Session({ client, system: "S", events });
+
+        await send(session, "what did you dream?");
+
+        // The tool was dispatchable: a tool_call + tool_result pair is in the log.
+        const log = events.recent({ session: session.id }).reverse();
+        const callKinds = log.map((e) => e.kind);
+        assert.ok(callKinds.includes("tool_call"));
+        const call = log.find((e) => e.kind === "tool_call");
+        assert.equal(call!.content, "dream_recall");
+    } finally {
+        events.close();
+    }
+});
+
+test("dreams:false withholds the dream_recall tool", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        // The model tries to call dream_recall; with the tool withheld the loop
+        // reports it as an unknown tool rather than dispatching it.
+        const client = new FakeClient([
+            callTurn("c1", "dream_recall", { query: "x" }),
+            textTurn("done"),
+        ]);
+        const session = new Session({ client, system: "S", events, dreams: false });
+
+        await send(session, "go");
+
+        const log = events.recent({ session: session.id }).reverse();
+        const result = log.find((e) => e.kind === "tool_result");
+        // The result exists (the loop answers every call) but is an error: no such
+        // tool, because dreams:false dropped it from the set.
+        assert.ok(result);
+        assert.equal((result!.meta as { isError?: boolean }).isError, true);
+    } finally {
+        events.close();
+    }
+});
+
+test("the most recent dream is pushed into the system prompt every turn", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        const client = new FakeClient([textTurn("a"), textTurn("b")]);
+        seedDream(events, { name: "Old", scenario: "old dilemma", choice: "old choice", ts: 1 });
+        seedDream(events, {
+            name: "Mara",
+            role: "night-shift nurse",
+            scenario: "a fresh dilemma",
+            choice: "I held the line",
+            ts: 2,
+        });
+        const session = new Session({ client, system: "S", events });
+
+        await send(session, "hello");
+        const wire = wireSystemOf(client, 0);
+        // The freshest dream rides every turn, unbidden, the way goals do.
+        assert.match(wire, /most recent dream/i);
+        assert.match(wire, /Mara, night-shift nurse/);
+        assert.match(wire, /a fresh dilemma/);
+        assert.doesNotMatch(wire, /old dilemma/);
+
+        // And again on the next turn (it's pushed every message, not just once).
+        await send(session, "again");
+        assert.match(wireSystemOf(client, 1), /most recent dream/i);
+    } finally {
+        events.close();
+    }
+});
+
+test("no dream is injected when the log holds none, and dreams:false disables the push", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        const client = new FakeClient([textTurn("a"), textTurn("b")]);
+        // With no dreams in the log, the provider stays silent.
+        const session = new Session({ client, system: "S", events });
+        await send(session, "hi");
+        assert.doesNotMatch(wireSystemOf(client, 0), /most recent dream/i);
+
+        // With dreams:false, even a logged dream is not pushed.
+        seedDream(events, { name: "Mara", scenario: "d", choice: "c", ts: 1 });
+        const client2 = new FakeClient([textTurn("a")]);
+        const off = new Session({ client: client2, system: "S", events, dreams: false });
+        await send(off, "hi");
+        assert.doesNotMatch(wireSystemOf(client2, 0), /most recent dream/i);
     } finally {
         events.close();
     }

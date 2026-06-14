@@ -61,7 +61,9 @@ const BASE_SYSTEM =
     "goal_update done when achieved; your active goals are shown to you each turn. To " +
     "look back over what actually happened earlier in this conversation (past " +
     "messages, whether a tool already ran, what was decided), search your transcript " +
-    "with transcript_recall. For longer-form documentation the human also edits (runbooks, " +
+    "with transcript_recall. Your most recent dream is shown to you each turn; to draw on " +
+    "earlier ones (stances you tried on while dreaming during downtime), search them with " +
+    "dream_recall. For longer-form documentation the human also edits (runbooks, " +
     "references, design notes), use the knowledge base: note_save / note_update to " +
     "write, note_recall to read it when relevant, note_link to relate a note to a " +
     "memory or another note. You also have two ways to run code: the sandboxed " +

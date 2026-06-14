@@ -67,8 +67,10 @@ export * from "./critics.ts";
 // variables (roster order, the stakes dealt) the way an unbiased jury's would?
 export * from "./biasHarness.ts";
 
-// Dreaming: generating disposable Constructs during downtime.
+// Dreaming: generating disposable Constructs during downtime, and the tools
+// that bridge those dreams back into the loop (recall + last-dream injection).
 export * from "./dreaming.ts";
+export * from "./dreamTools.ts";
 
 // The interactive runner, for embedding a REPL in your own entry point.
 export * from "./repl.ts";

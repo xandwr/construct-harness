@@ -24,6 +24,7 @@ import type { WorkingMindOptions } from "./workingMind.ts";
 import { MemoryStore, MAX_LIMIT } from "./memory.ts";
 import { memoryTools, recallContextDetailed } from "./memoryTools.ts";
 import { eventTools, embedEventIfPossible } from "./eventTools.ts";
+import { dreamTools, dreamContext } from "./dreamTools.ts";
 import { goalTools, goalContext } from "./goalTools.ts";
 import { GoalStore } from "./goals.ts";
 import type { Embedder } from "./embeddings.ts";
@@ -76,6 +77,25 @@ export interface SessionConfig {
      * replaces it (add {@link goalContext} yourself if you want both).
      */
     goals?: GoalStore;
+    /**
+     * Give the model a `dream_recall` tool over the dreams in its {@link events}
+     * log, and push its *most recent* dream into the system prompt every turn.
+     * Dreams are conjured during downtime (a disposable persona facing a scenario
+     * abstracted from the corpus; see the dreaming module), logged under
+     * `dream` events. With this on, the Construct can search what it dreamed
+     * (`dream_recall`) and wakes each message already holding its last dream,
+     * rather than that exploration accumulating write-only.
+     *
+     * Unlike memory and the transcript, dreams are *not* session-scoped: they
+     * belong to the Construct as a whole, so recall and the injection span every
+     * dream regardless of conversation. Defaults to `true` when an `events` log
+     * is configured; pass `false` to withhold both the tool and the injection.
+     * No-op without `events`: there are no dreams to read. As with the goal
+     * injection, only the default context provider list picks up the last-dream
+     * push; supplying your own `context` replaces it (add {@link dreamContext}
+     * yourself if you want both).
+     */
+    dreams?: boolean;
     /**
      * Embedder for semantic recall. Meaningful alongside `store` (saved memories
      * are embedded so memory_recall matches by meaning) and alongside `events`
@@ -177,8 +197,10 @@ export class Session {
         this.events = config.events;
         this.sessionId = config.sessionId ?? freshSessionId();
         // A store contributes its memory tools; an event log can contribute the
-        // transcript tool (scoped to this Session); the model's own tools come
-        // last. transcript_recall is on by default whenever a log is present.
+        // transcript tool (scoped to this Session) and the dream-recall tool
+        // (spanning every dream, not session-scoped); the model's own tools come
+        // last. transcript_recall and dream_recall are both on by default
+        // whenever a log is present.
         const memTools = config.store ? memoryTools(config.store, config.embedder) : [];
         const txTools =
             this.events && config.transcriptRecall !== false
@@ -187,14 +209,21 @@ export class Session {
                       embedder: config.embedder,
                   })
                 : [];
+        const drTools =
+            this.events && config.dreams !== false
+                ? dreamTools(this.events, { embedder: config.embedder })
+                : [];
         const goTools = config.goals ? goalTools(config.goals, this.sessionId) : [];
-        this.tools = [...memTools, ...txTools, ...goTools, ...(config.tools ?? [])];
+        this.tools = [...memTools, ...txTools, ...drTools, ...goTools, ...(config.tools ?? [])];
         // Default context: the temporal provider, plus a goal provider when a goal
-        // store is configured so active goals stand in front of the model each
-        // turn. A caller-supplied `context` replaces this whole list.
+        // store is configured (active goals stand in front of the model each turn)
+        // and a last-dream provider when a log is present and dreams aren't
+        // disabled (the Construct's freshest dream is pushed every turn the way
+        // its goals are). A caller-supplied `context` replaces this whole list.
         const baseContext = config.context ?? [
             temporalContext(),
             ...(config.goals ? [goalContext(config.goals, this.sessionId)] : []),
+            ...(this.events && config.dreams !== false ? [dreamContext(this.events)] : []),
         ];
         // The working mind is orthogonal to the context *list*: it's the
         // Construct's own recent state, on by default. So it's appended even when
