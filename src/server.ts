@@ -24,6 +24,9 @@
  *  - `GET  /api/sessions`        — conversation list (id + preview + count).
  *  - `GET  /api/memories`        — the curated memory store.
  *  - `GET  /api/log`            — the raw event log, newest first.
+ *  - `GET  /api/dreams`          — the accumulated dreams, newest first.
+ *  - `POST /api/dreams`          — run N dreams now (a disposable persona faces a
+ *                                  scenario drawn from the corpus); each is logged.
  *  - `GET  /api/commands`        — the slash-command catalogue, for the client's
  *                                  `/` menu (mirrors {@link BUILTIN_COMMANDS}).
  *
@@ -48,6 +51,7 @@ import { NotesService } from "./notesService.ts";
 import { noteTools } from "./noteTools.ts";
 import { shellTools } from "./shellTools.ts";
 import { BUILTIN_COMMANDS } from "./commands.ts";
+import { dreamLoop, DREAM_EVENT_KIND, type Dream } from "./dreaming.ts";
 
 const BASE_SYSTEM =
     "You are a helpful, concise assistant: a long-lived Construct that remembers " +
@@ -77,6 +81,12 @@ const DEFAULT_PAGE = 100;
  *  database handles. `notes` is optional so the server still runs without a KB
  *  (the routes 503 cleanly), but the default wiring always provides one. */
 interface ServerDeps {
+    /** The model client every model-driven route runs on. Chat drives it through
+     *  the {@link SessionPool}; dreaming ({@link handleDreams}) drives it directly,
+     *  outside any conversation, to conjure personas and abstract scenarios. Held
+     *  on the deps (not only captured in the session config) so a route that isn't
+     *  a chat can still reach the provider. */
+    client: ModelClient;
     store: MemoryStore;
     events: EventStore;
     goals: GoalStore;
@@ -311,6 +321,7 @@ function buildDeps(): ServerDeps {
     }
 
     return {
+        client,
         store,
         events,
         goals,
@@ -409,6 +420,44 @@ function eventToJson(e: Event) {
         meta: e.meta ?? null,
         session: e.session ?? null,
         correlation: e.correlation ?? null,
+    };
+}
+
+/**
+ * Serialize a `dream` event into the dreams-applet wire shape.
+ *
+ * A dream is logged as one event ({@link dreamOnce}): its `content` is the
+ * persona's choice (verbatim), and its `meta` carries the structured record the
+ * loop wrote — `{ persona, scenario, sourceMemoryIds }`. The dreams view wants
+ * that structure flattened into named fields rather than the raw event, so the
+ * applet renders persona/scenario/choice directly without re-deriving them.
+ *
+ * `meta` is read defensively: the EventStore degrades a corrupt `meta` to
+ * `undefined` on read, and even a well-formed event might (in principle) carry a
+ * shape we don't expect, so every field falls back to a safe default rather than
+ * throwing. The persona is passed through as-is (it's a {@link Personality}, with
+ * optional dealt stakes); the applet reads its `name`/`role` and ignores the
+ * rest.
+ */
+function dreamEventToJson(e: Event) {
+    const meta = (e.meta ?? {}) as {
+        persona?: unknown;
+        scenario?: unknown;
+        sourceMemoryIds?: unknown;
+    };
+    const persona =
+        meta.persona && typeof meta.persona === "object" ? meta.persona : { name: "(unknown)" };
+    const sources = Array.isArray(meta.sourceMemoryIds)
+        ? meta.sourceMemoryIds.filter((x): x is number => typeof x === "number")
+        : [];
+    return {
+        id: e.id,
+        ts: e.ts,
+        persona,
+        scenario: typeof meta.scenario === "string" ? meta.scenario : "",
+        // The persona's choice rides in the event content (FTS-searchable there).
+        choice: e.content,
+        sourceMemoryIds: sources,
     };
 }
 
@@ -752,6 +801,96 @@ function sendNoteError(res: ServerResponse, err: unknown): void {
     sendJson(res, 500, { error: message });
 }
 
+// ── Dreams routes ────────────────────────────────────────────────────────────
+
+/** The largest number of dreams a single POST may ask for. A dream is several
+ *  model turns, so an unbounded `count` would be an open-ended spend; this caps
+ *  one request to a reasonable batch (a client wanting more dreams sends another
+ *  request). Reads (GET) are bounded separately by {@link clampPage}. */
+const MAX_DREAM_BATCH = 10;
+
+/**
+ * Handle the dreams applet's two routes: read the accumulated dreams and run new
+ * ones on demand.
+ *
+ *  - GET  /api/dreams           the logged dreams, newest first. A scoped read of
+ *                               the event log filtered to {@link DREAM_EVENT_KIND},
+ *                               each event flattened to its structured record
+ *                               (persona / scenario / choice) by
+ *                               {@link dreamEventToJson}. `limit` bounds the page.
+ *  - POST /api/dreams           run `count` dreams now and return them. Drives
+ *                               {@link dreamLoop} directly against the shared
+ *                               stores and client — no conversation, the way
+ *                               dreaming is meant to run (during downtime, with no
+ *                               one watching). Each dream appends a `dream` event
+ *                               as a side effect, so a subsequent GET reflects them.
+ *
+ * The POST tolerates per-dream failures the way the loop does: a malformed dream
+ * is recorded in the result's `failures`, not fatal, so a single bad dream
+ * doesn't sink the batch. The whole batch only fails (a real error status) if the
+ * client itself throws — a transport/auth problem the client should see classified.
+ */
+async function handleDreams(
+    req: IncomingMessage,
+    res: ServerResponse,
+    deps: ServerDeps,
+    url: URL,
+): Promise<void> {
+    if (req.method === "GET") {
+        const limit = clampPage(url.searchParams.get("limit"), DEFAULT_PAGE, 1000);
+        // recent() is newest-first and filters by kind in the store, so the dreams
+        // view is the dream events alone, freshest at the top — the order a "what
+        // has the Construct been dreaming" list wants.
+        const rows = deps.events.recent({ kind: DREAM_EVENT_KIND, limit }).map(dreamEventToJson);
+        sendJson(res, 200, { dreams: rows, total: deps.events.count({ kind: DREAM_EVENT_KIND }) });
+        return;
+    }
+
+    if (req.method === "POST") {
+        const body = await readJsonObject(req);
+        if (!body) {
+            sendJson(res, 400, { error: "invalid JSON body" });
+            return;
+        }
+        // `count` defaults to one dream; clamp to [1, MAX_DREAM_BATCH] so a missing
+        // or silly value still runs exactly one rather than erroring or running away.
+        const requested = typeof body.count === "number" ? Math.floor(body.count) : 1;
+        const count = Math.min(Math.max(1, requested), MAX_DREAM_BATCH);
+        // `deal` opts the dreamer into stakes (a biased dreamer); a truthy `deal`
+        // flag deals the default count, an object passes through its `count`.
+        const deal =
+            body.deal === true
+                ? {}
+                : body.deal && typeof body.deal === "object"
+                  ? (body.deal as { count?: number })
+                  : undefined;
+
+        const result = await dreamLoop({
+            client: deps.client,
+            store: deps.store,
+            events: deps.events,
+            count,
+            deal,
+        });
+
+        sendJson(res, 200, {
+            // Return the dreams this batch produced in the same flattened shape the
+            // GET serves, so the client can prepend them without a re-fetch. They're
+            // already on the log too (dreamOnce appended each), so a refresh agrees.
+            dreams: result.dreams.map((d: Dream) => dreamEventToJson(d.event)),
+            // Surface the misses rather than hiding them: a batch that asked for 3
+            // and produced 1 should say so, with each failure's reason.
+            failures: result.failures.map((f) => ({
+                index: f.index,
+                error: f.error instanceof Error ? f.error.message : String(f.error),
+            })),
+        });
+        return;
+    }
+
+    sendJson(res, 405, { error: `method ${req.method} not allowed on /api/dreams` });
+}
+
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /** Build the request handler over a set of deps. Pure routing: it owns no
@@ -848,6 +987,14 @@ export function createHandler(deps: ServerDeps) {
             // NotesService write path so a UI write and a file save converge.
             if (path === "/api/notes" || path.startsWith("/api/notes/")) {
                 await handleNotes(req, res, deps, url, path);
+                return;
+            }
+
+            // Dreams: GET reads the accumulated dreams from the log; POST runs new
+            // ones on demand by driving dreamLoop directly (no conversation), which
+            // appends each as a dream event the GET then reflects.
+            if (path === "/api/dreams") {
+                await handleDreams(req, res, deps, url);
                 return;
             }
 

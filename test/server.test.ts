@@ -189,6 +189,123 @@ test("GET /api/commands returns the slash-command catalogue", async () => {
     assert.ok(Array.isArray(reset.params));
 });
 
+test("GET /api/dreams returns logged dreams flattened to persona/scenario/choice", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    // Seed a dream the way dreamOnce logs one: choice in content, the structured
+    // record in meta. The GET should flatten this into named fields.
+    deps.events.append({
+        kind: "dream",
+        role: "agent",
+        content: "I hold it to verify. Reasoning… and so I wait.",
+        meta: {
+            persona: { name: "Mara", role: "staff security engineer" },
+            scenario: "You must decide whether to ship under pressure. Choose.",
+            sourceMemoryIds: [3, 7],
+        },
+    });
+    const handle = createHandler(deps);
+    const { res, captured } = fakeRes();
+    await handle(getReq("/api/dreams"), res);
+    deps.close();
+
+    assert.equal(captured.status, 200);
+    const body = JSON.parse(captured.body);
+    assert.equal(body.total, 1);
+    assert.equal(body.dreams.length, 1);
+    const d = body.dreams[0];
+    assert.equal(d.persona.name, "Mara");
+    assert.equal(d.persona.role, "staff security engineer");
+    assert.match(d.scenario, /whether to ship/);
+    assert.match(d.choice, /I hold it to verify/);
+    assert.deepEqual(d.sourceMemoryIds, [3, 7]);
+});
+
+test("GET /api/dreams returns only dream events, newest first", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    // A non-dream event must not leak into the dreams view…
+    deps.events.append({ kind: "message", role: "user", content: "not a dream" });
+    deps.events.append({
+        kind: "dream",
+        role: "agent",
+        content: "older dream",
+        meta: { persona: { name: "A" }, scenario: "s1", sourceMemoryIds: [] },
+    });
+    deps.events.append({
+        kind: "dream",
+        role: "agent",
+        content: "newer dream",
+        meta: { persona: { name: "B" }, scenario: "s2", sourceMemoryIds: [] },
+    });
+    const handle = createHandler(deps);
+    const { res, captured } = fakeRes();
+    await handle(getReq("/api/dreams"), res);
+    deps.close();
+
+    const body = JSON.parse(captured.body);
+    assert.equal(body.total, 2, "only the two dream events are counted");
+    assert.deepEqual(
+        body.dreams.map((d: { choice: string }) => d.choice),
+        ["newer dream", "older dream"],
+        "dreams are newest first",
+    );
+});
+
+test("POST /api/dreams runs a dream and appends it to the log", async () => {
+    // Empty corpus: sampleScenario falls back without a model turn, so a single
+    // dream is just persona generation + the persona's choice. Script both.
+    const deps = makeDeps(
+        new FakeClient([
+            textTurn('```json\n{"name":"Dreamer"}\n```'), // persona
+            textTurn("I choose to hold and verify. Here is why…"), // the choice
+        ]),
+    );
+    const handle = createHandler(deps);
+    const { res, captured } = fakeRes();
+    await handle(postReq("/api/dreams", JSON.stringify({ count: 1 })), res);
+    deps.close();
+
+    assert.equal(captured.status, 200);
+    const body = JSON.parse(captured.body);
+    assert.equal(body.dreams.length, 1, "the batch produced one dream");
+    assert.equal(body.failures.length, 0);
+    assert.equal(body.dreams[0].persona.name, "Dreamer");
+    assert.match(body.dreams[0].choice, /hold and verify/);
+
+    // The dream was persisted as a dream event (the load-bearing side effect): a
+    // fresh GET on the same deps sees it. (deps already closed above, so assert on
+    // the returned dream's id being a real row instead.)
+    assert.ok(Number.isInteger(body.dreams[0].id), "the dream carries its logged event id");
+});
+
+test("POST /api/dreams clamps a missing count to one dream", async () => {
+    const deps = makeDeps(new FakeClient([textTurn('{"name":"X"}'), textTurn("a choice")]));
+    const handle = createHandler(deps);
+    const { res, captured } = fakeRes();
+    await handle(postReq("/api/dreams", JSON.stringify({})), res);
+    deps.close();
+
+    assert.equal(captured.status, 200);
+    const body = JSON.parse(captured.body);
+    assert.equal(body.dreams.length, 1, "no count defaults to exactly one dream");
+});
+
+test("POST /api/dreams records a malformed dream as a failure, not a crash", async () => {
+    // The persona reply is junk: dreamLoop catches the PersonaError, records it,
+    // and the route returns it under `failures` with the batch still 200.
+    const deps = makeDeps(new FakeClient([textTurn("I'd rather not invent anyone.")]));
+    const handle = createHandler(deps);
+    const { res, captured } = fakeRes();
+    await handle(postReq("/api/dreams", JSON.stringify({ count: 1 })), res);
+    deps.close();
+
+    assert.equal(captured.status, 200);
+    const body = JSON.parse(captured.body);
+    assert.equal(body.dreams.length, 0, "no dream completed");
+    assert.equal(body.failures.length, 1, "the bad dream is surfaced, not hidden");
+    assert.equal(body.failures[0].index, 0);
+    assert.ok(typeof body.failures[0].error === "string");
+});
+
 test("GET /api/events requires a session param", async () => {
     const deps = makeDeps(new FakeClient([]));
     const handle = createHandler(deps);

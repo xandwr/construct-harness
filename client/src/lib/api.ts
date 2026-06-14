@@ -72,6 +72,39 @@ export interface WireNote extends WireNoteSummary {
     links: WireNoteLink[];
 }
 
+/** The persona a dream conjured, as it rides in a dream's `meta`. Mirrors the
+ *  harness `Personality`: only `name` is guaranteed; the rest are the optional
+ *  traits the persona factory may have filled in (and any dealt stakes). The
+ *  dreams applet reads `name`/`role` and leaves the rest. */
+export interface WireDreamPersona {
+    name: string;
+    role?: string;
+    disposition?: string;
+    standards?: string;
+    expertise?: string;
+    stakes?: { riding: string; valence: "falsePass" | "falseFail" }[];
+}
+
+/** One dream, as `/api/dreams` returns it: a disposable persona faced a scenario
+ *  drawn from the corpus and made a `choice`. The structured record the dream
+ *  loop wrote to the event's `meta`, flattened by the server so the applet
+ *  renders persona / scenario / choice without re-deriving them. */
+export interface WireDream {
+    /** The `dream` event's id (its row in the log). */
+    id: number;
+    /** When the dream was logged (epoch ms). */
+    ts: number;
+    /** Who dreamed it. */
+    persona: WireDreamPersona;
+    /** The dilemma the persona faced, phrased as a scene with a choice to make. */
+    scenario: string;
+    /** The persona's reply: the choice it made and why, verbatim. */
+    choice: string;
+    /** Ids of the memories the scenario was abstracted from (empty when the
+     *  corpus was empty and a generic scenario was used). */
+    sourceMemoryIds: number[];
+}
+
 /** One parameter a slash command accepts, as `/api/commands` returns it. Mirrors
  *  the harness `CommandParam`: a placeholder name, a hint, and whether it's
  *  required (which decides the `<name>` vs `[name]` bracket in the signature). */
@@ -153,6 +186,12 @@ export function getCommands(fetchFn?: typeof fetch): Promise<{ commands: WireCom
     return getJson("/api/commands", fetchFn);
 }
 
+/** The accumulated dreams, newest first: each a disposable persona's choice on a
+ *  scenario drawn from the corpus. The dreams applet renders this directly. */
+export function getDreams(fetchFn?: typeof fetch): Promise<{ dreams: WireDream[]; total: number }> {
+    return getJson("/api/dreams", fetchFn);
+}
+
 /** Run a JSON write (POST/PUT/DELETE), throwing {@link ApiError} on a non-2xx so
  *  callers can surface the server's message (a 400 path clash, a 404, ...). */
 async function writeJson<T>(
@@ -224,6 +263,24 @@ export function updateNote(
 /** Delete a note by uuid. */
 export function deleteNote(uuid: string, fetchFn?: typeof fetch): Promise<{ deleted: boolean }> {
     return writeJson("DELETE", `/api/notes/${encodeURIComponent(uuid)}`, undefined, fetchFn);
+}
+
+/**
+ * Run `count` dreams now and return them (newest of the batch first, same shape
+ * as {@link getDreams}). Each dream is also appended to the log server-side, so a
+ * subsequent {@link getDreams} reflects them; the applet prepends the returned
+ * dreams immediately rather than re-fetching.
+ *
+ * `deal: true` biases the dreamer with stakes (see the harness `dealStakes`).
+ * `failures` carries any dream in the batch that didn't complete (a malformed
+ * persona, a momentary blip), so a partial batch is visible rather than silently
+ * short. A transport/auth error throws {@link ApiError}, as with any write.
+ */
+export function runDreams(
+    opts: { count?: number; deal?: boolean } = {},
+    fetchFn?: typeof fetch,
+): Promise<{ dreams: WireDream[]; failures: { index: number; error: string }[] }> {
+    return writeJson("POST", "/api/dreams", opts, fetchFn);
 }
 
 /** The events the chat SSE stream delivers, in the same `kind` vocabulary the
