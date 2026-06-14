@@ -72,6 +72,26 @@ export interface WireNote extends WireNoteSummary {
     links: WireNoteLink[];
 }
 
+/** One parameter a slash command accepts, as `/api/commands` returns it. Mirrors
+ *  the harness `CommandParam`: a placeholder name, a hint, and whether it's
+ *  required (which decides the `<name>` vs `[name]` bracket in the signature). */
+export interface WireCommandParam {
+    name: string;
+    description: string;
+    required: boolean;
+}
+
+/** A slash command as `/api/commands` advertises it. Mirrors the harness
+ *  `SlashCommand`: the keyword (no leading slash), a one-line description, its
+ *  parameters in signature order, and any alias keywords. The chat composer
+ *  lists these in its `/` menu. */
+export interface WireCommand {
+    name: string;
+    description: string;
+    params: WireCommandParam[];
+    aliases?: string[];
+}
+
 /** Thrown when a JSON read fails; carries the HTTP status so a caller can tell
  *  a 401 (no/invalid API key on the server) from a 502 (upstream blip). */
 export class ApiError extends Error {
@@ -124,6 +144,13 @@ export function getMemories(
 /** The raw event log, newest first. */
 export function getLog(fetchFn?: typeof fetch): Promise<{ events: WireEvent[]; total: number }> {
     return getJson("/api/log", fetchFn);
+}
+
+/** The slash-command catalogue, for the chat composer's `/` menu. Static for the
+ *  process, so a caller can fetch it once and filter client-side as the human
+ *  types. */
+export function getCommands(fetchFn?: typeof fetch): Promise<{ commands: WireCommand[] }> {
+    return getJson("/api/commands", fetchFn);
 }
 
 /** Run a JSON write (POST/PUT/DELETE), throwing {@link ApiError} on a non-2xx so

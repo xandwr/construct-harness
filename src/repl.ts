@@ -18,6 +18,7 @@ import { Session } from "./session.ts";
 import type { LoopEvent } from "./bridge/loop.ts";
 import { HarnessError } from "./bridge/errors.ts";
 import { makeMarkdownRenderer } from "./markdown.ts";
+import { BUILTIN_COMMANDS, commandSignature, findCommand } from "./commands.ts";
 
 /** The output sink the REPL writes to. `process.stdout` satisfies this; tests
  *  pass a buffer. `isTTY` gates ANSI styling so piped/redirected output stays
@@ -239,12 +240,25 @@ function footer(
     return parts.join(" · ");
 }
 
-/** Handle a slash command. Returns true when the REPL should exit. */
+/**
+ * Handle a slash command. Returns true when the REPL should exit.
+ *
+ * The set of commands and their descriptions live in {@link BUILTIN_COMMANDS}
+ * (the same catalogue the web client lists in its `/` menu); the REPL resolves
+ * the typed word against it so an unknown command is reported rather than run,
+ * and `/help` prints the registry instead of a hand-kept string. What each
+ * command *does* still lives here — execution is the surface's job — switched on
+ * the resolved command's stable `name`.
+ */
 function handleCommand(out: ReplOutput, input: string, session: Session): boolean {
-    const [cmd] = input.slice(1).split(/\s+/);
-    switch (cmd) {
+    const [word] = input.slice(1).split(/\s+/);
+    const cmd = findCommand(word);
+    if (!cmd) {
+        out.write(dim(out, `Unknown command: /${word}. Try /help.\n`));
+        return false;
+    }
+    switch (cmd.name) {
         case "exit":
-        case "quit":
             return true;
         case "reset":
             session.reset();
@@ -256,10 +270,18 @@ function handleCommand(out: ReplOutput, input: string, session: Session): boolea
             return false;
         }
         case "help":
-            out.write(dim(out, "/reset clear history · /history count · /exit quit\n"));
+            out.write(dim(out, `${helpText()}\n`));
             return false;
         default:
-            out.write(dim(out, `Unknown command: /${cmd}. Try /help.\n`));
+            // A command in the registry the REPL doesn't act on (none today).
+            out.write(dim(out, `/${cmd.name} isn't available here.\n`));
             return false;
     }
+}
+
+/** One-line help listing every built-in command's signature and description,
+ *  rendered from {@link BUILTIN_COMMANDS} so the REPL and the registry never
+ *  drift. */
+function helpText(): string {
+    return BUILTIN_COMMANDS.map((c) => `${commandSignature(c)} — ${c.description}`).join(" · ");
 }

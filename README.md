@@ -85,7 +85,11 @@ npm start            # or: node --env-file-if-exists=.env src/index.ts
 ```
 
 You get a streaming prompt. The Construct saves durable facts on its own and
-recalls them on later turns. Slash commands: `/reset`, `/history`, `/exit`.
+recalls them on later turns. Slash commands handle the session-level actions a
+transcript can't: `/reset`, `/history`, `/help`, `/exit`. They come from one
+catalogue ([`src/commands.ts`](src/commands.ts)) the REPL prints under `/help`
+and the web client lists in a menu when you open the composer with a `/`; adding
+a command in that one file lights it up on both surfaces.
 
 ## HTTP server and client
 

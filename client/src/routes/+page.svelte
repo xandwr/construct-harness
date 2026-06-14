@@ -1,10 +1,21 @@
 <script lang="ts">
 	import { tick } from 'svelte';
+	import { goto } from '$app/navigation';
 	import AppHeader from '$lib/AppHeader.svelte';
 	import Icon from '$lib/Icon.svelte';
+	import CommandMenu from '$lib/CommandMenu.svelte';
 	import { APPS } from '$lib/apps';
 	import { page } from '$app/state';
-	import { sendChat, getEvents, ApiError, type ChatEvent, type WireEvent } from '$lib/api';
+	import {
+		sendChat,
+		getEvents,
+		getCommands,
+		ApiError,
+		type ChatEvent,
+		type WireEvent,
+		type WireCommand
+	} from '$lib/api';
+	import { commandPrefix, filterCommands, commandSignature } from '$lib/commands';
 	import { clock, shortWhen } from '$lib/time';
 	import { renderMarkdown } from '$lib/markdown';
 
@@ -55,6 +66,48 @@
 	// The event id the URL hash (#event-<id>) points at: the message the event log
 	// linked to. We scroll it into view and flash it once after the replay renders.
 	let highlighted = $state<number | null>(null);
+	// A transient status line under the composer for a client-handled command (e.g.
+	// `/history`'s count). Distinct from `error`/`footer`; cleared on the next edit.
+	let notice = $state<string | null>(null);
+
+	// ── Slash-command menu ──────────────────────────────────────────────────────
+	// The catalogue from GET /api/commands, fetched once. The menu filters this as
+	// the human types; an empty list (fetch failed or not yet loaded) just means no
+	// menu appears, and typed `/text` sends as an ordinary message.
+	let commands = $state<WireCommand[]>([]);
+	// Index of the keyboard-highlighted row while the menu is open. Reset to 0
+	// whenever the visible set changes so the cursor never points past the list.
+	let active = $state(0);
+	// The human dismissed the menu for the current draft (Escape). Sticky until the
+	// draft changes, so Escape closes it without the next keystroke reopening it.
+	let dismissed = $state(false);
+	// The composer input element, so a Tab/click completion can keep focus there
+	// (a menu-button click would otherwise blur the input).
+	let commandInput = $state<HTMLInputElement | null>(null);
+
+	// The text after `/` when the draft is opening a command (single token, no
+	// space), else null — see commandPrefix. Drives whether the menu shows at all.
+	const prefix = $derived(commandPrefix(draft));
+	// The commands matching the current prefix. Empty when the draft isn't a
+	// command or nothing matches; the menu renders only when this is non-empty.
+	const matches = $derived(prefix === null ? [] : filterCommands(prefix, commands));
+	// Show the menu when there's something to show and the human hasn't dismissed
+	// it for this draft.
+	const menuOpen = $derived(matches.length > 0 && !dismissed);
+
+	$effect(() => {
+		getCommands()
+			.then((res) => (commands = res.commands))
+			.catch(() => {
+				/* No menu without a catalogue; typing `/x` just sends as a message. */
+			});
+	});
+
+	// Keep `active` in range as the filtered set shrinks/grows while typing. Reading
+	// matches.length makes this rerun on every filter change.
+	$effect(() => {
+		if (active >= matches.length) active = 0;
+	});
 
 	// The scrollable transcript element, bound below. We read its scroll position to
 	// decide whether to show the jump-to-latest chevron and to stick to the bottom
@@ -189,9 +242,106 @@
 		return lines;
 	}
 
+	// Any edit re-arms the menu: clear a prior dismissal and any command notice so a
+	// fresh `/` opens the menu again and stale status lines don't linger.
+	function onInput() {
+		dismissed = false;
+		notice = null;
+	}
+
+	// Drive the menu from the composer's own keystrokes, so the input keeps focus
+	// and one cursor serves both mouse and keyboard. Only acts while the menu is
+	// open; otherwise the input behaves normally. Tab completes the highlighted
+	// command into the draft — it never executes; Enter is left alone so it submits
+	// the form, where the line is parsed inline (see submit).
+	function onKeydown(event: KeyboardEvent) {
+		if (!menuOpen) return;
+		switch (event.key) {
+			case 'ArrowDown':
+				event.preventDefault();
+				active = (active + 1) % matches.length;
+				break;
+			case 'ArrowUp':
+				event.preventDefault();
+				active = (active - 1 + matches.length) % matches.length;
+				break;
+			case 'Tab':
+				// Complete the highlighted command into the input, like shell tab
+				// completion: fill the draft and stop here. The human then edits or
+				// hits Enter to run it; Tab on its own runs nothing.
+				event.preventDefault();
+				completeCommand(matches[active]);
+				break;
+			case 'Escape':
+				event.preventDefault();
+				dismissed = true;
+				break;
+		}
+	}
+
+	// Complete a command into the draft (Tab or a menu click): a parameterized one
+	// leaves a trailing space so the human types its argument next; a nullary one
+	// completes bare. Either way the menu closes (a trailing space closes it; a bare
+	// completion is a finished single token the human can now submit) and nothing
+	// runs until Enter. Keeps focus in the input so editing/submitting is immediate.
+	function completeCommand(cmd: WireCommand) {
+		draft = cmd.params.length === 0 ? `/${cmd.name}` : `/${cmd.name} `;
+		dismissed = true;
+		commandInput?.focus();
+	}
+
+	// Run a client-handled slash command, with any inline arguments the submit
+	// parser split off (none of today's commands take args; `args` is here so a
+	// future parameterized one reads them without rewiring the call site). The
+	// catalogue is shared with the REPL, so it lists `/exit` too; here we map the
+	// ones a web composer can honor and note the ones it can't, rather than sending
+	// any of them to the model as prose.
+	function runCommand(cmd: WireCommand, args: string[] = []) {
+		void args;
+		error = null;
+		footer = null;
+		switch (cmd.name) {
+			case 'reset':
+				// A web conversation can't mutate the server's history, so "reset" is
+				// starting a fresh one — the same outcome the REPL's /reset gives.
+				goto('/');
+				notice = 'started a new conversation';
+				break;
+			case 'history': {
+				const count = messages.length;
+				notice = `${count} message${count === 1 ? '' : 's'} in this conversation`;
+				break;
+			}
+			case 'help':
+				notice = commands.map((c) => commandSignature(c)).join(' · ');
+				break;
+			default:
+				// e.g. /exit — meaningful in the REPL, not in a browser tab.
+				notice = `/${cmd.name} isn't available here`;
+		}
+	}
+
 	async function submit(event: SubmitEvent) {
 		event.preventDefault();
 		const text = draft.trim();
+
+		// Parse a slash command inline: the first token is the command, the rest its
+		// arguments. Submitting (Enter / the send button) is the only thing that
+		// runs a command — completing one from the menu just fills the input. An
+		// unknown `/word` falls through and sends to the model as ordinary prose.
+		if (text.startsWith('/')) {
+			const [token, ...rest] = text.slice(1).split(/\s+/);
+			const word = token.toLowerCase();
+			const cmd = commands.find(
+				(c) => c.name === word || (c.aliases ?? []).some((a) => a.toLowerCase() === word)
+			);
+			if (cmd) {
+				draft = '';
+				runCommand(cmd, rest);
+				return;
+			}
+		}
+
 		// Block on an in-flight turn or a replay still loading (sending before the
 		// transcript is in context would resume from an incomplete history), but not
 		// on viewing a past conversation — that's the resume path.
@@ -200,6 +350,7 @@
 		draft = '';
 		error = null;
 		footer = null;
+		notice = null;
 		sending = true;
 		messages.push({ role: 'user', text, ts: Date.now() });
 
@@ -391,19 +542,40 @@
 	{/if}
 
 	<!-- Composer: always enabled (resuming a past conversation is just sending into
-	     it); only blocked mid-turn or while a replay is still loading. -->
+	     it); only blocked mid-turn or while a replay is still loading. Opening the
+	     draft with `/` pops the command menu above the input (see CommandMenu). -->
 	<form class="border-t border-border px-4 py-3" onsubmit={submit}>
+		<!-- A one-line result from a client-handled command (e.g. /history's count).
+		     Above the input so it reads as a reply to what was just typed. -->
+		{#if notice}
+			<div class="text-faint mb-2 text-[10px]">{notice}</div>
+		{/if}
 		<div class="flex items-stretch gap-2">
-			<input
-				bind:value={draft}
-				disabled={sending || loadingReplay}
-				placeholder={loadingReplay
-					? 'loading…'
-					: viewing
-						? 'resume this conversation'
-						: 'say something'}
-				class="placeholder:text-faint flex-1 border border-border bg-surface px-3 py-2 text-xs text-text outline-none focus:border-glow disabled:opacity-50"
-			/>
+			<!-- The relative wrapper anchors the floating menu to the input column, so
+			     it spans the input's width and sits just above it. -->
+			<div class="relative flex-1">
+				{#if menuOpen}
+					<CommandMenu
+						commands={matches}
+						{active}
+						onselect={completeCommand}
+						onhover={(i) => (active = i)}
+					/>
+				{/if}
+				<input
+					bind:this={commandInput}
+					bind:value={draft}
+					oninput={onInput}
+					onkeydown={onKeydown}
+					disabled={sending || loadingReplay}
+					placeholder={loadingReplay
+						? 'loading…'
+						: viewing
+							? 'resume this conversation'
+							: 'say something, or / for commands'}
+					class="placeholder:text-faint w-full border border-border bg-surface px-3 py-2 text-xs text-text outline-none focus:border-glow disabled:opacity-50"
+				/>
+			</div>
 			<button
 				type="submit"
 				disabled={sending || loadingReplay || draft.trim() === ''}

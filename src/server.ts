@@ -24,6 +24,8 @@
  *  - `GET  /api/sessions`        — conversation list (id + preview + count).
  *  - `GET  /api/memories`        — the curated memory store.
  *  - `GET  /api/log`            — the raw event log, newest first.
+ *  - `GET  /api/commands`        — the slash-command catalogue, for the client's
+ *                                  `/` menu (mirrors {@link BUILTIN_COMMANDS}).
  *
  * Run it with `npm run serve` (see package.json). It speaks only core types and
  * the stores' public surface, so it stays as provider-neutral as everything
@@ -45,6 +47,7 @@ import { NotesStore, Note, NoteError, type NoteFrontmatter } from "./notes.ts";
 import { NotesService } from "./notesService.ts";
 import { noteTools } from "./noteTools.ts";
 import { shellTools } from "./shellTools.ts";
+import { BUILTIN_COMMANDS } from "./commands.ts";
 
 const BASE_SYSTEM =
     "You are a helpful, concise assistant: a long-lived Construct that remembers " +
@@ -828,6 +831,15 @@ export function createHandler(deps: ServerDeps) {
                 const kind = url.searchParams.get("kind") ?? undefined;
                 const rows = deps.events.recent({ limit, kind }).map(eventToJson);
                 sendJson(res, 200, { events: rows, total: deps.events.count() });
+                return;
+            }
+
+            // The slash-command catalogue: a static read of the registry, so the
+            // client can list the same commands (name, signature parts, params)
+            // in its `/` menu that the REPL prints under `/help`. No per-session
+            // state: the menu is the same for every conversation.
+            if (req.method === "GET" && path === "/api/commands") {
+                sendJson(res, 200, { commands: BUILTIN_COMMANDS });
                 return;
             }
 

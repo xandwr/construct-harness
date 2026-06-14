@@ -52,6 +52,10 @@ export * from "./context.ts";
 export * from "./compaction.ts";
 export * from "./usage.ts";
 
+// The slash-command catalogue every client surface (the REPL, the web client)
+// advertises; inert data describing the session-level actions a surface runs.
+export * from "./commands.ts";
+
 // The thing you talk to, and the ways to drive it without a human in the seat.
 export * from "./session.ts";
 export * from "./orchestrate.ts";

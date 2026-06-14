@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 
 import { createHandler, resolveServerTools, SessionPool } from "../src/server.ts";
+import { BUILTIN_COMMANDS } from "../src/commands.ts";
 import { MemoryStore, Memory } from "../src/memory.ts";
 import { EventStore } from "../src/events.ts";
 import { GoalStore } from "../src/goals.ts";
@@ -170,6 +171,22 @@ test("GET /api/memories returns the curated store in wire shape", async () => {
     assert.equal(body.memories.length, 1);
     assert.equal(body.memories[0].content, "Deploys go out on Fridays.");
     assert.deepEqual(body.memories[0].tags, ["ops"]);
+});
+
+test("GET /api/commands returns the slash-command catalogue", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const handle = createHandler(deps);
+    const { res, captured } = fakeRes();
+    await handle(getReq("/api/commands"), res);
+    deps.close();
+
+    assert.equal(captured.status, 200);
+    const body = JSON.parse(captured.body);
+    assert.deepEqual(body.commands, BUILTIN_COMMANDS);
+    // The shape the client's `/` menu reads: a name and params per command.
+    const reset = body.commands.find((c: { name: string }) => c.name === "reset");
+    assert.ok(reset, "expected a /reset command");
+    assert.ok(Array.isArray(reset.params));
 });
 
 test("GET /api/events requires a session param", async () => {
