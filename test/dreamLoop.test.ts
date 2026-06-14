@@ -27,8 +27,19 @@ import {
 import type { Dream } from "../src/dreaming.ts";
 import { Memory, MemoryStore } from "../src/memory.ts";
 import { EventStore } from "../src/events.ts";
+import { personaIdentity } from "../src/critics.ts";
 import { FakeClient, textTurn } from "./helpers/fakeClient.ts";
 import type { ScriptedTurn } from "../src/testing.ts";
+
+/** The text of the system turn carried by a recorded FakeClient call. The system
+ *  prompt rides as a {@link Message} with `sender.role === "system"`. */
+function systemTextOf(call: {
+    messages: { sender: { role: string }; content: { kind: string; text?: string }[] }[];
+}): string {
+    const system = call.messages.find((m) => m.sender.role === "system");
+    assert.ok(system, "a system turn should be present");
+    return system!.content.map((p) => (p.kind === "text" ? p.text : "")).join("");
+}
 
 /** A persona reply turn, as the model would emit it (fenced JSON). */
 function personaTurn(name: string): ScriptedTurn {
@@ -163,6 +174,14 @@ test("dreamOnce reuses a supplied scenario and skips corpus sampling", async () 
         assert.equal(dream.scenario.prompt, "Pre-built dilemma. Choose.");
         assert.deepEqual(dream.scenario.sourceMemoryIds, [42]);
         assert.match(dream.choice, /I approve it/);
+
+        // The dreamer faces the scenario AS the persona but NOT as a verifier: its
+        // system prompt is the persona's identity, with no PASS/FAIL verdict clause
+        // to cross the "choose, and say why" scenario. (calls[1] is the choice
+        // turn; calls[0] was persona generation.)
+        const choiceSystem = systemTextOf(client.calls[1]!);
+        assert.equal(choiceSystem, personaIdentity(dream.persona));
+        assert.doesNotMatch(choiceSystem, /PASS or FAIL/);
     });
 });
 

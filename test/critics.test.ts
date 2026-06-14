@@ -15,6 +15,8 @@ import assert from "node:assert/strict";
 
 import {
     personaSystem,
+    personaIdentity,
+    VERDICT_CLAUSE,
     renderStakes,
     critic,
     panel,
@@ -102,6 +104,50 @@ test("personaSystem folds stakes in after the standing instruction, before extra
 test("personaSystem omits the stakes preamble when there are none", () => {
     const out = personaSystem({ name: "Dana" });
     assert.doesNotMatch(out, /depend on you getting this right/);
+});
+
+// ── personaIdentity: the person without the verifier framing ──────────────────
+
+test("personaIdentity renders the person but NOT the verdict clause", () => {
+    const p: Personality = {
+        name: "Priya",
+        role: "staff security engineer",
+        disposition: "assumes every input is hostile",
+        stakes: [{ riding: "the on-call gets paged at 3am", valence: "falsePass" }],
+        extra: "Always cite a CWE.",
+    };
+    const out = personaIdentity(p);
+    // The identity, traits, stakes scene, and extra are all present...
+    assert.match(out, /You are Priya, staff security engineer\./);
+    assert.match(out, /Disposition: assumes every input is hostile/);
+    assert.match(out, /the on-call gets paged at 3am/);
+    assert.match(out, /Always cite a CWE\./);
+    // ...but the PASS/FAIL verdict framing is gone: this is a person, not a
+    // verifier. A dreamer minted from this faces its scenario with no stray
+    // "end with PASS or FAIL on work" instruction crossing the choice.
+    assert.doesNotMatch(out, /PASS or FAIL/);
+    assert.doesNotMatch(out, /reviewing work/);
+});
+
+test("personaSystem is personaIdentity plus the verdict clause", () => {
+    // The split is lossless: personaSystem is exactly the identity with the
+    // verdict clause spliced in after the traits, before the stakes/extra tail.
+    const p: Personality = {
+        name: "Mara",
+        role: "release captain",
+        disposition: "ships fast, hates ceremony",
+        stakes: [{ riding: "the quarter ships behind this", valence: "falseFail" }],
+        extra: "Cite a line number.",
+    };
+    const system = personaSystem(p);
+    assert.ok(system.includes(VERDICT_CLAUSE));
+    // Removing the clause (and the blank line that joins it) recovers exactly the
+    // identity rendering: nothing else differs between the two.
+    assert.equal(system.replace(`${VERDICT_CLAUSE}\n\n`, ""), personaIdentity(p));
+    // And the clause sits where the old order put it: after the traits (the
+    // disposition), before the stakes tail.
+    assert.ok(system.indexOf("ships fast") < system.indexOf(VERDICT_CLAUSE));
+    assert.ok(system.indexOf(VERDICT_CLAUSE) < system.indexOf("the quarter ships"));
 });
 
 // ── STAKE_POOL: the deck dealStakes draws from ────────────────────────────────

@@ -29,7 +29,7 @@
 
 import { Session } from "./session.ts";
 import type { ModelClient, ProviderOptions } from "./bridge/types.ts";
-import { critic, dealStakes } from "./critics.ts";
+import { dealStakes, personaIdentity } from "./critics.ts";
 import type { Personality, DealOptions, Random } from "./critics.ts";
 import type { Memory, MemoryStore } from "./memory.ts";
 import type { Event, EventStore } from "./events.ts";
@@ -513,11 +513,18 @@ export async function dreamOnce(options: DreamOptions): Promise<Dream> {
             providerOptions: options.providerOptions,
         }));
 
-    // The dreamer *becomes* the persona: a critic Session whose system prompt is
-    // the rendered persona. No memory tools, no log on this inner Session: the
-    // dreamer is disposable and we record only its choice, on the outer log.
-    const dreamer = critic(persona, {
+    // The dreamer *becomes* the persona, but as a person facing a life choice,
+    // not a critic signing off on work: its system prompt is the persona's
+    // identity ALONE, without the PASS/FAIL verdict clause critic() would splice
+    // in. The scenario prompt ("choose, and say why") is then the only task in
+    // play, instead of being crossed with a "end with PASS or FAIL on work"
+    // instruction that doesn't belong on a personal dilemma and would contaminate
+    // the decision-space signal the dream exists to collect. No memory tools, no
+    // log on this inner Session: the dreamer is disposable and we record only its
+    // choice, on the outer log.
+    const dreamer = new Session({
         client: options.client,
+        system: personaIdentity(persona),
         context: [],
         providerOptions: options.providerOptions,
     });

@@ -133,7 +133,67 @@ export interface Personality {
 }
 
 /**
- * Render a {@link Personality} into the system prompt a {@link critic} runs on.
+ * The standing instruction that frames a persona's reply as a *verdict*: judge
+ * in character and end with PASS or FAIL. This is the part that makes a persona a
+ * *critic* rather than just a person, so it is deliberately separable from the
+ * identity ({@link personaIdentity}): a caller who wants the person without the
+ * review framing (a dreamer choosing a life dilemma, not signing off on work)
+ * renders the identity alone and lets its own task prompt say what to do. A
+ * caller who wants a verifier uses {@link personaSystem}, which splices this in.
+ */
+export const VERDICT_CLAUSE =
+    "You are reviewing work as yourself: judge it the way this specific " +
+    "person would, with their priorities and their blind spots, not as a " +
+    "neutral assistant. Be concrete about what you find. State your " +
+    "reasoning, then end your reply with exactly PASS or FAIL on its own.";
+
+/** The persona's identity and traits as ordered prose segments, in render order:
+ *  the second-person "You are …" line, then each present trait as its own
+ *  labelled sentence. Absent fields contribute nothing. Internal: callers want
+ *  {@link personaIdentity} (joined) or {@link personaSystem} (with the verdict
+ *  clause spliced after these head segments). */
+function identitySegments(p: Personality): string[] {
+    const parts: string[] = [];
+    parts.push(p.role ? `You are ${p.name}, ${p.role}.` : `You are ${p.name}.`);
+    if (p.expertise) parts.push(`Your expertise is ${p.expertise}.`);
+    if (p.disposition) parts.push(`Disposition: ${p.disposition}`);
+    if (p.standards) parts.push(`Your standards: ${p.standards}`);
+    return parts;
+}
+
+/** The persona's stakes scene (if any) and freeform `extra` (if any), in render
+ *  order: the thing the persona protects last before its escape-hatch text. The
+ *  tail both {@link personaIdentity} and {@link personaSystem} end with. */
+function tailSegments(p: Personality): string[] {
+    const parts: string[] = [];
+    const stakes = renderStakes(p.stakes);
+    if (stakes) parts.push(stakes);
+    if (p.extra) parts.push(p.extra);
+    return parts;
+}
+
+/**
+ * Render a {@link Personality} into *who they are*: identity, traits, the stakes
+ * scene, and any `extra` — but **not** the verdict framing. This is the persona
+ * as a person, not as a reviewer.
+ *
+ * Pure and exported so a caller can drop a persona into a task that isn't a
+ * review without the PASS/FAIL clause contaminating it: the dream loop mints its
+ * dreamer from this so the scenario prompt ("choose, and say why") is the only
+ * instruction in play, instead of being crossed with "end with PASS or FAIL on
+ * work" that doesn't apply. The shape is the same as {@link personaSystem} minus
+ * the verdict clause: identity line first, then each present trait, then the
+ * stakes as a scene to inhabit, then any `extra`. Absent fields contribute
+ * nothing.
+ */
+export function personaIdentity(p: Personality): string {
+    return [...identitySegments(p), ...tailSegments(p)].join("\n\n");
+}
+
+/**
+ * Render a {@link Personality} into the system prompt a {@link critic} runs on:
+ * {@link personaIdentity} plus the {@link VERDICT_CLAUSE} that frames the whole
+ * thing as judging in character.
  *
  * Pure and exported so a caller can preview exactly what persona a Construct
  * will inhabit (and unit-test the rendering) without spinning up a Session. The
@@ -146,22 +206,7 @@ export interface Personality {
  * for a critic with nothing on the line.
  */
 export function personaSystem(p: Personality): string {
-    const parts: string[] = [];
-    const identity = p.role ? `You are ${p.name}, ${p.role}.` : `You are ${p.name}.`;
-    parts.push(identity);
-    if (p.expertise) parts.push(`Your expertise is ${p.expertise}.`);
-    if (p.disposition) parts.push(`Disposition: ${p.disposition}`);
-    if (p.standards) parts.push(`Your standards: ${p.standards}`);
-    parts.push(
-        "You are reviewing work as yourself: judge it the way this specific " +
-            "person would, with their priorities and their blind spots, not as a " +
-            "neutral assistant. Be concrete about what you find. State your " +
-            "reasoning, then end your reply with exactly PASS or FAIL on its own.",
-    );
-    const stakes = renderStakes(p.stakes);
-    if (stakes) parts.push(stakes);
-    if (p.extra) parts.push(p.extra);
-    return parts.join("\n\n");
+    return [...identitySegments(p), VERDICT_CLAUSE, ...tailSegments(p)].join("\n\n");
 }
 
 /**
