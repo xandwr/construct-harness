@@ -15,32 +15,32 @@
  */
 
 export interface AppDef {
-	/** Stable id, also the active-route key. Matches the route segment. */
-	id: string;
-	/** Sidebar label. Plain, lowercase, legible. */
-	title: string;
-	/** Route to navigate to. Usually `/${id}`; chat owns the index. */
-	href: string;
-	/** Icon name: a file basename in `src/lib/icons/`, resolved by Icon.svelte. */
-	icon: string;
+    /** Stable id, also the active-route key. Matches the route segment. */
+    id: string;
+    /** Sidebar label. Plain, lowercase, legible. */
+    title: string;
+    /** Route to navigate to. Usually `/${id}`; chat owns the index. */
+    href: string;
+    /** Icon name: a file basename in `src/lib/icons/`, resolved by Icon.svelte. */
+    icon: string;
 }
 
 /** The applets, in sidebar order. chat owns the index route (`/`). */
 export const APPS: AppDef[] = [
-	{ id: 'chat', title: 'chat', href: '/', icon: 'chat' },
-	{ id: 'conversations', title: 'conversations', href: '/conversations', icon: 'conversations' },
-	{ id: 'memories', title: 'memories', href: '/memories', icon: 'memories' },
-	{ id: 'kb', title: 'knowledge base', href: '/kb', icon: 'knowledge-base' },
-	{ id: 'log', title: 'event log', href: '/log', icon: 'event-log' },
-	{ id: 'dreams', title: 'dreams', href: '/dreams', icon: 'dreams' },
-	{ id: 'settings', title: 'settings', href: '/settings', icon: 'settings' }
+    { id: "chat", title: "chat", href: "/", icon: "chat" },
+    { id: "conversations", title: "conversations", href: "/conversations", icon: "conversations" },
+    { id: "memories", title: "memories", href: "/memories", icon: "memories" },
+    { id: "kb", title: "knowledge base", href: "/kb", icon: "knowledge-base" },
+    { id: "log", title: "event log", href: "/log", icon: "event-log" },
+    { id: "dreams", title: "dreams", href: "/dreams", icon: "dreams" },
+    { id: "settings", title: "settings", href: "/settings", icon: "settings" },
 ];
 
 /** Find the applet whose route is currently active, given a pathname. The index
  *  (`/`) maps to chat; everything else matches on the leading path segment so a
  *  nested route still highlights its applet. */
 export function activeApp(pathname: string): AppDef | undefined {
-	if (pathname === '/') return APPS.find((a) => a.id === 'chat');
-	const seg = pathname.split('/').filter(Boolean)[0];
-	return APPS.find((a) => a.id === seg);
+    if (pathname === "/") return APPS.find((a) => a.id === "chat");
+    const seg = pathname.split("/").filter(Boolean)[0];
+    return APPS.find((a) => a.id === seg);
 }

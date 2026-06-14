@@ -68,6 +68,25 @@ npm start            # or: node --env-file-if-exists=.env src/index.ts
 You get a streaming prompt. The Construct saves durable facts on its own and
 recalls them on later turns. Slash commands: `/reset`, `/history`, `/exit`.
 
+## HTTP server and client
+
+Run the local HTTP surface with:
+
+```sh
+npm run serve
+```
+
+It exposes the single-user `/api/*` backend used by the SvelteKit client. By
+default CORS is permissive (`CORS_ORIGIN=*`) for local development and separately
+served static builds. Set `CORS_ORIGIN=http://localhost:5173` or another exact
+origin if you expose the server outside that local setup.
+
+The HTTP helpers are exported separately from the core package:
+
+```ts
+import { createHandler } from "construct-harness/server";
+```
+
 ## Using it as a library
 
 Install it, then import the pieces you want. Importing the package runs nothing;

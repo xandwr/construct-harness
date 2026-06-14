@@ -354,6 +354,21 @@ function serializeFrontmatter(fm: NoteFrontmatter): string | null {
     return Object.keys(fm).length ? JSON.stringify(fm) : null;
 }
 
+function appendNoteFilters(
+    where: string[],
+    params: unknown[],
+    needle: string | null,
+    pathPrefix: string | undefined,
+): void {
+    if (needle !== null) {
+        // Substring over title OR content, both escaped.
+        where.push(`(title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')`);
+        const like = `%${escapeLike(needle)}%`;
+        params.push(like, like);
+    }
+    appendPathPrefix(where, params, pathPrefix, null);
+}
+
 /** Fields a caller may patch on an existing note. `uuid` is immutable. */
 export type NotePatch = Partial<Pick<NoteInput, "path" | "title" | "content" | "frontmatter">>;
 
@@ -739,9 +754,20 @@ export class NotesStore {
 
     // ── Counting / lifecycle ──────────────────────────────────────────────────
 
-    count(): number {
+    count(opts: { q?: string; pathPrefix?: string } = {}): number {
         this.assertOpen();
-        const row = this.countStmt.get() as { n: number };
+        const needle = typeof opts.q === "string" && opts.q.trim() ? opts.q.trim() : null;
+        const where: string[] = [];
+        const params: unknown[] = [];
+        appendNoteFilters(where, params, needle, opts.pathPrefix);
+        const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+        const row = (
+            params.length
+                ? this.db
+                      .prepare(`SELECT COUNT(*) AS n FROM notes ${whereSql}`)
+                      .get(...(params as never[]))
+                : this.countStmt.get()
+        ) as { n: number };
         return row.n;
     }
 
@@ -757,13 +783,7 @@ export class NotesStore {
 
         const where: string[] = [];
         const params: unknown[] = [];
-        if (needle !== null) {
-            // Substring over title OR content, both escaped.
-            where.push(`(title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')`);
-            const like = `%${escapeLike(needle)}%`;
-            params.push(like, like);
-        }
-        appendPathPrefix(where, params, opts.pathPrefix, null);
+        appendNoteFilters(where, params, needle, opts.pathPrefix);
 
         const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
         const sql =

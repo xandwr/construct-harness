@@ -64,6 +64,7 @@ interface ServerDeps {
     session: Session;
     notes?: NotesService;
     notesStore?: NotesStore;
+    corsOrigin?: string;
     close(): void;
 }
 
@@ -147,6 +148,7 @@ function buildDeps(): ServerDeps {
         session,
         notes,
         notesStore,
+        corsOrigin: process.env.CORS_ORIGIN,
         close() {
             // Stop the watcher first so no inbound event races the store closing.
             notes.close();
@@ -190,10 +192,11 @@ function statusForKind(kind: ErrorKind): number {
  *  the Vite dev proxy) or cross-origin (a separately-served static build). The
  *  harness is a local, single-user tool; there's no credentialed session to
  *  protect with a strict origin allow-list. */
-function cors(res: ServerResponse): void {
-    res.setHeader("Access-Control-Allow-Origin", "*");
+function cors(res: ServerResponse, origin = "*"): void {
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    if (origin && origin !== "*") res.setHeader("Vary", "Origin");
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -453,7 +456,10 @@ async function handleNotes(
                     ? notesStore.search(q, { limit, pathPrefix: prefix })
                     : notesStore.all({ limit, pathPrefix: prefix })
             ).map(noteToSummaryJson);
-            sendJson(res, 200, { notes: rows, total: notesStore.count() });
+            sendJson(res, 200, {
+                notes: rows,
+                total: notesStore.count({ q: q ?? undefined, pathPrefix: prefix }),
+            });
             return;
         }
         if (req.method === "POST") {
@@ -577,7 +583,7 @@ function sendNoteError(res: ServerResponse, err: unknown): void {
  *  pointing it at an in-memory store and a fake client. */
 export function createHandler(deps: ServerDeps) {
     return async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-        cors(res);
+        cors(res, deps.corsOrigin);
         if (req.method === "OPTIONS") {
             res.writeHead(204);
             res.end();

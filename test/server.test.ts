@@ -130,6 +130,17 @@ test("GET /api/health reports ok and the live session id", async () => {
     assert.equal(body.session, deps.session.id);
 });
 
+test("CORS origin is configurable", async () => {
+    const deps = { ...makeDeps(new FakeClient([])), corsOrigin: "http://localhost:5173" };
+    const handle = createHandler(deps);
+    const { res, captured } = fakeRes();
+    await handle(getReq("/api/health"), res);
+    deps.close();
+
+    assert.equal(captured.headers["access-control-allow-origin"], "http://localhost:5173");
+    assert.equal(captured.headers.vary, "Origin");
+});
+
 test("GET /api/memories returns the curated store in wire shape", async () => {
     const deps = makeDeps(new FakeClient([]));
     deps.store.save(

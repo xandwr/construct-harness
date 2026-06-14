@@ -312,6 +312,20 @@ test("pathPrefix filters to a folder subtree", () => {
     store.close();
 });
 
+test("count supports the same search and path filters as list queries", () => {
+    const store = freshStore();
+    store.save(note({ title: "Deploy", content: "rollout", path: "projects/a.md" }));
+    store.save(note({ title: "Deploy", content: "rollback", path: "projects/sub/b.md" }));
+    store.save(note({ title: "Recipe", content: "braise", path: "personal/c.md" }));
+
+    assert.equal(store.count(), 3);
+    assert.equal(store.count({ pathPrefix: "projects/" }), 2);
+    assert.equal(store.count({ q: "deploy" }), 2);
+    assert.equal(store.count({ q: "deploy", pathPrefix: "projects/sub/" }), 1);
+
+    store.close();
+});
+
 // ---------------------------------------------------------------------------
 // Relevance (FTS5) over title + content
 // ---------------------------------------------------------------------------

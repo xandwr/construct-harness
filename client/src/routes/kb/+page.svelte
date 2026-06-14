@@ -22,6 +22,7 @@
 	// applets' read-table shape with editing on top.
 
 	let notes = $state<WireNoteSummary[]>([]);
+	let folderNotes = $state<WireNoteSummary[]>([]);
 	let total = $state(0);
 	let error = $state<string | null>(null);
 	let loading = $state(true);
@@ -43,9 +44,14 @@
 		loading = true;
 		error = null;
 		try {
-			const res = await getNotes({ q: query || undefined });
-			notes = res.notes;
-			total = res.total;
+			const q = query || undefined;
+			const [list, tree] = await Promise.all([
+				getNotes({ q, prefix: folder || undefined }),
+				getNotes({ q })
+			]);
+			notes = list.notes;
+			folderNotes = tree.notes;
+			total = list.total;
 		} catch (e) {
 			error = e instanceof ApiError ? e.message : 'failed to load the knowledge base';
 		} finally {
@@ -61,7 +67,7 @@
 	// sorted, plus the implicit root. Derived, so it tracks the note list live.
 	const folders = $derived.by(() => {
 		const set = new Set<string>();
-		for (const n of notes) {
+		for (const n of folderNotes) {
 			const parts = n.path.split('/');
 			parts.pop(); // drop the filename
 			let acc = '';
@@ -73,10 +79,8 @@
 		return [...set].sort();
 	});
 
-	// Notes within the selected folder (or all, at the root), matching the search.
-	const visible = $derived(
-		notes.filter((n) => (folder === '' ? true : n.path.startsWith(folder)))
-	);
+	// Notes returned by the server for the selected folder/search.
+	const visible = $derived(notes);
 
 	async function selectNote(uuid: string) {
 		if (dirty && !confirm('Discard unsaved changes?')) return;

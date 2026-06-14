@@ -111,6 +111,31 @@ test("accumulates usage and flags maxTurns cut-off", async () => {
     assert.equal(done.result.stoppedAtMaxTurns, true);
 });
 
+test("streaming loop clamps maxTurns to at least one model turn", async () => {
+    const client = new FakeClient([textTurn("hello")]);
+    const { done } = await drain(runLoopStream(client, { messages: [user("hi")], maxTurns: 0 }));
+
+    assert.equal(done.result.turns, 1);
+    assert.equal(client.calls.length, 1);
+    assert.equal(done.result.final.stopReason, "end_turn");
+});
+
+test("streaming loop floors fractional maxTurns", async () => {
+    const tool = spyTool();
+    const client = new FakeClient([
+        callTurn("c1", "echo", {}),
+        callTurn("c2", "echo", {}),
+        textTurn("unreached"),
+    ]);
+    const { done } = await drain(
+        runLoopStream(client, { messages: [user("go")], tools: [tool], maxTurns: 1.9 }),
+    );
+
+    assert.equal(done.result.turns, 1);
+    assert.equal(client.calls.length, 1);
+    assert.equal(done.result.stoppedAtMaxTurns, true);
+});
+
 test("compacts mid-stream and emits a compacted event", async () => {
     const big = user("x".repeat(5000));
     const client = new FakeClient([textTurn("SUMMARY"), textTurn("answer")]);

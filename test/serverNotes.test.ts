@@ -191,11 +191,13 @@ test("GET /api/notes?q= searches; ?prefix= filters by folder", async () => {
         const q = fakeRes();
         await handle(req("GET", "/api/notes?q=braise"), q.res);
         assert.equal(body(q.captured).notes.length, 1);
+        assert.equal(body(q.captured).total, 1);
         assert.equal(body(q.captured).notes[0].title, "Recipe");
 
         const p = fakeRes();
         await handle(req("GET", "/api/notes?prefix=ops/"), p.res);
         assert.equal(body(p.captured).notes.length, 1);
+        assert.equal(body(p.captured).total, 1);
         assert.equal(body(p.captured).notes[0].title, "Deploy");
     });
 });

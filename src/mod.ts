@@ -54,7 +54,3 @@ export * from "./dreaming.ts";
 
 // The interactive runner, for embedding a REPL in your own entry point.
 export * from "./repl.ts";
-
-// The HTTP surface: the request handler that exposes the stores and a live
-// Session over `/api/*`, for serving the client (or your own UI).
-export * from "./server.ts";

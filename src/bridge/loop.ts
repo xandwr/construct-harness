@@ -136,6 +136,13 @@ function validateArgs(schema: unknown, args: unknown): string | null {
     return null;
 }
 
+/** Normalize the caller's turn cap to the loop invariant: at least one model
+ *  turn, whole-numbered. */
+function normalizeMaxTurns(maxTurns: number | undefined): number {
+    if (maxTurns === undefined || !Number.isFinite(maxTurns)) return 10;
+    return Math.max(1, Math.floor(maxTurns));
+}
+
 /** Execute one tool call, capturing bad args and thrown errors as a
  *  `tool_result` part. A rejected or throwing tool becomes an error result the
  *  model can see and react to: it never crashes the loop. */
@@ -213,7 +220,7 @@ async function runToolTurn(
  * without tool calls or {@link RunLoopParams.maxTurns} is hit.
  */
 export async function runLoop(client: ModelClient, params: RunLoopParams): Promise<RunLoopResult> {
-    const maxTurns = params.maxTurns ?? 10;
+    const maxTurns = normalizeMaxTurns(params.maxTurns);
     const toolIndex = indexTools(params.tools);
     const context = params.context ?? [];
 
@@ -300,7 +307,7 @@ export async function* runLoopStream(
     client: ModelClient,
     params: RunLoopParams,
 ): AsyncGenerator<LoopEvent, void, void> {
-    const maxTurns = params.maxTurns ?? 10;
+    const maxTurns = normalizeMaxTurns(params.maxTurns);
     const toolIndex = indexTools(params.tools);
     const context = params.context ?? [];
 

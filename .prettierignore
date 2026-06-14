@@ -1,2 +1,10 @@
 node_modules
 package-lock.json
+
+# generated/build output
+client/.svelte-kit
+client/build
+client/.output
+client/.vercel
+client/.netlify
+client/.wrangler

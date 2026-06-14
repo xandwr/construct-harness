@@ -176,6 +176,35 @@ test("stops at maxTurns even if the model keeps requesting tools", async () => {
     assert.equal(res.final.stopReason, "tool_use");
 });
 
+test("maxTurns is clamped to at least one model turn", async () => {
+    const client = new FakeClient([textTurn("hello")]);
+
+    const res = await runLoop(client, { messages: [user("hi")], maxTurns: 0 });
+
+    assert.equal(res.turns, 1);
+    assert.equal(client.calls.length, 1);
+    assert.equal(res.final.stopReason, "end_turn");
+});
+
+test("fractional maxTurns is floored", async () => {
+    const tool = spyTool();
+    const client = new FakeClient([
+        callTurn("c1", "echo", {}),
+        callTurn("c2", "echo", {}),
+        textTurn("unreached"),
+    ]);
+
+    const res = await runLoop(client, {
+        messages: [user("go")],
+        tools: [tool],
+        maxTurns: 1.9,
+    });
+
+    assert.equal(res.turns, 1);
+    assert.equal(client.calls.length, 1);
+    assert.equal(res.stoppedAtMaxTurns, true);
+});
+
 test("does not mutate the caller's messages array", async () => {
     const tool = spyTool();
     const messages = [user("go")];
