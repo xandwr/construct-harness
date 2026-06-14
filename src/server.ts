@@ -52,7 +52,14 @@ import type { ModelClient } from "./bridge/types.ts";
 import { MemoryStore, Memory, MemoryError } from "./memory.ts";
 import { EventStore, type Event } from "./events.ts";
 import { backfillEventEmbeddings } from "./eventTools.ts";
-import { GoalStore, Goal, GoalError, isGoalStatus, type GoalStatus } from "./goals.ts";
+import {
+    GoalStore,
+    Goal,
+    GoalError,
+    isGoalStatus,
+    type GoalStatus,
+    type GoalChange,
+} from "./goals.ts";
 import { OpenAIEmbedder, EmbeddingError, type Embedder } from "./embeddings.ts";
 import { Session, type SessionConfig } from "./session.ts";
 import type { LoopEvent } from "./bridge/loop.ts";
@@ -319,7 +326,11 @@ function buildDeps(): ServerDeps {
     const dbPath = process.env.MEMORY_DB ?? "db.sqlite";
     const store = new MemoryStore(dbPath);
     const events = new EventStore(dbPath);
-    const goals = new GoalStore(dbPath);
+    // Log each goal write into the shared event log, so adding or deleting a goal
+    // leaves a trace the way a message or a dream does. One sink on the single
+    // shared store covers both write paths: the agent's goal tools and the
+    // human-editable /api/goals routes.
+    const goals = new GoalStore({ location: dbPath, onChange: goalEventSink(events) });
     const embedder = makeEmbedder();
     const compactAt = Number(process.env.COMPACT_AT) || DEFAULT_COMPACT_AT;
     const serverTools = resolveServerTools(process.env.SERVER_TOOLS);
@@ -603,6 +614,56 @@ function memoryToJson(m: Memory, deps: Pick<ServerDeps, "store" | "events">, now
                       session: sourceEvent?.session ?? null,
                   },
         hasEmbedding: deps.store.hasEmbedding(m.id),
+    };
+}
+
+/** The event `kind` a goal change is logged under, the goal counterpart to
+ *  {@link DREAM_EVENT_KIND}. One kind covers the whole lifecycle (created,
+ *  deleted, status, edited); the `meta.change` discriminates, so a reader can
+ *  filter goal events with `recent({ kind: GOAL_EVENT_KIND })` and tell what
+ *  happened from the payload. */
+export const GOAL_EVENT_KIND = "goal";
+
+/**
+ * Build the {@link GoalEventSink} that records a goal write into the event log,
+ * so adding or deleting a goal leaves the same kind of trace a message or a
+ * dream does. Wired into the single shared {@link GoalStore}, it covers *both*
+ * write paths at once: the agent's `goal_set`/`goal_update` tools and the
+ * human-editable `/api/goals` routes run through that one store.
+ *
+ * The append is best-effort by the store's contract (a throwing sink is
+ * swallowed there), but we also guard here: an event-log hiccup must never
+ * surface as a failed goal write. The goal's `session` rides onto the event so a
+ * session-scoped goal's change shows up in that conversation's transcript, while
+ * a shared (global) goal's change stays unscoped, visible in the cross-session
+ * view the way the goal itself is.
+ */
+export function goalEventSink(
+    events: EventStore,
+): (change: GoalChange, goal: Goal, now: number) => void {
+    // Past tense for the human-readable content line; the structured `change`
+    // lives in meta for programmatic readers.
+    const verb: Record<GoalChange, string> = {
+        created: "added",
+        deleted: "deleted",
+        status: "status changed",
+        edited: "edited",
+    };
+    return (change, goal, now) => {
+        try {
+            events.append({
+                kind: GOAL_EVENT_KIND,
+                role: "agent",
+                content: `Goal ${verb[change]}: ${goal.content}`,
+                meta: { change, goalId: goal.id, status: goal.status },
+                session: goal.session,
+                ts: now,
+            });
+        } catch (err) {
+            console.warn(
+                `goal event not logged: ${err instanceof Error ? err.message : String(err)}`,
+            );
+        }
     };
 }
 

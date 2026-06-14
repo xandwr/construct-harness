@@ -24,6 +24,16 @@ import { DatabaseSync } from "node:sqlite";
 import { migrate, DEFAULT_BUSY_TIMEOUT, type StoreOptions } from "./memory.ts";
 import { clampLimit, MAX_CONTENT_LENGTH } from "./sqlite.ts";
 
+/** {@link GoalStore} options: the shared store options plus a goal-only event
+ *  sink. Kept separate from {@link StoreOptions} (which MemoryStore and
+ *  EventStore also use) so only the goal store carries the `onChange` channel. */
+export interface GoalStoreOptions extends StoreOptions {
+    /** Invoked after each successful write so the change can be logged (added,
+     *  deleted, status, edited). Best-effort: the store catches a throwing sink
+     *  so a logging failure never undoes the goal write. */
+    onChange?: GoalEventSink;
+}
+
 /**
  * Thrown when a goal fails validation before it reaches the database. Callers can
  * `instanceof`-check this to tell "you gave me bad data" from a real storage
@@ -40,6 +50,27 @@ export class GoalError extends Error {
  *  `abandoned` was dropped without achieving it (kept, not deleted, so the record
  *  of intent survives). Matches the CHECK constraint in the schema. */
 export type GoalStatus = "active" | "done" | "abandoned";
+
+/** What happened to a goal, for the {@link GoalEventSink}. `created` and `deleted`
+ *  are the lifecycle endpoints a human or the agent drives directly; `status` and
+ *  `edited` are in-place changes. The sink decides which it cares to record. */
+export type GoalChange = "created" | "deleted" | "status" | "edited";
+
+/**
+ * A callback the store invokes after a successful write, so a change to the
+ * agent's intent can be recorded in the event log the way a message or a tool
+ * call is — "goals also emit events when added/deleted." It is the store's only
+ * outward channel: `goals.ts` stays provider-neutral (it imports no EventStore),
+ * and the wiring side decides what a goal event looks like (see the server's
+ * {@link GoalStore} construction). The store calls it best-effort — a sink that
+ * throws must not fail the goal write that already committed — so the callback,
+ * or the store's call of it, swallows errors.
+ *
+ * `goal` is the post-write row for a create/status/edit, or the row as it last
+ * stood for a delete (so the sink can name what was removed). `now` is the same
+ * timestamp stamped on the write, so the event and the goal agree on when.
+ */
+export type GoalEventSink = (change: GoalChange, goal: Goal, now: number) => void;
 
 const STATUSES: readonly GoalStatus[] = ["active", "done", "abandoned"];
 
@@ -158,11 +189,15 @@ export class GoalStore {
     private readonly updateStatusStmt;
     private readonly updateContentStmt;
     private readonly deleteStmt;
+    /** Optional channel for recording writes as events; see {@link GoalEventSink}. */
+    private readonly onChange?: GoalEventSink;
     private closed = false;
 
-    constructor(options: string | StoreOptions = "db.sqlite") {
-        const opts: StoreOptions = typeof options === "string" ? { location: options } : options;
+    constructor(options: string | GoalStoreOptions = "db.sqlite") {
+        const opts: GoalStoreOptions =
+            typeof options === "string" ? { location: options } : options;
         const location = opts.location ?? "db.sqlite";
+        this.onChange = opts.onChange;
         const busyTimeout = opts.busyTimeout ?? DEFAULT_BUSY_TIMEOUT;
         const wantWal = (opts.wal ?? true) && location !== ":memory:";
 
@@ -201,6 +236,18 @@ export class GoalStore {
         if (this.closed) throw new GoalError("store is closed");
     }
 
+    /** Notify the {@link GoalEventSink} of a committed write, best-effort. A sink
+     *  that throws is swallowed: the goal write already happened, and a failure to
+     *  *log* it must not turn into a failure to *do* it. */
+    private emit(change: GoalChange, goal: Goal, now: number) {
+        if (!this.onChange) return;
+        try {
+            this.onChange(change, goal, now);
+        } catch {
+            // Best-effort logging: never let a sink failure escape a goal write.
+        }
+    }
+
     /** Create a goal (status defaults to 'active'), returning it with its id. */
     create(input: { content: string; session?: string; now?: number }): Goal {
         this.assertOpen();
@@ -208,7 +255,7 @@ export class GoalStore {
         const now = input.now ?? Date.now();
         const session = input.session ?? null;
         const result = this.insertStmt.run(content, "active", session, now, now);
-        return new Goal({
+        const goal = new Goal({
             id: Number(result.lastInsertRowid),
             content,
             status: "active",
@@ -216,6 +263,8 @@ export class GoalStore {
             created: now,
             updated: now,
         });
+        this.emit("created", goal, now);
+        return goal;
     }
 
     /** Fetch one goal by id, or undefined if none exists. */
@@ -272,7 +321,10 @@ export class GoalStore {
             throw new GoalError(`status must be one of ${STATUSES.join(", ")}`);
         }
         const changed = this.updateStatusStmt.run(status, now, id).changes > 0;
-        return changed ? this.get(id) : undefined;
+        if (!changed) return undefined;
+        const goal = this.get(id);
+        if (goal) this.emit("status", goal, now);
+        return goal;
     }
 
     /** Edit a goal's text (e.g. to sharpen it). Returns the updated goal, or
@@ -281,15 +333,24 @@ export class GoalStore {
         this.assertOpen();
         const text = normalizeContent(content);
         const changed = this.updateContentStmt.run(text, now, id).changes > 0;
-        return changed ? this.get(id) : undefined;
+        if (!changed) return undefined;
+        const goal = this.get(id);
+        if (goal) this.emit("edited", goal, now);
+        return goal;
     }
 
     /** Permanently remove a goal. Prefer {@link setStatus} to 'abandoned' when the
      *  record of intent is worth keeping; this is for genuine mistakes. Returns
-     *  whether a row was removed. */
-    delete(id: number): boolean {
+     *  whether a row was removed. The row is read before the delete so the
+     *  {@link GoalEventSink} can name what was removed (the row is gone after). */
+    delete(id: number, now = Date.now()): boolean {
         this.assertOpen();
-        return this.deleteStmt.run(id).changes > 0;
+        // Read first so a sink that records the deletion has the goal it removed;
+        // skip the read entirely when nothing is listening.
+        const goal = this.onChange ? this.get(id) : undefined;
+        const removed = this.deleteStmt.run(id).changes > 0;
+        if (removed && goal) this.emit("deleted", goal, now);
+        return removed;
     }
 
     /** Count goals matching the filters (no limit applied). Honors

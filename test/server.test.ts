@@ -19,7 +19,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createHandler, resolveServerTools, SessionPool } from "../src/server.ts";
+import {
+    createHandler,
+    resolveServerTools,
+    SessionPool,
+    goalEventSink,
+    GOAL_EVENT_KIND,
+} from "../src/server.ts";
 import { BUILTIN_COMMANDS } from "../src/commands.ts";
 import { MemoryStore, Memory } from "../src/memory.ts";
 import { EventStore } from "../src/events.ts";
@@ -110,7 +116,9 @@ function postReq(url: string, body: string): any {
 function makeDeps(client: FakeClient) {
     const store = new MemoryStore(":memory:");
     const events = new EventStore(":memory:");
-    const goals = new GoalStore(":memory:");
+    // Wire the production goal→event sink, so a goal write through these deps logs
+    // an event exactly as the real server does.
+    const goals = new GoalStore({ location: ":memory:", onChange: goalEventSink(events) });
     const sessions = new SessionPool(() => ({ client, system: "be brief", store, events, goals }));
     return {
         store,
@@ -709,6 +717,49 @@ test("DELETE /api/goals/:id removes a goal; a missing id is a 404", async () => 
 
     const again = await call(deps, bodyReq("DELETE", `/api/goals/${g.id}`));
     assert.equal(again.status, 404);
+    deps.close();
+});
+
+test("a goal added then deleted through the routes logs both events", async () => {
+    const deps = makeDeps(new FakeClient([]));
+
+    // Add via the route (no session ⇒ a shared, unscoped goal).
+    const created = await call(
+        deps,
+        bodyReq("POST", "/api/goals", JSON.stringify({ content: "uphold the house style" })),
+    );
+    const id = created.json.goal.id;
+
+    // Delete it via the route.
+    const removed = await call(deps, bodyReq("DELETE", `/api/goals/${id}`));
+    assert.equal(removed.json.deleted, true);
+
+    // Both writes left a goal event in the log, newest first.
+    const logged = deps.events.recent({ kind: GOAL_EVENT_KIND });
+    assert.deepEqual(
+        logged.map((e) => (e.meta as { change?: string })?.change),
+        ["deleted", "created"],
+    );
+    // The events name the goal and carry its id; a shared goal stays unscoped.
+    assert.ok(logged.every((e) => e.session === undefined));
+    assert.deepEqual(
+        logged.map((e) => (e.meta as { goalId?: number })?.goalId),
+        [id, id],
+    );
+    assert.ok(logged.every((e) => e.content.includes("uphold the house style")));
+
+    deps.close();
+});
+
+test("a session-scoped goal's events carry that session", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    await call(
+        deps,
+        bodyReq("POST", "/api/goals", JSON.stringify({ content: "ship it", session: "s_42" })),
+    );
+    const logged = deps.events.recent({ kind: GOAL_EVENT_KIND, session: "s_42" });
+    assert.equal(logged.length, 1);
+    assert.equal((logged[0]!.meta as { change?: string })?.change, "created");
     deps.close();
 });
 

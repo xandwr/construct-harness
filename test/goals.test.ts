@@ -248,6 +248,89 @@ test("count honors status and session filters", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Event sink (onChange)
+// ---------------------------------------------------------------------------
+
+interface SinkCall {
+    change: string;
+    id: number;
+    content: string;
+    status: string;
+    now: number;
+}
+
+/** A store with a recording sink, for asserting on what a write emits. */
+function storeWithSink(): { store: GoalStore; calls: SinkCall[] } {
+    const calls: SinkCall[] = [];
+    const store = new GoalStore({
+        location: ":memory:",
+        onChange: (change, goal, now) =>
+            calls.push({ change, id: goal.id, content: goal.content, status: goal.status, now }),
+    });
+    return { store, calls };
+}
+
+test("create emits a 'created' change carrying the new goal and timestamp", () => {
+    const { store, calls } = storeWithSink();
+    const g = store.create({ content: "ship it", now: 1000 });
+    assert.deepEqual(calls, [
+        { change: "created", id: g.id, content: "ship it", status: "active", now: 1000 },
+    ]);
+    store.close();
+});
+
+test("setStatus and edit emit their changes with the post-write goal", () => {
+    const { store, calls } = storeWithSink();
+    const g = store.create({ content: "draft", now: 1 });
+    store.setStatus(g.id, "done", 2);
+    store.edit(g.id, "final", 3);
+    assert.deepEqual(
+        calls.map((c) => ({ change: c.change, status: c.status, content: c.content, now: c.now })),
+        [
+            { change: "created", status: "active", content: "draft", now: 1 },
+            { change: "status", status: "done", content: "draft", now: 2 },
+            { change: "edited", status: "done", content: "final", now: 3 },
+        ],
+    );
+    store.close();
+});
+
+test("delete emits a 'deleted' change naming the removed goal", () => {
+    const { store, calls } = storeWithSink();
+    const g = store.create({ content: "oops", now: 1 });
+    calls.length = 0; // drop the create event; we only care about the delete
+    assert.equal(store.delete(g.id, 5), true);
+    assert.deepEqual(calls, [
+        { change: "deleted", id: g.id, content: "oops", status: "active", now: 5 },
+    ]);
+    store.close();
+});
+
+test("a write that changes nothing emits nothing", () => {
+    const { store, calls } = storeWithSink();
+    store.setStatus(999, "done"); // no such goal
+    store.edit(999, "nope"); // no such goal
+    store.delete(999); // no such goal
+    assert.deepEqual(calls, []);
+    store.close();
+});
+
+test("a throwing sink never undoes the goal write", () => {
+    const store = new GoalStore({
+        location: ":memory:",
+        onChange: () => {
+            throw new Error("sink blew up");
+        },
+    });
+    // The write must succeed and be queryable even though the sink threw.
+    const g = store.create({ content: "resilient" });
+    assert.equal(store.get(g.id)?.content, "resilient");
+    assert.equal(store.delete(g.id), true);
+    assert.equal(store.get(g.id), undefined);
+    store.close();
+});
+
+// ---------------------------------------------------------------------------
 // Guards
 // ---------------------------------------------------------------------------
 
