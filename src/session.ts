@@ -19,7 +19,7 @@ import type { CompactionConfig, LoopEvent } from "./bridge/loop.ts";
 import type { ModelClient, ProviderOptions } from "./bridge/types.ts";
 import type { ContextProvider } from "./context.ts";
 import { temporalContext } from "./context.ts";
-import { MemoryStore } from "./memory.ts";
+import { MemoryStore, MAX_LIMIT } from "./memory.ts";
 import { memoryTools, recallContext } from "./memoryTools.ts";
 import { eventTools, embedEventIfPossible } from "./eventTools.ts";
 import { goalTools, goalContext } from "./goalTools.ts";
@@ -174,6 +174,29 @@ export class Session {
         this.startedAt = this.resolveStart();
     }
 
+    /**
+     * Construct a Session resuming a past conversation, with its prior turns
+     * already loaded into the model's working context. The one-call form of
+     * "construct with the old id, then {@link rehydrate}".
+     *
+     * Requires `config.events` (there's nothing to resume from without a log) and
+     * a `config.sessionId` naming the conversation to pick up. The returned Session
+     * appends to and recalls that same transcript, reports its real start time, and
+     * starts with {@link history} populated from the log, so the first {@link send}
+     * builds on the prior exchange exactly as an uninterrupted turn would.
+     *
+     * `maxMessages` bounds how much of a long transcript to reload (most recent
+     * kept); see {@link rehydrate}.
+     */
+    static async resume(
+        config: SessionConfig & { events: EventStore; sessionId: string },
+        maxMessages?: number,
+    ): Promise<Session> {
+        const session = new Session(config);
+        await session.rehydrate(maxMessages);
+        return session;
+    }
+
     /** When this conversation began: the earliest event already in the log under
      *  this Session's id (a resume), else now (a fresh Session). Best-effort —
      *  a log read failure falls back to now rather than breaking construction. */
@@ -228,6 +251,75 @@ export class Session {
         // `recent` is newest-first; reverse to natural reading order so the
         // transcript reads top-to-bottom like the conversation it records.
         return this.events.recent({ session: this.sessionId, limit }).reverse();
+    }
+
+    /**
+     * Rehydrate the in-memory conversation from this Session's logged transcript,
+     * so resuming a past conversation starts with that conversation already in the
+     * model's working context, not just searchable via `transcript_recall`.
+     *
+     * Construction alone resumes the *log* (a pinned {@link sessionId} keeps
+     * appending to and recalling the same transcript, and {@link startedAt} already
+     * reflects the real start). But the constructor is synchronous and leaves
+     * {@link history} empty: the model could look its past up, but it didn't *start*
+     * with it in front of it. This is the explicit, async step that loads it. The
+     * usual resume flow is: construct with the old `sessionId` + the same
+     * {@link EventStore}, then `await session.rehydrate()` before the first
+     * {@link send}. {@link Session.resume} wraps both.
+     *
+     * Faithful reconstruction: each logged event maps back to the same message
+     * shape {@link send} commits, so a resumed turn sees exactly what an
+     * uninterrupted one would —
+     *  - a user/agent `message` → a User/Agent text turn,
+     *  - a `tool_call` → an Agent turn carrying the {@link ToolCallPart}
+     *    (id/name/args recovered from `correlation` + `meta`),
+     *  - a `tool_result` → a Tool turn carrying the {@link ToolResultPart}
+     *    (the structured payload from `meta.result`, not the FTS text in
+     *    `content`).
+     * Events the conversation doesn't replay (recall/dream/system signals, or a
+     * tool event missing the correlation that threads a call to its result) are
+     * skipped rather than guessed at: a malformed transcript degrades to a shorter
+     * clean history, never a corrupt one.
+     *
+     * Replaces the current in-memory conversation (like {@link reset} then load).
+     * Returns the number of messages rebuilt. No-op returning 0 without a log.
+     *
+     * `maxMessages` bounds how much of a very long transcript to pull back into
+     * context (oldest dropped first, so the most recent exchange is always kept);
+     * omit to load the whole transcript. The log keeps everything regardless, and
+     * `transcript_recall` still reaches what wasn't loaded.
+     */
+    async rehydrate(maxMessages?: number): Promise<number> {
+        if (!this.events) return 0;
+        const events = this.readFullTranscript();
+        const rebuilt = messagesFromEvents(events);
+        this.conversation =
+            maxMessages !== undefined && rebuilt.length > maxMessages
+                ? rebuilt.slice(rebuilt.length - maxMessages)
+                : rebuilt;
+        return this.conversation.length;
+    }
+
+    /** Read this Session's whole transcript oldest-first, paging through the log
+     *  so a conversation longer than one page is fully recovered. Best-effort: a
+     *  read failure returns what was gathered so far rather than throwing, matching
+     *  the log's "observer, never a gate" posture. */
+    private readFullTranscript(): Event[] {
+        const out: Event[] = [];
+        const page = MAX_LIMIT;
+        for (let offset = 0; ; offset += page) {
+            let batch: Event[];
+            try {
+                // `recent` is newest-first; gather pages then reverse the whole
+                // thing once at the end into reading order.
+                batch = this.events!.recent({ session: this.sessionId, limit: page, offset });
+            } catch {
+                break;
+            }
+            out.push(...batch);
+            if (batch.length < page) break;
+        }
+        return out.reverse();
     }
 
     /**
@@ -473,6 +565,72 @@ function freshSessionId(): string {
     const stamp = Date.now().toString(36);
     const rand = Math.random().toString(36).slice(2, 10);
     return `s_${stamp}_${rand}`;
+}
+
+/**
+ * Rebuild the durable conversation ({@link Message}[], oldest first) from a
+ * Session's logged events, the inverse of the append `send` does as it runs. Used
+ * by {@link Session.rehydrate} to resume a past conversation into the model's
+ * working context.
+ *
+ * Each event maps back to the message shape it came from; an event the
+ * conversation doesn't carry (a `recall`/`dream`/system signal, or a tool event
+ * with no `correlation` to thread a call to its result) is skipped, so a partial
+ * or hand-edited log degrades to a shorter clean history rather than a corrupt
+ * one. The `meta` payloads `send` wrote (`{ name, args }` on a call, `{ result,
+ * isError }` on a result) are the authoritative source for the structured parts;
+ * the events' text `content` is only the FTS projection and isn't trusted here.
+ *
+ * Exported so a caller reconstructing a conversation outside a Session (a viewer,
+ * a migration) can reuse the exact same mapping.
+ */
+export function messagesFromEvents(events: readonly Event[]): Message[] {
+    const messages: Message[] = [];
+    for (const e of events) {
+        if (e.kind === "message") {
+            // user → User, anything else (agent) → Agent. A message with empty
+            // text can't have been a real turn; skip it.
+            const text = e.content;
+            if (!text) continue;
+            const role = e.role === "user" ? RoleType.User : RoleType.Agent;
+            messages.push({
+                sender: { role },
+                timestamp: e.ts,
+                content: [{ kind: "text", text }],
+            });
+        } else if (e.kind === "tool_call") {
+            // The call id (correlation) is what threads this to its result; without
+            // it the pair can't be reconstructed, so drop it.
+            if (!e.correlation) continue;
+            const meta = (e.meta ?? {}) as { name?: unknown; args?: unknown };
+            const name = typeof meta.name === "string" ? meta.name : e.content;
+            messages.push({
+                sender: { role: RoleType.Agent },
+                timestamp: e.ts,
+                content: [{ kind: "tool_call", id: e.correlation, name, args: meta.args }],
+            });
+        } else if (e.kind === "tool_result") {
+            if (!e.correlation) continue;
+            const meta = (e.meta ?? {}) as { result?: unknown; isError?: unknown };
+            messages.push({
+                sender: { role: RoleType.Tool },
+                timestamp: e.ts,
+                content: [
+                    {
+                        kind: "tool_result",
+                        callId: e.correlation,
+                        // The structured payload `send` stashed in meta is the real
+                        // result; fall back to the text content only if it's absent.
+                        result: "result" in meta ? meta.result : e.content,
+                        isError: meta.isError === true ? true : undefined,
+                    },
+                ],
+            });
+        }
+        // Any other kind (recall, dream, system bookkeeping) isn't part of the
+        // replayable conversation; leave it to transcript_recall.
+    }
+    return messages;
 }
 
 /** Render a tool result into the log's text `content` column. A string passes

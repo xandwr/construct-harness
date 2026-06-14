@@ -18,6 +18,7 @@ import { Session } from "../src/session.ts";
 import type { LoopEvent } from "../src/bridge/loop.ts";
 import type { TurnResult } from "../src/session.ts";
 import { RoleType } from "../src/types.ts";
+import type { ToolDef } from "../src/types.ts";
 import { MemoryStore } from "../src/memory.ts";
 import { EventStore } from "../src/events.ts";
 import { GoalStore } from "../src/goals.ts";
@@ -288,6 +289,148 @@ test("transcript() reads this session's turns back in reading order", async () =
     } finally {
         events.close();
     }
+});
+
+// ── Resume (rehydrating a past conversation into working context) ───────────
+
+test("rehydrate reloads a past conversation into history from the log", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        // First Session: hold a two-turn conversation, then drop out.
+        const client = new FakeClient([textTurn("a1"), textTurn("a2")]);
+        const first = new Session({ client, system: "S", events });
+        await send(first, "u1");
+        await send(first, "u2");
+        const id = first.id;
+
+        // A fresh Session resuming the same id starts with an EMPTY history
+        // (construction resumes the log, not the working context)...
+        const client2 = new FakeClient([textTurn("a3")]);
+        const resumed = new Session({ client: client2, system: "S", events, sessionId: id });
+        assert.equal(resumed.history().length, 0);
+
+        // ...until we rehydrate, which rebuilds the prior turns.
+        const n = await resumed.rehydrate();
+        assert.equal(n, 4);
+        const texts = resumed
+            .history()
+            .map((m) => (m.content[0]!.kind === "text" ? m.content[0].text : ""));
+        assert.deepEqual(texts, ["u1", "a1", "u2", "a2"]);
+    } finally {
+        events.close();
+    }
+});
+
+test("a resumed Session feeds the prior conversation to the model on the next send", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        const client = new FakeClient([textTurn("the answer is 42")]);
+        const first = new Session({ client, system: "S", events });
+        await send(first, "what is the answer");
+        const id = first.id;
+
+        // Resume and send again: the model's messages this turn must include the
+        // prior exchange, not just be searchable via transcript_recall.
+        const client2 = new FakeClient([textTurn("still 42")]);
+        const resumed = await Session.resume({
+            client: client2,
+            system: "S",
+            events,
+            sessionId: id,
+        });
+        await send(resumed, "are you sure");
+
+        const sent = client2.calls[0]!.messages.flatMap((m) => m.content)
+            .map((p) => (p.kind === "text" ? p.text : ""))
+            .join("\n");
+        assert.match(sent, /what is the answer/);
+        assert.match(sent, /the answer is 42/);
+        assert.match(sent, /are you sure/); // and this turn's new message
+    } finally {
+        events.close();
+    }
+});
+
+test("rehydrate reconstructs tool turns with correlated call and result", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        const noop: ToolDef = {
+            name: "noop",
+            description: "no-op",
+            parameters: { type: "object", properties: {} },
+            async run() {
+                return { ok: true };
+            },
+        };
+        const client = new FakeClient([callTurn("c1", "noop", { x: 1 }), textTurn("did it")]);
+        const first = new Session({ client, system: "S", events, tools: [noop] });
+        await send(first, "do the thing");
+        const id = first.id;
+
+        const client2 = new FakeClient([textTurn("again")]);
+        const resumed = new Session({
+            client: client2,
+            system: "S",
+            events,
+            sessionId: id,
+            tools: [noop],
+        });
+        await resumed.rehydrate();
+
+        // The rebuilt history carries the tool_call and its tool_result, threaded
+        // by the same id, with the structured args/result recovered from meta.
+        const parts = resumed.history().flatMap((m) => m.content);
+        const call = parts.find((p) => p.kind === "tool_call");
+        const result = parts.find((p) => p.kind === "tool_result");
+        assert.ok(call && call.kind === "tool_call");
+        assert.equal(call.name, "noop");
+        assert.deepEqual(call.args, { x: 1 });
+        assert.ok(result && result.kind === "tool_result");
+        assert.equal(result.callId, call.id); // call ↔ result threaded
+        assert.deepEqual(result.result, { ok: true }); // structured payload, not FTS text
+
+        // And the rebuilt pair is well-formed enough to send through the loop: a
+        // resumed turn carrying a prior tool exchange completes cleanly (a dangling
+        // or mis-threaded call would break the provider's call/result pairing).
+        const { result: turn } = await send(resumed, "again");
+        assert.equal(turn.text, "again");
+    } finally {
+        events.close();
+    }
+});
+
+test("rehydrate's maxMessages keeps the most recent turns", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        const client = new FakeClient([textTurn("a1"), textTurn("a2"), textTurn("a3")]);
+        const first = new Session({ client, system: "S", events });
+        await send(first, "u1");
+        await send(first, "u2");
+        await send(first, "u3");
+        const id = first.id;
+
+        const resumed = new Session({
+            client: new FakeClient([]),
+            system: "S",
+            events,
+            sessionId: id,
+        });
+        const n = await resumed.rehydrate(2);
+        assert.equal(n, 2);
+        // Oldest dropped first: the last two messages (u3, a3) are what's kept.
+        const texts = resumed
+            .history()
+            .map((m) => (m.content[0]!.kind === "text" ? m.content[0].text : ""));
+        assert.deepEqual(texts, ["u3", "a3"]);
+    } finally {
+        events.close();
+    }
+});
+
+test("rehydrate is a no-op without an event log", async () => {
+    const session = new Session({ client: new FakeClient([]), system: "S" });
+    assert.equal(await session.rehydrate(), 0);
+    assert.equal(session.history().length, 0);
 });
 
 // ── Goal wiring ────────────────────────────────────────────────────────────
