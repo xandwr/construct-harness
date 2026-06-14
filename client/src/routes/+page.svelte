@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { tick } from 'svelte';
 	import AppHeader from '$lib/AppHeader.svelte';
+	import Icon from '$lib/Icon.svelte';
 	import { APPS } from '$lib/apps';
 	import { page } from '$app/state';
 	import { sendChat, getEvents, ApiError, type ChatEvent, type WireEvent } from '$lib/api';
@@ -54,6 +55,47 @@
 	// The event id the URL hash (#event-<id>) points at: the message the event log
 	// linked to. We scroll it into view and flash it once after the replay renders.
 	let highlighted = $state<number | null>(null);
+
+	// The scrollable transcript element, bound below. We read its scroll position to
+	// decide whether to show the jump-to-latest chevron and to stick to the bottom
+	// while a reply streams.
+	let transcript = $state<HTMLDivElement | null>(null);
+	// True when the transcript is scrolled (near) the bottom. We hide the chevron
+	// there and only auto-stick to new content when the human was already following
+	// along at the end — scrolling up to read history shouldn't be yanked back.
+	let atBottom = $state(true);
+
+	// How close to the bottom (px) still counts as "at the bottom". A small slack
+	// keeps the chevron from flickering on sub-pixel rounding and lets a reply's
+	// final lines settle without re-revealing the button.
+	const BOTTOM_SLACK = 24;
+
+	function isNearBottom(el: HTMLElement): boolean {
+		return el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK;
+	}
+
+	function onTranscriptScroll() {
+		if (transcript) atBottom = isNearBottom(transcript);
+	}
+
+	function scrollToLatest() {
+		transcript?.scrollTo({ top: transcript.scrollHeight, behavior: 'smooth' });
+	}
+
+	// Keep the view pinned to the newest content as messages grow, but only when the
+	// human is already at the bottom — reading back through history stays put. Reads
+	// `messages` so it reruns on every streamed chunk and on replay loads; the tick
+	// waits for the new content to lay out before measuring the scroll height.
+	$effect(() => {
+		// Touch both the count and the last line's streamed text so this reruns as
+		// new messages arrive and as the live reply grows chunk by chunk.
+		messages.length;
+		messages.at(-1)?.text;
+		if (!atBottom) return;
+		tick().then(() => {
+			if (transcript) transcript.scrollTop = transcript.scrollHeight;
+		});
+	});
 
 	// Reload the transcript whenever the ?session param changes: replay that
 	// session's events when resuming one, else start a fresh conversation empty.
@@ -247,9 +289,13 @@
 	{/if}
 </AppHeader>
 
-<div class="flex min-h-0 flex-1 flex-col">
+<div class="relative flex min-h-0 flex-1 flex-col">
 	<!-- Transcript -->
-	<div class="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+	<div
+		bind:this={transcript}
+		onscroll={onTranscriptScroll}
+		class="min-h-0 flex-1 overflow-y-auto px-4 py-4"
+	>
 		{#if messages.length === 0 && !error}
 			<div class="text-faint text-xs lowercase">
 				{loadingReplay
@@ -326,6 +372,23 @@
 			<div class="text-faint text-[10px]">{footer}</div>
 		{/if}
 	</div>
+
+	<!-- Jump to latest: floats over the transcript's bottom edge while the human has
+	     scrolled up off the newest message. Clicking smooth-scrolls to the end, which
+	     also re-arms the auto-stick effect. Hidden when already at the bottom or with
+	     nothing to scroll to. -->
+	{#if !atBottom && messages.length > 0}
+		<button
+			type="button"
+			onclick={scrollToLatest}
+			title="scroll to latest"
+			aria-label="scroll to latest"
+			class="absolute bottom-20 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1 border border-border bg-surface px-2 py-1 text-[10px] lowercase text-muted hover:text-text"
+		>
+			<Icon name="chevron-down" class="size-3.5" />
+			latest
+		</button>
+	{/if}
 
 	<!-- Composer: always enabled (resuming a past conversation is just sending into
 	     it); only blocked mid-turn or while a replay is still loading. -->
