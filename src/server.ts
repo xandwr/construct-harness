@@ -46,9 +46,17 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { AnthropicClient, type ServerToolName } from "./bridge/anthropic.ts";
+import { AnthropicClient, type AnthropicOptions, type ServerToolName } from "./bridge/anthropic.ts";
 import { HarnessError, type ErrorKind } from "./bridge/errors.ts";
-import type { ModelClient } from "./bridge/types.ts";
+import type { ModelClient, ProviderOptions } from "./bridge/types.ts";
+import { PROVIDERS, providerForModel } from "./bridge/models.ts";
+import {
+    RuntimeConfig,
+    SERVER_TOOL_CATALOG,
+    EFFORT_LEVELS,
+    type LocalToolGroup,
+} from "./runtimeConfig.ts";
+import type { ToolDef } from "./types.ts";
 import { MemoryStore, Memory, MemoryError } from "./memory.ts";
 import { EventStore, type Event } from "./events.ts";
 import { backfillEventEmbeddings } from "./eventTools.ts";
@@ -115,6 +123,11 @@ interface ServerDeps {
     sessions: SessionPool;
     notes?: NotesService;
     notesStore?: NotesStore;
+    /** The live runtime knobs the settings page reads and writes: the model in
+     *  use, which server/local tools are on, the effort level. Optional so a test
+     *  can omit it (the settings routes then 503); the default wiring provides
+     *  one. Reads off it report the *current* runtime, not the boot snapshot. */
+    runtime?: RuntimeConfig;
     corsOrigin?: string;
     /** A snapshot of the *static* runtime configuration this process booted with,
      *  for the read-only status endpoint (see {@link handleStatus}). The dynamic
@@ -127,21 +140,19 @@ interface ServerDeps {
 }
 
 /**
- * The static slice of runtime configuration the status endpoint reports: what
- * this process booted with that doesn't change while it runs. Captured once in
- * {@link buildDeps} and handed to the deps, so the handler stays a pure read and
- * a test can supply its own snapshot. Deliberately carries no secrets — the
- * embedder is reported as a yes/no, never the key behind it.
+ * The genuinely static slice of runtime configuration the status endpoint
+ * reports: what this process booted with that doesn't change while it runs —
+ * where data lives, the compaction threshold, whether embedding is configured,
+ * the standing features, the shell policy. Captured once in {@link buildDeps},
+ * so the handler stays a pure read and a test can supply its own snapshot.
+ *
+ * The *mutable* knobs the settings page turns — the model, the server tools, the
+ * local tools, the effort level — deliberately live on {@link RuntimeConfig}, not
+ * here, so the status route reads them live and a switch shows up immediately.
+ * Deliberately carries no secrets — the embedder is reported as a yes/no, never
+ * the key behind it.
  */
 export interface StatusConfig {
-    /** The model id chat and dreaming run on (e.g. the configured MODEL). */
-    model: string;
-    /** Which provider-hosted tools are enabled (web_search, web_fetch, …). */
-    serverTools: ServerToolName[];
-    /** The names of the local (harness-owned) tools wired into every Session,
-     *  e.g. the note tools and the local shell. The agent-facing toolset minus
-     *  the memory/goal/transcript/dream tools the Session adds itself. */
-    localTools: string[];
     /** The sqlite file every store shares (MEMORY_DB). */
     memoryDb: string;
     /** The knowledge-base markdown folder (KB_DIR), or null when no KB is wired. */
@@ -256,6 +267,15 @@ export class SessionPool {
 /** Where the knowledge-base markdown folder lives, mirroring MEMORY_DB. */
 const DEFAULT_KB_DIR = "kb";
 
+/** A local (harness-owned) tool group plus the factory that builds its ToolDefs.
+ *  {@link buildDeps} defines one per toggleable group; the session config rebuilds
+ *  the enabled subset per Session, and the runtime config is told the resolved
+ *  tool names (the build's output) for the settings list. The build is a thunk so
+ *  toggling never rewires a live Session — only the next Session's tool list. */
+interface LocalToolGroupWiring extends Omit<LocalToolGroup, "toolNames"> {
+    build: () => ToolDef[];
+}
+
 /** The provider-hosted tools enabled by default: live web access so the Construct
  *  can answer about the current world. Code execution is opt-in (it spins up a
  *  sandbox and bills accordingly), so it's left out of the default set. */
@@ -349,14 +369,59 @@ function buildDeps(): ServerDeps {
     // when an operator opts in via SHELL_POLICY / SHELL_ALLOWED_ROOTS / the caps.
     const shellPolicy = resolveShellPolicy(process.env);
 
-    // The local (harness-owned) tools every Session runs with: the KB note tools
-    // and the local shell (under the resolved policy). Built once so both the
-    // session config and the status snapshot name the same set — the status page
-    // reports exactly what's wired.
-    const localTools = [
-        ...noteTools(notes, notesStore, embedder),
-        ...shellTools({ policy: shellPolicy }),
+    // The local (harness-owned) tools, grouped so the runtime config can toggle
+    // each group on or off for newly built Sessions. Each group carries a factory
+    // that builds its ToolDefs on demand, so the session config closure rebuilds
+    // exactly the enabled subset per Session — the same wiring the settings page
+    // turns into a list of switches. The KB note tools are one group; the local
+    // shell (under the resolved policy) is another.
+    const localGroups: LocalToolGroupWiring[] = [
+        {
+            key: "notes",
+            label: "knowledge base",
+            note: "save / recall / link markdown notes",
+            build: () => noteTools(notes, notesStore, embedder),
+        },
+        {
+            key: "shell",
+            label: "local shell",
+            note: "run commands on the user's real machine",
+            build: () => shellTools({ policy: shellPolicy }),
+        },
     ];
+    // Both groups are on at boot — the historical wiring. The runtime config can
+    // disable one; that takes effect for conversations started after the toggle.
+    const enabledLocalKeys = localGroups.map((g) => g.key);
+
+    // The single ProviderOptions object every Session in the pool shares. The
+    // runtime config mutates THIS object in place (server tools, effort), so a
+    // change reaches live conversations: a Session reads `cfg.providerOptions`
+    // each turn off this same reference. Cache the system prefix; turn on adaptive
+    // thinking with a summarized display so the streaming path emits readable
+    // `thinking` deltas the client can show (see streamChat); start with the
+    // resolved server tools (provider-hosted web access the model runs in-turn).
+    const sharedProviderOptions: ProviderOptions & AnthropicOptions = {
+        cacheSystem: true,
+        thinking: true,
+        thinkingDisplay: true,
+        serverTools,
+    };
+
+    // The live knobs the settings page turns. It owns model switching (through
+    // the client's setter), the shared provider options above, and which local
+    // tool groups new Sessions wire in. Built before the session config so the
+    // closure can read its enablement set per Session.
+    const runtime = new RuntimeConfig(
+        client,
+        sharedProviderOptions,
+        localGroups.map(({ key, label, note, build }) => ({
+            key,
+            label,
+            note,
+            toolNames: build().map((t) => t.name),
+        })),
+        enabledLocalKeys,
+    );
 
     // One wiring shared by every live conversation. Every Session in the pool —
     // the boot one and every resumed past conversation — runs under this exact
@@ -371,23 +436,16 @@ function buildDeps(): ServerDeps {
         events,
         goals,
         embedder,
-        // The agent opts into the KB: it gets the note tools (save/update/recall/
-        // link) but notes are not auto-injected into context the way memories are.
-        // It also gets use__user__shell, the unguarded local counterpart to the
-        // sandboxed code_execution server tool wired in via serverTools below.
-        tools: localTools,
+        // The agent opts into the KB and the local shell, each gated by the
+        // runtime config: a group the settings page disabled isn't wired into a
+        // Session built after the toggle. The note tools (save/update/recall/link)
+        // are not auto-injected into context the way memories are; the shell
+        // (use__user__shell) is the unguarded local counterpart to the sandboxed
+        // code_execution server tool enabled via providerOptions.serverTools.
+        tools: localGroups.filter((g) => runtime.isLocalEnabled(g.key)).flatMap((g) => g.build()),
         compaction: { thresholdTokens: compactAt },
-        // Cache the system prefix; turn on adaptive thinking with a summarized
-        // display so the streaming path emits readable `thinking` deltas the
-        // client can show (see streamChat); and give the Construct provider-hosted
-        // web access (search + fetch) so it can answer about the live world. The
-        // model runs these server-side, so there's no tool loop to drive them.
-        providerOptions: {
-            cacheSystem: true,
-            thinking: true,
-            thinkingDisplay: true,
-            serverTools,
-        },
+        // The shared, mutable provider options (see above): live edits land here.
+        providerOptions: sharedProviderOptions,
     });
     const sessions = new SessionPool(sessionConfig);
 
@@ -426,14 +484,15 @@ function buildDeps(): ServerDeps {
         sessions,
         notes,
         notesStore,
+        runtime,
         corsOrigin: process.env.CORS_ORIGIN,
-        // The static config snapshot for /api/status. Mirrors the wiring above so
-        // the page reports the truth: the model chat runs on, the tools that are
-        // on, where the data lives, and which standing features a turn uses.
+        // The static config snapshot for /api/status: the fields that genuinely
+        // don't change while the process runs — where the data lives, the
+        // compaction threshold, whether embedding is configured, the standing
+        // features, the shell policy. The *mutable* fields (model, server tools,
+        // local tools, effort) are NOT frozen here; the status route reads them
+        // live off `runtime` so the page reflects a switch the moment it lands.
         status: {
-            model: client.model,
-            serverTools,
-            localTools: localTools.map((t) => t.name),
             memoryDb: dbPath,
             kbDir,
             compactAt,
@@ -495,7 +554,7 @@ function statusForKind(kind: ErrorKind): number {
  *  protect with a strict origin allow-list. */
 function cors(res: ServerResponse, origin = "*"): void {
     res.setHeader("Access-Control-Allow-Origin", origin || "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
     if (origin && origin !== "*") res.setHeader("Vary", "Origin");
 }
@@ -1290,39 +1349,90 @@ function sendGoalError(res: ServerResponse, err: unknown): void {
 // ── Status route ─────────────────────────────────────────────────────────────
 
 /**
- * Assemble the runtime status: the truth about what this process is, replacing
- * the settings page's hardcoded rows. Two halves:
+ * Assemble the runtime status: the truth about what this process is *right now*,
+ * and the catalogue the settings page's controls render from. Three layers:
  *
- *  - **static** ({@link ServerDeps.status}, captured at boot): the model and its
- *    capabilities, which provider-hosted and local tools are on, where the data
- *    lives, the compaction threshold, whether embedding is configured, and the
- *    standing feature flags. Reported verbatim, minus any secret — the embedder
- *    is a yes/no, never a key.
- *  - **dynamic** (read off the live deps now): the schema version the store is
- *    migrated to, and the ids of the conversations currently live in the pool.
+ *  - **live knobs** (read off {@link RuntimeConfig} now): the model in use, which
+ *    server and local tools are enabled, the effort level. These reflect the
+ *    current runtime, so a model switch or tool toggle shows up the moment it
+ *    lands — they are NOT the boot snapshot. With no runtime (a bare test), they
+ *    fall back to the client's model and empty/default tool sets.
+ *  - **catalogue** (static, from the model + tool catalogues): the providers and
+ *    their model variants for the two dropdowns, the server-tool and local-tool
+ *    lists for the toggles, and the effort levels — so the page never hardcodes
+ *    a model id or tool name. Each tool/model entry carries an `enabled`/current
+ *    flag so the controls render in the right state.
+ *  - **static + dynamic context** (the boot snapshot and live deps): where data
+ *    lives, the compaction threshold, the standing features, the shell policy
+ *    (static); the schema version and live session ids (dynamic).
  *
  * Read-only, side-effect free: it never touches a Session or mutates a store, so
- * polling it is free. When a test supplies no static snapshot, the static fields
- * are reported as null/empty and only the dynamic half is real — the route still
- * answers rather than 500-ing.
+ * the page can poll it freely. Secret-free — the embedder is a yes/no, never a key.
  */
 function handleStatus(res: ServerResponse, deps: ServerDeps): void {
     const s = deps.status;
+    const rt = deps.runtime;
     // The schema version is the same across every store (one file, one
     // user_version); read it off the memory store, which always exists.
     const schemaVersion = deps.store.version;
     const liveSessions = deps.sessions.ids();
 
+    // The model in use right now, and the provider that serves it, read live off
+    // the runtime (or the client when no runtime is wired). The provider value
+    // drives which model dropdown is shown.
+    const currentModel = rt?.model ?? deps.client.model;
+    const currentProvider = providerForModel(currentModel)?.id ?? null;
+
+    // The enabled server tools and the effort level, live off the runtime.
+    const enabledServerTools = rt?.serverTools ?? [];
+    const effort = rt?.effort ?? null;
+
     sendJson(res, 200, {
         provider: {
-            // The capabilities object is small and secret-free; ship it whole so the
-            // page can show thinking/serverTools/streaming support as the provider
-            // actually reports them, not a hardcoded guess.
-            model: s?.model ?? deps.client.model,
+            // Which provider and model the next turn uses, plus the capabilities
+            // the provider reports (small, secret-free) so the page can show
+            // thinking/serverTools/streaming support rather than a hardcoded guess.
+            id: currentProvider,
+            model: currentModel,
             capabilities: deps.client.capabilities,
         },
-        serverTools: s?.serverTools ?? [],
-        localTools: s?.localTools ?? [],
+        // The catalogue the two dropdowns render from: every provider and its
+        // model variants, each marked `current` when it's the one in use. Static
+        // provider knowledge, so the page picks up a new provider/model without a
+        // frontend change.
+        providers: PROVIDERS.map((p) => ({
+            id: p.id,
+            label: p.label,
+            models: p.models.map((m) => ({
+                id: m.id,
+                label: m.label,
+                contextWindow: m.contextWindow,
+                maxOutput: m.maxOutput,
+                current: m.id === currentModel,
+            })),
+        })),
+        // The server-tool toggles: the full catalogue, each flagged with whether
+        // it's currently enabled. A toggle here lands on every live conversation's
+        // next turn (the options object is shared and mutated in place).
+        serverTools: SERVER_TOOL_CATALOG.map((t) => ({
+            id: t.id,
+            label: t.label,
+            note: t.note,
+            enabled: enabledServerTools.includes(t.id),
+        })),
+        // The local-tool toggles: the harness-owned groups, each with the tool
+        // names it covers and whether it's on. Toggling applies to conversations
+        // started after the change (a live Session captured its tools at start).
+        localTools: (rt?.localGroups ?? []).map((g) => ({
+            key: g.key,
+            label: g.label,
+            note: g.note,
+            toolNames: g.toolNames,
+            enabled: rt!.isLocalEnabled(g.key),
+        })),
+        // The effort levels for that dropdown, plus the level in use (null = the
+        // provider default, "high").
+        effort: { current: effort, levels: EFFORT_LEVELS },
         storage: {
             memoryDb: s?.memoryDb ?? null,
             kbDir: s?.kbDir ?? null,
@@ -1345,6 +1455,108 @@ function handleStatus(res: ServerResponse, deps: ServerDeps): void {
         shellPolicy: s?.shellPolicy ?? { mode: "unrestricted", allowedCwdRoots: [] },
         liveSessions,
     });
+}
+
+// ── Settings write route ─────────────────────────────────────────────────────
+
+/**
+ * The settings page's write surface: turn the live runtime knobs.
+ *
+ *  - PATCH /api/settings  { model?, serverTools?, effort?, localTools? }
+ *
+ * A single PATCH applies any subset of the knobs, each validated by
+ * {@link RuntimeConfig}: an unknown model id, server-tool name, effort level, or
+ * local-tool key is a 400 (the bad field is named) and nothing changes. Applied
+ * fields take effect immediately — the model and server tools/effort on every
+ * conversation's next turn (the client and options object are process-wide and
+ * read per turn), local-tool toggles on conversations started after the change.
+ *
+ * `model` carries just the model id; the provider is derived from it (the
+ * provider dropdown's value follows the model). `effort: null` clears the level
+ * back to the provider default. `localTools` is a map of group-key → enabled.
+ *
+ * After applying, it returns the same payload {@link handleStatus} serves, so the
+ * client refreshes its whole view from one response.
+ */
+async function handleSettings(
+    req: IncomingMessage,
+    res: ServerResponse,
+    deps: ServerDeps,
+): Promise<void> {
+    const rt = deps.runtime;
+    if (!rt) {
+        sendJson(res, 503, { error: "runtime configuration is not available" });
+        return;
+    }
+    if (req.method !== "PATCH") {
+        sendJson(res, 405, { error: `method ${req.method} not allowed on /api/settings` });
+        return;
+    }
+    const body = await readJsonObject(req);
+    if (!body) {
+        sendJson(res, 400, { error: "invalid JSON body" });
+        return;
+    }
+
+    try {
+        // Each field is optional and applied only when present. Validation lives
+        // in RuntimeConfig, which throws a classified HarnessError on bad input;
+        // the catch below turns that into a 400 naming the offending field.
+        if (body.model !== undefined) {
+            if (typeof body.model !== "string") {
+                sendJson(res, 400, { error: "model must be a string" });
+                return;
+            }
+            rt.setModel(body.model);
+        }
+        if (body.serverTools !== undefined) {
+            if (
+                !Array.isArray(body.serverTools) ||
+                body.serverTools.some((t) => typeof t !== "string")
+            ) {
+                sendJson(res, 400, { error: "serverTools must be an array of strings" });
+                return;
+            }
+            rt.setServerTools(body.serverTools as string[]);
+        }
+        if (body.effort !== undefined) {
+            if (body.effort !== null && typeof body.effort !== "string") {
+                sendJson(res, 400, { error: "effort must be a string or null" });
+                return;
+            }
+            rt.setEffort(body.effort as string | null);
+        }
+        if (body.localTools !== undefined) {
+            if (
+                body.localTools === null ||
+                typeof body.localTools !== "object" ||
+                Array.isArray(body.localTools)
+            ) {
+                sendJson(res, 400, { error: "localTools must be an object of key → boolean" });
+                return;
+            }
+            for (const [key, enabled] of Object.entries(
+                body.localTools as Record<string, unknown>,
+            )) {
+                if (typeof enabled !== "boolean") {
+                    sendJson(res, 400, { error: `localTools.${key} must be a boolean` });
+                    return;
+                }
+                rt.setLocalEnabled(key, enabled);
+            }
+        }
+    } catch (err) {
+        if (err instanceof HarnessError) {
+            sendJson(res, statusForKind(err.kind), { error: err.message });
+            return;
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        sendJson(res, 500, { error: message });
+        return;
+    }
+
+    // Echo the full status back so the client re-renders from one response.
+    handleStatus(res, deps);
 }
 
 // ── Context inspector route ──────────────────────────────────────────────────
@@ -1543,6 +1755,16 @@ export function createHandler(deps: ServerDeps) {
             // rows. No secrets leave (the embedder is a yes/no).
             if (req.method === "GET" && path === "/api/status") {
                 handleStatus(res, deps);
+                return;
+            }
+
+            // The settings write surface: PATCH the live runtime knobs (model,
+            // server tools, effort, local tools). Each applied field takes effect
+            // immediately — model/server-tools/effort on every conversation's next
+            // turn, local-tool toggles on conversations started after the change.
+            // Echoes the full status back so the client refreshes from one reply.
+            if (path === "/api/settings") {
+                await handleSettings(req, res, deps);
                 return;
             }
 

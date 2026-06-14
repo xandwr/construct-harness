@@ -25,6 +25,7 @@ import { HarnessError, isRetryableKind } from "./errors.ts";
 import type { ErrorKind } from "./errors.ts";
 import { withRetry } from "./retry.ts";
 import type { RetryOptions } from "./retry.ts";
+import { isKnownModel } from "./models.ts";
 
 /** Default model + token ceilings, per the Claude API guidance. */
 const DEFAULT_MODEL = "claude-opus-4-8";
@@ -368,9 +369,13 @@ export interface AnthropicClientConfig {
 
 export class AnthropicClient implements ModelClient {
     readonly provider = "anthropic";
-    readonly model: string;
     readonly capabilities = ANTHROPIC_CAPABILITIES;
 
+    /** The model id every request is built with. Mutable through {@link model}'s
+     *  setter so the settings page can switch models live: {@link buildRequest}
+     *  reads it per request, so a change takes effect on the very next turn for
+     *  every conversation this one client drives. */
+    private currentModel: string;
     private readonly sdk: Anthropic;
     private readonly retry: RetryOptions | false;
 
@@ -381,8 +386,34 @@ export class AnthropicClient implements ModelClient {
             ...(config.apiKey ? { apiKey: config.apiKey } : {}),
             maxRetries: 0,
         });
-        this.model = config.model ?? DEFAULT_MODEL;
+        this.currentModel = config.model ?? DEFAULT_MODEL;
         this.retry = config.retry ?? {};
+    }
+
+    /** The model id this client currently calls. Satisfies {@link ModelClient.model};
+     *  {@link setModel} makes it live. */
+    get model(): string {
+        return this.currentModel;
+    }
+
+    /**
+     * Switch the model every subsequent request uses (the {@link ModelClient.setModel}
+     * capability). Validated against the bridge's model catalogue
+     * ({@link isKnownModel}) so a typo can't be handed to the provider to 404 on
+     * the next turn — an unknown id throws an `invalid_request` {@link HarnessError}
+     * the caller surfaces, and the live model is left unchanged. Takes effect on
+     * the next request: there is no per-conversation pinning, so it switches the
+     * whole process at once.
+     */
+    setModel(id: string): void {
+        const next = id.trim();
+        if (!isKnownModel(next)) {
+            throw new HarnessError(`unknown model "${id}"`, {
+                kind: "invalid_request",
+                retryable: false,
+            });
+        }
+        this.currentModel = next;
     }
 
     /** Run `fn` under the configured retry policy, mapping every failure to a

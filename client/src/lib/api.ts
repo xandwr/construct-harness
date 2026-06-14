@@ -234,10 +234,52 @@ export function getCommands(fetchFn?: typeof fetch): Promise<{ commands: WireCom
     return getJson("/api/commands", fetchFn);
 }
 
-/** The runtime status, as `/api/status` returns it: the truth about what this
- *  process is. Secret-free — `embeddingConfigured` is a flag, never a key. */
+/** One model variant a provider serves, as `/api/status` lists it for the model
+ *  dropdown. `current` marks the one the runtime is using. */
+export interface WireModelVariant {
+    id: string;
+    label: string;
+    contextWindow: number;
+    maxOutput: number;
+    current: boolean;
+}
+
+/** A provider and its model variants, for the provider/model dropdowns. */
+export interface WireProvider {
+    id: string;
+    label: string;
+    models: WireModelVariant[];
+}
+
+/** One server-tool toggle: its id, a label/note for the row, and whether it's on. */
+export interface WireServerTool {
+    id: string;
+    label: string;
+    note: string;
+    enabled: boolean;
+}
+
+/** One local-tool toggle: a group key, the tool names it covers, and whether
+ *  it's on. Toggling applies to conversations started after the change. */
+export interface WireLocalTool {
+    key: string;
+    label: string;
+    note: string;
+    toolNames: string[];
+    enabled: boolean;
+}
+
+/** The reasoning-effort levels, in ascending depth. */
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+
+/** The runtime status, as `/api/status` returns it: the live knobs the settings
+ *  page turns plus the catalogue its controls render from. Secret-free —
+ *  `embeddingConfigured` is a flag, never a key. */
 export interface WireStatus {
     provider: {
+        /** The provider serving the current model (drives the provider dropdown),
+         *  or null when no known provider serves it. */
+        id: string | null;
         model: string;
         capabilities: {
             thinking: boolean;
@@ -247,8 +289,15 @@ export interface WireStatus {
             streaming: boolean;
         };
     };
-    serverTools: string[];
-    localTools: string[];
+    /** Every provider and its model variants — the two dropdowns' options. */
+    providers: WireProvider[];
+    /** The server-tool toggle catalogue, each flagged enabled/disabled. */
+    serverTools: WireServerTool[];
+    /** The local-tool toggle catalogue, each flagged enabled/disabled. */
+    localTools: WireLocalTool[];
+    /** The effort dropdown: the level in use (null = provider default) and the
+     *  levels to choose from. */
+    effort: { current: EffortLevel | null; levels: EffortLevel[] };
     storage: {
         memoryDb: string | null;
         kbDir: string | null;
@@ -269,9 +318,28 @@ export interface WireStatus {
     liveSessions: string[];
 }
 
-/** The read-only runtime status, for the settings page. */
+/** The runtime status, for the settings page. */
 export function getStatus(fetchFn?: typeof fetch): Promise<WireStatus> {
     return getJson("/api/status", fetchFn);
+}
+
+/** The settings PATCH body: any subset of the live knobs. `effort: null` clears
+ *  the level back to the provider default; `localTools` maps group-key → on. */
+export interface SettingsPatch {
+    model?: string;
+    serverTools?: string[];
+    effort?: EffortLevel | null;
+    localTools?: Record<string, boolean>;
+}
+
+/**
+ * Turn the live runtime knobs. Applies any subset in one PATCH and returns the
+ * full refreshed {@link WireStatus}, so the caller re-renders from one response.
+ * Model/server-tool/effort changes land on every conversation's next turn;
+ * local-tool toggles apply to conversations started after the change.
+ */
+export function updateSettings(patch: SettingsPatch, fetchFn?: typeof fetch): Promise<WireStatus> {
+    return writeJson("PATCH", "/api/settings", patch, fetchFn);
 }
 
 /** One ingredient of a context preview: a named slice of what the next turn would
@@ -320,7 +388,7 @@ export function getDreams(fetchFn?: typeof fetch): Promise<{ dreams: WireDream[]
 /** Run a JSON write (POST/PUT/DELETE), throwing {@link ApiError} on a non-2xx so
  *  callers can surface the server's message (a 400 path clash, a 404, ...). */
 async function writeJson<T>(
-    method: "POST" | "PUT" | "DELETE",
+    method: "POST" | "PUT" | "PATCH" | "DELETE",
     path: string,
     body?: unknown,
     fetchFn: typeof fetch = fetch,

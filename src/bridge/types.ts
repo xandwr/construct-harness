@@ -109,10 +109,18 @@ export type CoreDelta =
 export interface ModelClient {
     /** Stable name of the provider, for logging/telemetry (e.g. "anthropic"). */
     readonly provider: string;
-    /** The model id this client is configured to call. */
+    /** The model id this client is configured to call. Read-only through the
+     *  interface; a client that supports live switching exposes {@link setModel}. */
     readonly model: string;
     /** What this client supports beyond the common path. */
     readonly capabilities: ProviderCapabilities;
+
+    /** Switch the model every subsequent request uses, if the client supports it.
+     *  Optional: a client without it is pinned to its constructed model. When
+     *  present, the change is read per request, so it lands on the next turn of
+     *  every conversation this one client drives. Implementations validate the id
+     *  and throw on an unknown one rather than letting the provider 404 later. */
+    setModel?(id: string): void;
 
     /** Run one turn and return the complete result. */
     generate(params: GenerateParams): Promise<GenerateResult>;

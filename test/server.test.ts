@@ -30,6 +30,8 @@ import { BUILTIN_COMMANDS } from "../src/commands.ts";
 import { MemoryStore, Memory } from "../src/memory.ts";
 import { EventStore } from "../src/events.ts";
 import { GoalStore } from "../src/goals.ts";
+import { RuntimeConfig } from "../src/runtimeConfig.ts";
+import { AnthropicClient } from "../src/bridge/anthropic.ts";
 import { FakeClient, textTurn, callTurn } from "./helpers/fakeClient.ts";
 
 /** A captured response: status, headers, and the concatenated body. For SSE the
@@ -167,6 +169,39 @@ function makeSharedDeps(client: FakeClient) {
  *  what the read endpoints flag as live. The pool seeds exactly one at start. */
 function defaultId(deps: { sessions: SessionPool }): string {
     return deps.sessions.ids()[0]!;
+}
+
+/** A RuntimeConfig over a real AnthropicClient (no network: model switching and
+ *  status reads are pure), the shared provider-options object, and a two-group
+ *  local-tool catalogue — the same shape buildDeps wires, for the settings tests.
+ *  No ANTHROPIC_API_KEY is needed: the SDK constructs lazily and we never call it. */
+function makeRuntime() {
+    const client = new AnthropicClient({ apiKey: "test-key", model: "claude-opus-4-8" });
+    const providerOptions: Record<string, unknown> = {
+        cacheSystem: true,
+        thinking: true,
+        thinkingDisplay: true,
+        serverTools: ["web_search", "web_fetch"],
+    };
+    const localGroups = [
+        {
+            key: "notes",
+            label: "knowledge base",
+            note: "save / recall / link markdown notes",
+            toolNames: ["note_save", "note_recall"],
+        },
+        {
+            key: "shell",
+            label: "local shell",
+            note: "run commands on the user's real machine",
+            toolNames: ["use__user__shell"],
+        },
+    ];
+    const runtime = new RuntimeConfig(client, providerOptions as any, localGroups, [
+        "notes",
+        "shell",
+    ]);
+    return { client, providerOptions, runtime };
 }
 
 test("GET /api/health reports ok and the live session ids", async () => {
@@ -871,13 +906,12 @@ test("DELETE /api/memories/:id forgets a memory; a missing id is a 404", async (
 
 // ── Status ───────────────────────────────────────────────────────────────────
 
-test("GET /api/status reports the static config snapshot when one is supplied", async () => {
+test("GET /api/status reports the static snapshot plus the live runtime knobs", async () => {
+    const { runtime } = makeRuntime();
     const deps = {
         ...makeDeps(new FakeClient([])),
+        runtime,
         status: {
-            model: "claude-test-1",
-            serverTools: ["web_search" as const, "web_fetch" as const],
-            localTools: ["note_save", "use__user__shell"],
             memoryDb: "/tmp/db.sqlite",
             kbDir: "/tmp/kb",
             compactAt: 99_000,
@@ -890,18 +924,36 @@ test("GET /api/status reports the static config snapshot when one is supplied", 
     };
     const { status, json } = await call(deps, getReq("/api/status"));
     assert.equal(status, 200);
-    assert.equal(json.provider.model, "claude-test-1");
-    // Capabilities come from the live client, not the snapshot.
+    // The live knobs come off the runtime, not the snapshot.
+    assert.equal(json.provider.id, "anthropic");
+    assert.equal(json.provider.model, "claude-opus-4-8");
+    // Capabilities come from the live client.
     assert.deepEqual(json.provider.capabilities, deps.client.capabilities);
-    assert.deepEqual(json.serverTools, ["web_search", "web_fetch"]);
-    assert.deepEqual(json.localTools, ["note_save", "use__user__shell"]);
+    // The provider/model catalogue the dropdowns render from, with the in-use
+    // model flagged current.
+    const anthropic = json.providers.find((p: any) => p.id === "anthropic");
+    assert.ok(anthropic, "anthropic provider is offered");
+    assert.ok(anthropic.models.some((m: any) => m.id === "claude-opus-4-8" && m.current));
+    assert.ok(anthropic.models.some((m: any) => m.id === "claude-fable-5" && !m.current));
+    // Server tools as a toggle catalogue, the enabled ones flagged.
+    const byId = Object.fromEntries(json.serverTools.map((t: any) => [t.id, t]));
+    assert.equal(byId.web_search.enabled, true);
+    assert.equal(byId.web_fetch.enabled, true);
+    assert.equal(byId.code_execution.enabled, false);
+    // Local tools as a toggle catalogue, both groups on at boot.
+    const byKey = Object.fromEntries(json.localTools.map((g: any) => [g.key, g]));
+    assert.equal(byKey.notes.enabled, true);
+    assert.equal(byKey.shell.enabled, true);
+    assert.deepEqual(byKey.shell.toolNames, ["use__user__shell"]);
+    // Effort: no level set means the provider default, plus the level catalogue.
+    assert.equal(json.effort.current, null);
+    assert.ok(json.effort.levels.includes("xhigh"));
+    // The static fields still come from the snapshot.
     assert.equal(json.storage.memoryDb, "/tmp/db.sqlite");
     assert.equal(json.storage.kbDir, "/tmp/kb");
     assert.equal(json.compactAt, 99_000);
     assert.equal(json.embeddingConfigured, true);
     assert.deepEqual(json.features, { dreams: true, transcriptRecall: true, workingMind: true });
-    // The shell policy is reported so the status page shows how the local shell
-    // is governed.
     assert.deepEqual(json.shellPolicy, { mode: "read-only", allowedCwdRoots: ["/srv/app"] });
     deps.close();
 });
@@ -920,17 +972,23 @@ test("GET /api/status reports live dynamic data: schema version, counts, session
     deps.close();
 });
 
-test("GET /api/status answers even with no static snapshot (no-key/no-embedder case)", async () => {
-    // makeDeps supplies no `status`, modelling a process booted without an
-    // embedder or an explicit model: the static fields degrade to empty/false but
-    // the route still answers with the live dynamic half rather than 500-ing.
+test("GET /api/status answers even with no snapshot or runtime (no-key/no-embedder case)", async () => {
+    // makeDeps supplies neither `status` nor `runtime`, modelling a bare process:
+    // the live knobs degrade gracefully (model falls back to the client, no tools
+    // enabled) and the static fields to empty/false, but the route still answers
+    // with the live dynamic half rather than 500-ing.
     const deps = makeDeps(new FakeClient([]));
     const { status, json } = await call(deps, getReq("/api/status"));
     assert.equal(status, 200);
-    // The model falls back to the live client's id.
+    // The model falls back to the live client's id; no provider serves "fake-model".
     assert.equal(json.provider.model, deps.client.model);
-    assert.deepEqual(json.serverTools, []);
+    assert.equal(json.provider.id, null);
+    // The server-tool catalogue is still offered (static), but nothing is enabled.
+    assert.ok(json.serverTools.every((t: any) => t.enabled === false));
+    // No runtime means no local-tool groups to list.
     assert.deepEqual(json.localTools, []);
+    // No effort level set.
+    assert.equal(json.effort.current, null);
     assert.equal(json.embeddingConfigured, false);
     assert.equal(json.storage.memoryDb, null);
     assert.equal(json.compactAt, null);
@@ -952,6 +1010,234 @@ test("GET /api/status answers even with no static snapshot (no-key/no-embedder c
 function captured(json: unknown): string {
     return JSON.stringify(json);
 }
+
+// ── Settings (write) ───────────────────────────────────────────────────────────
+
+test("PATCH /api/settings switches the model live and echoes the new status", async () => {
+    const { client, runtime } = makeRuntime();
+    const deps = { ...makeDeps(new FakeClient([])), runtime };
+    const { status, json } = await call(
+        deps,
+        bodyReq("PATCH", "/api/settings", JSON.stringify({ model: "claude-sonnet-4-6" })),
+    );
+    assert.equal(status, 200);
+    // The change lands on the live client (so every conversation's next turn).
+    assert.equal(client.model, "claude-sonnet-4-6");
+    // The echoed status reflects it immediately.
+    assert.equal(json.provider.model, "claude-sonnet-4-6");
+    assert.equal(json.provider.id, "anthropic");
+    const anthropic = json.providers.find((p: any) => p.id === "anthropic");
+    assert.ok(anthropic.models.some((m: any) => m.id === "claude-sonnet-4-6" && m.current));
+    deps.close();
+});
+
+test("PATCH /api/settings rejects an unknown model and leaves the live model unchanged", async () => {
+    const { client, runtime } = makeRuntime();
+    const deps = { ...makeDeps(new FakeClient([])), runtime };
+    const { status, json } = await call(
+        deps,
+        bodyReq("PATCH", "/api/settings", JSON.stringify({ model: "gpt-nope" })),
+    );
+    assert.equal(status, 400);
+    assert.match(json.error, /unknown model/);
+    // The live model is untouched.
+    assert.equal(client.model, "claude-opus-4-8");
+    deps.close();
+});
+
+test("PATCH /api/settings toggles server tools in place on the shared options", async () => {
+    const { providerOptions, runtime } = makeRuntime();
+    const deps = { ...makeDeps(new FakeClient([])), runtime };
+    const { status, json } = await call(
+        deps,
+        bodyReq(
+            "PATCH",
+            "/api/settings",
+            JSON.stringify({ serverTools: ["web_search", "code_execution"] }),
+        ),
+    );
+    assert.equal(status, 200);
+    // The shared provider-options object every live Session reads is mutated in
+    // place, in catalogue (display) order, so live conversations pick it up.
+    assert.deepEqual(providerOptions.serverTools, ["web_search", "code_execution"]);
+    const byId = Object.fromEntries(json.serverTools.map((t: any) => [t.id, t.enabled]));
+    assert.deepEqual(byId, { web_search: true, web_fetch: false, code_execution: true });
+    deps.close();
+});
+
+test("PATCH /api/settings rejects an unknown server tool", async () => {
+    const { providerOptions, runtime } = makeRuntime();
+    const deps = { ...makeDeps(new FakeClient([])), runtime };
+    const { status, json } = await call(
+        deps,
+        bodyReq("PATCH", "/api/settings", JSON.stringify({ serverTools: ["telepathy"] })),
+    );
+    assert.equal(status, 400);
+    assert.match(json.error, /unknown server tool/);
+    // Unchanged on rejection.
+    assert.deepEqual(providerOptions.serverTools, ["web_search", "web_fetch"]);
+    deps.close();
+});
+
+test("PATCH /api/settings sets and clears the effort level", async () => {
+    const { providerOptions, runtime } = makeRuntime();
+    const deps = { ...makeDeps(new FakeClient([])), runtime };
+    const set = await call(
+        deps,
+        bodyReq("PATCH", "/api/settings", JSON.stringify({ effort: "xhigh" })),
+    );
+    assert.equal(set.status, 200);
+    assert.equal(providerOptions.effort, "xhigh");
+    assert.equal(set.json.effort.current, "xhigh");
+
+    const cleared = await call(
+        deps,
+        bodyReq("PATCH", "/api/settings", JSON.stringify({ effort: null })),
+    );
+    assert.equal(cleared.status, 200);
+    assert.equal("effort" in providerOptions, false, "null clears the level entirely");
+    assert.equal(cleared.json.effort.current, null);
+
+    const bad = await call(
+        deps,
+        bodyReq("PATCH", "/api/settings", JSON.stringify({ effort: "ludicrous" })),
+    );
+    assert.equal(bad.status, 400);
+    assert.match(bad.json.error, /unknown effort level/);
+    deps.close();
+});
+
+test("PATCH /api/settings toggles a local tool group and rejects an unknown key", async () => {
+    const { runtime } = makeRuntime();
+    const deps = { ...makeDeps(new FakeClient([])), runtime };
+    const off = await call(
+        deps,
+        bodyReq("PATCH", "/api/settings", JSON.stringify({ localTools: { shell: false } })),
+    );
+    assert.equal(off.status, 200);
+    assert.equal(runtime.isLocalEnabled("shell"), false);
+    assert.equal(runtime.isLocalEnabled("notes"), true);
+    const byKey = Object.fromEntries(off.json.localTools.map((g: any) => [g.key, g.enabled]));
+    assert.deepEqual(byKey, { notes: true, shell: false });
+
+    const bad = await call(
+        deps,
+        bodyReq("PATCH", "/api/settings", JSON.stringify({ localTools: { quantum: true } })),
+    );
+    assert.equal(bad.status, 400);
+    assert.match(bad.json.error, /unknown tool/);
+    deps.close();
+});
+
+test("PATCH /api/settings applies several knobs in one request", async () => {
+    const { client, providerOptions, runtime } = makeRuntime();
+    const deps = { ...makeDeps(new FakeClient([])), runtime };
+    const { status } = await call(
+        deps,
+        bodyReq(
+            "PATCH",
+            "/api/settings",
+            JSON.stringify({
+                model: "claude-fable-5",
+                serverTools: ["web_search"],
+                effort: "high",
+                localTools: { notes: false },
+            }),
+        ),
+    );
+    assert.equal(status, 200);
+    assert.equal(client.model, "claude-fable-5");
+    assert.deepEqual(providerOptions.serverTools, ["web_search"]);
+    assert.equal(providerOptions.effort, "high");
+    assert.equal(runtime.isLocalEnabled("notes"), false);
+    deps.close();
+});
+
+test("PATCH /api/settings 503s when no runtime is wired", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const { status } = await call(
+        deps,
+        bodyReq("PATCH", "/api/settings", JSON.stringify({ model: "claude-opus-4-8" })),
+    );
+    assert.equal(status, 503);
+    deps.close();
+});
+
+test("non-PATCH /api/settings is 405", async () => {
+    const { runtime } = makeRuntime();
+    const deps = { ...makeDeps(new FakeClient([])), runtime };
+    const { status } = await call(deps, getReq("/api/settings"));
+    assert.equal(status, 405);
+    deps.close();
+});
+
+test("a server-tool toggle reaches a live conversation's next turn", async () => {
+    // The load-bearing claim: the runtime config mutates the SAME ProviderOptions
+    // object the session pool was built with, so a toggle lands on a turn already
+    // in flight — not just on conversations started afterward. Wire it the way
+    // buildDeps does: one shared options object referenced by both.
+    const client = new FakeClient([textTurn("ok")]);
+    const store = new MemoryStore(":memory:");
+    const events = new EventStore(":memory:");
+    const goals = new GoalStore({ location: ":memory:", onChange: goalEventSink(events) });
+    const sharedProviderOptions: Record<string, unknown> = {
+        thinking: true,
+        serverTools: ["web_search"],
+    };
+    const sessions = new SessionPool(() => ({
+        client,
+        system: "be brief",
+        store,
+        events,
+        goals,
+        providerOptions: sharedProviderOptions,
+    }));
+    const runtime = new RuntimeConfig(
+        new AnthropicClient({ apiKey: "test-key", model: "claude-opus-4-8" }),
+        sharedProviderOptions as any,
+        [],
+        [],
+    );
+    const deps = {
+        store,
+        events,
+        goals,
+        sessions,
+        client,
+        runtime,
+        close() {
+            events.close();
+            goals.close();
+            store.close();
+        },
+    };
+
+    // Toggle code_execution on (and keep web_search) via the settings route.
+    const patched = await call(
+        deps,
+        bodyReq(
+            "PATCH",
+            "/api/settings",
+            JSON.stringify({ serverTools: ["web_search", "code_execution"] }),
+        ),
+    );
+    assert.equal(patched.status, 200);
+
+    // Now run a chat turn on the default (already-live) conversation and read back
+    // what the loop handed the client.
+    const handle = createHandler(deps);
+    const { res } = fakeRes();
+    await handle(postReq("/api/chat", JSON.stringify({ message: "hi" })), res);
+
+    const lastCall = client.calls.at(-1)!;
+    const opts = lastCall.providerOptions as { serverTools?: string[] };
+    assert.deepEqual(
+        opts.serverTools,
+        ["web_search", "code_execution"],
+        "the in-flight turn saw the toggled server-tool set",
+    );
+    deps.close();
+});
 
 // ── Context inspector ────────────────────────────────────────────────────────
 
