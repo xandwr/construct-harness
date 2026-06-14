@@ -5,6 +5,7 @@
 	import { page } from '$app/state';
 	import { sendChat, getEvents, ApiError, type ChatEvent, type WireEvent } from '$lib/api';
 	import { clock, shortWhen } from '$lib/time';
+	import { renderMarkdown } from '$lib/markdown';
 
 	const app = APPS.find((a) => a.id === 'chat')!;
 
@@ -273,9 +274,19 @@
 							{/if}
 						</div>
 					{/if}
-					<span class="text-text text-xs leading-relaxed whitespace-pre-wrap"
-						>{m.text}{#if m.pending}<span class="text-glow">▍</span>{/if}</span
-					>
+					{#if m.role === 'agent'}
+						<!-- The agent writes markdown; render it as prose. User messages stay
+						     literal text (below) so typed markup shows as-typed. The pending
+						     cursor lives outside the @html so the streamed source it renders
+						     stays clean. -->
+						<div class="md text-text text-xs leading-relaxed">
+							{@html renderMarkdown(m.text)}{#if m.pending}<span class="text-glow"
+									>▍</span
+								>{/if}
+						</div>
+					{:else}
+						<span class="text-text text-xs leading-relaxed whitespace-pre-wrap">{m.text}</span>
+					{/if}
 					{#if m.tool}
 						<div class="text-faint mt-1 text-[10px]">{m.tool}</div>
 					{/if}
@@ -309,3 +320,120 @@
 		</div>
 	</form>
 </div>
+
+<!-- Markdown prose styling for rendered agent replies. The @html content
+     DOMPurify produces isn't seen by Svelte's style scoper, so these are
+     :global selectors gated under .md. The aim is terminal-restrained: the
+     monospace face and theme palette stay; markdown only adds structure
+     (spacing, weight, rules), never new colors or rounded corners. -->
+<style>
+	/* Vertical rhythm between blocks; the wrapper's own margins are collapsed
+	   so a reply doesn't push off its author row. */
+	.md :global(> :first-child) {
+		margin-top: 0;
+	}
+	.md :global(> :last-child) {
+		margin-bottom: 0;
+	}
+	.md :global(p),
+	.md :global(ul),
+	.md :global(ol),
+	.md :global(blockquote),
+	.md :global(pre),
+	.md :global(table) {
+		margin: 0.5em 0;
+	}
+
+	.md :global(h1),
+	.md :global(h2),
+	.md :global(h3),
+	.md :global(h4) {
+		margin: 0.8em 0 0.4em;
+		font-weight: 700;
+		line-height: 1.3;
+	}
+	.md :global(h1) {
+		font-size: 1.15em;
+	}
+	.md :global(h2) {
+		font-size: 1.08em;
+	}
+	.md :global(h3),
+	.md :global(h4) {
+		font-size: 1em;
+		color: var(--color-muted);
+	}
+
+	.md :global(a) {
+		color: var(--color-glow);
+		text-decoration: underline;
+	}
+	.md :global(strong) {
+		font-weight: 700;
+		color: var(--color-text);
+	}
+	.md :global(em) {
+		font-style: italic;
+	}
+
+	.md :global(ul),
+	.md :global(ol) {
+		padding-left: 1.4em;
+	}
+	.md :global(li) {
+		margin: 0.2em 0;
+	}
+	.md :global(li::marker) {
+		color: var(--color-faint);
+	}
+
+	/* Inline code: a faint plate, no rounding (the instrument is square). */
+	.md :global(code) {
+		background: var(--color-surface-2);
+		padding: 0.05em 0.3em;
+		color: var(--color-glow);
+	}
+	/* Fenced blocks: bordered, scrollable, code inside drops the inline plate. */
+	.md :global(pre) {
+		background: var(--color-surface);
+		border: 1px solid var(--color-border);
+		padding: 0.6em 0.7em;
+		overflow-x: auto;
+	}
+	.md :global(pre code) {
+		background: none;
+		padding: 0;
+		color: var(--color-text);
+	}
+
+	.md :global(blockquote) {
+		border-left: 2px solid var(--color-border);
+		padding-left: 0.7em;
+		color: var(--color-muted);
+	}
+	.md :global(hr) {
+		border: none;
+		border-top: 1px solid var(--color-border);
+		margin: 0.8em 0;
+	}
+
+	.md :global(table) {
+		border-collapse: collapse;
+		display: block;
+		overflow-x: auto;
+	}
+	.md :global(th),
+	.md :global(td) {
+		border: 1px solid var(--color-border);
+		padding: 0.3em 0.6em;
+		text-align: left;
+	}
+	.md :global(th) {
+		color: var(--color-muted);
+		font-weight: 700;
+	}
+
+	.md :global(img) {
+		max-width: 100%;
+	}
+</style>

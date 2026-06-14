@@ -94,6 +94,87 @@ test("shows tool activity as it runs", async () => {
     assert.match(text, /done/);
 });
 
+test("renders markdown in the streamed reply (line-buffered)", async () => {
+    const client = new FakeClient([textTurn("# Title\n\nuse **bold** and `code` here\n")]);
+    const session = new Session({ client, system: "S" });
+    const out = bufferOutput();
+
+    await runRepl(session, { input: inputOf(["hi", "/exit"]), output: out });
+
+    const text = out.text();
+    // Non-TTY buffer → plain rendering: hashes/asterisks/backticks stripped.
+    // (The heading shares a line with the "› " prompt, hence not anchored to ^.)
+    assert.match(text, /\bTitle\b/, "heading should render");
+    assert.doesNotMatch(text, /# Title/, "heading hashes should be stripped");
+    assert.match(text, /use bold and code here/, "inline markers should be stripped");
+    assert.doesNotMatch(text, /\*\*bold\*\*/, "raw bold markers should not survive");
+});
+
+test("renders LaTeX math approximated to Unicode", async () => {
+    const client = new FakeClient([textTurn("energy $E = mc^2$ and $\\alpha$\n")]);
+    const session = new Session({ client, system: "S" });
+    const out = bufferOutput();
+
+    await runRepl(session, { input: inputOf(["hi", "/exit"]), output: out });
+
+    assert.match(out.text(), /energy E = mc² and α/);
+});
+
+test("markdown spanning multiple stream deltas renders once the line completes", async () => {
+    // A construct split across deltas: the renderer must buffer until the line's
+    // newline arrives, then render the whole line.
+    const split = {
+        content: [
+            { kind: "text", text: "a **bo" },
+            { kind: "text", text: "ld** word\n" },
+        ],
+        stopReason: "end_turn",
+    } as const;
+    const client = new FakeClient([split]);
+    const session = new Session({ client, system: "S" });
+    const out = bufferOutput();
+
+    await runRepl(session, { input: inputOf(["hi", "/exit"]), output: out });
+
+    const text = out.text();
+    assert.match(text, /a bold word/, "split bold should still render");
+    assert.doesNotMatch(text, /\*\*/, "no raw markers should leak");
+});
+
+test("separates text segments around a tool block with a blank line", async () => {
+    // The pattern that used to render as one unspaced blob: a turn that emits
+    // prose *and* calls a tool, followed by a turn with more prose. The tool
+    // status lines must not let the two prose segments butt together.
+    const noop = {
+        name: "noop",
+        description: "does nothing",
+        parameters: { type: "object" },
+        async run() {
+            return "ok";
+        },
+    };
+    const turnWithText = {
+        content: [
+            { kind: "text", text: "before the tool" },
+            { kind: "tool_call", id: "c1", name: "noop", args: {} },
+        ],
+        stopReason: "tool_use",
+    } as const;
+    const client = new FakeClient([turnWithText, textTurn("after the tool")]);
+    const session = new Session({ client, system: "S", tools: [noop] });
+    const out = bufferOutput();
+
+    await runRepl(session, { input: inputOf(["go", "/exit"]), output: out });
+
+    const text = out.text();
+    // First prose ends on its own line before the tool block; second prose is
+    // separated from the tool's "ok" line by a blank line.
+    assert.match(text, /before the tool\n\n  ↳ noop\(/, "text should close before the tool block");
+    assert.match(text, /noop ok\n\nafter the tool/, "a blank line should precede resumed prose");
+    // And no run-together of the two prose segments.
+    assert.doesNotMatch(text, /before the toolafter the tool/);
+});
+
 test("an unknown slash command is reported, not fatal", async () => {
     const client = new FakeClient([textTurn("a")]);
     const session = new Session({ client, system: "S" });

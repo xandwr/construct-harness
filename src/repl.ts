@@ -17,6 +17,7 @@ import type { Readable } from "node:stream";
 import { Session } from "./session.ts";
 import type { LoopEvent } from "./bridge/loop.ts";
 import { HarnessError } from "./bridge/errors.ts";
+import { makeMarkdownRenderer } from "./markdown.ts";
 
 /** The output sink the REPL writes to. `process.stdout` satisfies this; tests
  *  pass a buffer. `isTTY` gates ANSI styling so piped/redirected output stays
@@ -40,25 +41,107 @@ function dim(out: ReplOutput, text: string): string {
     return out.isTTY ? `\x1b[2m${text}\x1b[0m` : text;
 }
 
-/** Render one streamed event. Text deltas print inline (the reply, as it
- *  arrives); everything else prints as a dim status line. */
-function render(out: ReplOutput, event: LoopEvent): void {
-    switch (event.kind) {
-        case "text":
-            out.write(event.text);
-            break;
-        case "tool_start":
-            out.write(dim(out, `\n  ↳ ${event.name}(${compactArgs(event.args)})\n`));
-            break;
-        case "tool_end":
-            out.write(dim(out, `  ↳ ${event.name} ${event.isError ? "errored" : "ok"}\n`));
-            break;
-        case "compacted":
-            out.write(dim(out, `\n  [compacted history]\n`));
-            break;
-        // thinking, tool_call_start/args, turn_start, loop_done: not surfaced
-        // in the basic REPL view.
+/**
+ * A stateful renderer for one turn's {@link LoopEvent} stream.
+ *
+ * Text deltas are Markdown, rendered (with inline LaTeX) as the reply arrives;
+ * tool and compaction activity print as dim status lines. Two problems get
+ * solved here, both about boundaries:
+ *
+ *  1. **Markdown can't render mid-token.** You can't style `**bold**` until the
+ *     closing `**` arrives. So we render *line-buffered*: text deltas accumulate
+ *     in `pending`, and each time a `\n` completes a line we hand that line to
+ *     the {@link makeMarkdownRenderer} and print the styled result. The partial
+ *     last line stays buffered until its newline (or a boundary) arrives. This
+ *     matches how the model streams — token by token, but lines settle quickly —
+ *     so the reply still appears live, just a line at a time rather than a
+ *     half-formatted character at a time.
+ *
+ *  2. **Segments must not run together.** A turn interleaves prose and tool
+ *     blocks; without care they form one unspaced wall. This closure owns every
+ *     boundary: entering a tool/compaction block first flushes and closes the
+ *     current prose line, and resuming prose after a block emits a blank line so
+ *     each segment reads as its own paragraph. {@link RenderState.finish} drains
+ *     the buffer and leaves the cursor on a fresh line for the footer.
+ */
+interface RenderState {
+    render(event: LoopEvent): void;
+    /** Flush any buffered text and ensure the cursor is on its own line (call
+     *  before the footer). */
+    finish(): void;
+}
+
+function makeRenderer(out: ReplOutput): RenderState {
+    const md = makeMarkdownRenderer(out.isTTY ?? false);
+    // Buffered text for the line currently being streamed (no newline yet).
+    let pending = "";
+    // True while we have emitted prose with no trailing newline since the last
+    // boundary, i.e. either `pending` is non-empty or a rendered line is open.
+    let inText = false;
+    // True once any text has been seen this turn, so the separating blank line
+    // goes *between* paragraphs, not before the first one.
+    let sawText = false;
+
+    /** Render and emit a single completed source line (its `\n` is added). */
+    function emitLine(src: string): void {
+        out.write(md.line(src) + "\n");
     }
+
+    /** Flush whole lines out of `pending`, keeping any trailing partial line
+     *  buffered. */
+    function flushCompleteLines(): void {
+        let nl: number;
+        while ((nl = pending.indexOf("\n")) !== -1) {
+            emitLine(pending.slice(0, nl));
+            pending = pending.slice(nl + 1);
+            inText = false; // a full line was just terminated with its own \n
+        }
+        if (pending.length > 0) inText = true;
+    }
+
+    /** Flush a trailing partial line and close it, so a status block starts on a
+     *  clean line. */
+    function endText(): void {
+        if (pending.length > 0) {
+            emitLine(pending);
+            pending = "";
+        } else if (inText) {
+            out.write("\n");
+        }
+        inText = false;
+    }
+
+    return {
+        render(event: LoopEvent): void {
+            switch (event.kind) {
+                case "text":
+                    // Resuming prose after a tool/compaction block: separate it
+                    // from the block above with a blank line.
+                    if (!inText && pending.length === 0 && sawText) out.write("\n");
+                    sawText = true;
+                    pending += event.text;
+                    flushCompleteLines();
+                    break;
+                case "tool_start":
+                    endText();
+                    out.write(dim(out, `\n  ↳ ${event.name}(${compactArgs(event.args)})\n`));
+                    break;
+                case "tool_end":
+                    endText();
+                    out.write(dim(out, `  ↳ ${event.name} ${event.isError ? "errored" : "ok"}\n`));
+                    break;
+                case "compacted":
+                    endText();
+                    out.write(dim(out, `\n  [compacted history]\n`));
+                    break;
+                // thinking, tool_call_start/args, turn_start, loop_done: not
+                // surfaced in the basic REPL view.
+            }
+        },
+        finish(): void {
+            endText();
+        },
+    };
 }
 
 /** One-line, length-bounded rendering of tool args for the status line. */
@@ -106,11 +189,13 @@ export async function runRepl(session: Session, deps: ReplDeps = {}): Promise<vo
             // Drive the turn. The generator yields events (rendered live) and
             // returns the TurnResult, which carries the accounting footer.
             const turn = session.send(text);
+            const renderer = makeRenderer(out);
             let next = await turn.next();
             while (!next.done) {
-                render(out, next.value);
+                renderer.render(next.value);
                 next = await turn.next();
             }
+            renderer.finish();
             const result = next.value;
             const u = result.usage;
             out.write(
