@@ -20,12 +20,26 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-/** Read a prompt file sitting one level up from `src/` (the repo root) and
- *  return it trimmed, so a trailing newline in the file doesn't ride into the
- *  system turn. */
+/**
+ * Read a prompt file sitting one level up from `src/` (the repo root) and reflow
+ * it from legible, hard-wrapped markdown into the prose the model sees.
+ *
+ * The files are wrapped at ~80-100 chars so they read cleanly on disk and diff
+ * sanely, but those line breaks are presentational, not semantic. We apply the
+ * standard markdown convention: a single newline is a soft wrap (it rejoins into
+ * a space) and a blank line is a real paragraph break (preserved). So the prompt
+ * the model receives is a handful of flowing paragraphs regardless of where the
+ * source happens to wrap, and rewrapping the file never changes what it sees.
+ */
 function loadPrompt(filename: string): string {
     const path = fileURLToPath(new URL(`../${filename}`, import.meta.url));
-    return readFileSync(path, "utf8").trim();
+    return readFileSync(path, "utf8")
+        .trim()
+        // Split on blank lines into paragraphs, unwrap each paragraph's soft
+        // line breaks back into single spaces, then rejoin with blank lines.
+        .split(/\n\s*\n/)
+        .map((para) => para.replace(/\s*\n\s*/g, " ").trim())
+        .join("\n\n");
 }
 
 /** The full Construct persona: every tool group the server wires in (memory,
