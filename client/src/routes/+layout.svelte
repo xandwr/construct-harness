@@ -16,10 +16,8 @@
 </svelte:head>
 
 <div class="flex h-screen w-screen overflow-hidden">
-	<!-- The spine: the app registry, and the one place the thing shows it's awake. -->
 	<nav class="flex w-48 shrink-0 flex-col border-r border-border bg-base" aria-label="applets">
 		<div class="flex items-center gap-2 border-b border-border px-3 py-3">
-			<!-- The mark. It breathes. The one anomaly in a dead-still instrument. -->
 			<img src={favicon} alt="Logo" class="w-5 h-5">
 			<span class="text-text text-xs lowercase tracking-wide">construct</span>
 		</div>
