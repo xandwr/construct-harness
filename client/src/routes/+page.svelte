@@ -2,66 +2,195 @@
 	import AppHeader from '$lib/AppHeader.svelte';
 	import { APPS } from '$lib/apps';
 	import { page } from '$app/state';
+	import { sendChat, getEvents, ApiError, type ChatEvent, type WireEvent } from '$lib/api';
 
 	const app = APPS.find((a) => a.id === 'chat')!;
 
-	// chat shows the live session by default, but the conversations applet links
-	// here with ?session=<id> to replay a past one. When that param is present we
-	// render that session read-only (composer disabled) with a way back to live.
-	// Wiring later swaps the placeholder for GET /api/events?session=<id>.
+	// A rendered transcript line. `tool` carries a one-line note of tool activity
+	// shown under the agent's text; `pending` marks the reply still streaming.
+	interface Line {
+		role: 'user' | 'agent';
+		text: string;
+		tool?: string;
+		pending?: boolean;
+	}
+
+	// When ?session=<id> is present the conversations applet linked here to replay
+	// a past conversation read-only (composer disabled). Otherwise this is the live
+	// session: the composer is enabled and replies stream in.
 	const viewing = $derived(page.url.searchParams.get('session'));
 
-	// Placeholder transcript. Replaced by the live SSE stream once chat is wired.
-	// When viewing a past session it stands in for that session's replayed events.
-	const messages = [
-		{ role: 'user', text: 'what did I tell you about deploys?' },
-		{
-			role: 'agent',
-			text: 'You deploy on Fridays. You prefer short answers.',
-			tool: 'recall deploys → 2'
+	let messages = $state<Line[]>([]);
+	let draft = $state('');
+	let sending = $state(false);
+	let error = $state<string | null>(null);
+	let footer = $state<string | null>(null);
+
+	// Reload the transcript whenever the ?session param changes: replay that
+	// session's events when viewing one, else start the live view empty (a fresh
+	// turn appends to it). Reruns because it reads `viewing`, a $derived.
+	$effect(() => {
+		const id = viewing;
+		error = null;
+		footer = null;
+		if (!id) {
+			messages = [];
+			return;
 		}
-	];
+		loadReplay(id);
+	});
+
+	async function loadReplay(id: string) {
+		try {
+			const res = await getEvents(id);
+			messages = replayLines(res.events);
+		} catch (e) {
+			error = e instanceof ApiError ? e.message : 'failed to load conversation';
+			messages = [];
+		}
+	}
+
+	// Fold a session's raw event log into transcript lines: user and agent
+	// messages become lines; tool_call events annotate the agent line that
+	// follows. This mirrors how the live stream builds the same shape.
+	function replayLines(events: WireEvent[]): Line[] {
+		const lines: Line[] = [];
+		let pendingTool: string | undefined;
+		for (const e of events) {
+			if (e.kind === 'message' && e.role === 'user') {
+				lines.push({ role: 'user', text: e.content });
+			} else if (e.kind === 'message' && e.role === 'agent') {
+				lines.push({ role: 'agent', text: e.content, tool: pendingTool });
+				pendingTool = undefined;
+			} else if (e.kind === 'tool_call') {
+				// Stack multiple tool calls in one turn onto a single note.
+				pendingTool = pendingTool ? `${pendingTool}, ${e.content}` : e.content;
+			}
+		}
+		return lines;
+	}
+
+	async function submit(event: SubmitEvent) {
+		event.preventDefault();
+		const text = draft.trim();
+		if (!text || sending || viewing) return;
+
+		draft = '';
+		error = null;
+		footer = null;
+		sending = true;
+		messages.push({ role: 'user', text });
+
+		// The agent line we stream into. Text deltas append to `.text`; tool
+		// activity accumulates onto `.tool`.
+		const reply: Line = { role: 'agent', text: '', pending: true };
+		messages.push(reply);
+
+		try {
+			await sendChat(text, (e: ChatEvent) => onChatEvent(e, reply));
+		} catch (e) {
+			reply.pending = false;
+			error = e instanceof ApiError ? e.message : 'the request failed';
+			if (!reply.text) reply.text = `[${error}]`;
+		} finally {
+			reply.pending = false;
+			sending = false;
+		}
+	}
+
+	function onChatEvent(e: ChatEvent, reply: Line) {
+		switch (e.kind) {
+			case 'text':
+				reply.text += e.text;
+				break;
+			case 'tool': {
+				// Note each tool as it starts; mark a failure on its end.
+				if (e.phase === 'start') {
+					const note = `${e.name}`;
+					reply.tool = reply.tool ? `${reply.tool}, ${note}` : note;
+				} else if (e.isError) {
+					reply.tool = reply.tool ? `${reply.tool} (errored)` : `${e.name} (errored)`;
+				}
+				break;
+			}
+			case 'compacted':
+				reply.tool = reply.tool ? `${reply.tool}, compacted` : 'compacted';
+				break;
+			case 'done':
+				reply.pending = false;
+				footer =
+					`${e.modelTurns} turn(s) · ${e.usage.inputTokens} in / ${e.usage.outputTokens} out` +
+					(e.compactions ? ` · ${e.compactions} compaction(s)` : '') +
+					(e.stoppedAtMaxTurns ? ' · cut off' : '');
+				break;
+			case 'error':
+				reply.pending = false;
+				error = `${e.errorKind}: ${e.message}`;
+				if (!reply.text) reply.text = `[${error}]`;
+				break;
+			case 'open':
+				// Session id is available here if we want to deep-link the live
+				// turn later; nothing to render for it now.
+				break;
+		}
+	}
 </script>
 
 <AppHeader title={app.title} icon={app.icon}>
 	{#if viewing}
 		<span class="text-faint text-[10px] lowercase">{viewing}</span>
 		<a href="/" class="text-muted hover:text-text text-[10px] lowercase underline">live</a>
+	{:else if sending}
+		<span class="text-glow text-[10px] lowercase">…</span>
 	{:else}
-		<span class="text-faint text-[10px] lowercase">not wired</span>
+		<span class="text-faint text-[10px] lowercase">live</span>
 	{/if}
 </AppHeader>
 
 <div class="flex min-h-0 flex-1 flex-col">
 	<!-- Transcript -->
 	<div class="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4">
+		{#if messages.length === 0 && !error}
+			<div class="text-faint text-xs lowercase">
+				{viewing ? 'no messages in this conversation' : 'say something to begin'}
+			</div>
+		{/if}
 		{#each messages as m, i (i)}
 			<div class="flex gap-2">
 				<span class="text-faint w-12 shrink-0 text-[10px] lowercase">{m.role}</span>
 				<div class="min-w-0 flex-1">
-					<span class="text-text text-xs leading-relaxed">{m.text}</span>
+					<span class="text-text text-xs leading-relaxed whitespace-pre-wrap"
+						>{m.text}{#if m.pending}<span class="text-glow">▍</span>{/if}</span
+					>
 					{#if m.tool}
 						<div class="text-faint mt-1 text-[10px]">{m.tool}</div>
 					{/if}
 				</div>
 			</div>
 		{/each}
+		{#if error}
+			<div class="text-faint text-[10px]">{error}</div>
+		{/if}
+		{#if footer}
+			<div class="text-faint text-[10px]">{footer}</div>
+		{/if}
 	</div>
 
-	<!-- Composer (disabled until wiring) -->
-	<form class="border-t border-border px-4 py-3" onsubmit={(e) => e.preventDefault()}>
+	<!-- Composer: disabled while replaying a past conversation. -->
+	<form class="border-t border-border px-4 py-3" onsubmit={submit}>
 		<div class="flex items-stretch gap-2">
 			<input
-				disabled
+				bind:value={draft}
+				disabled={!!viewing || sending}
 				placeholder={viewing ? 'viewing a past conversation' : 'say something'}
 				class="placeholder:text-faint flex-1 border border-border bg-surface px-3 py-2 text-xs text-text outline-none focus:border-glow disabled:opacity-50"
 			/>
 			<button
 				type="submit"
-				disabled
+				disabled={!!viewing || sending || draft.trim() === ''}
 				class="border border-border bg-surface px-4 py-2 text-xs lowercase text-muted disabled:opacity-50"
 			>
-				send
+				{sending ? '…' : 'send'}
 			</button>
 		</div>
 	</form>

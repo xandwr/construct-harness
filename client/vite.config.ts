@@ -18,5 +18,18 @@ export default defineConfig({
 			adapter: adapter()
 		}),
 		tailwindcss(),
-	]
+	],
+	server: {
+		// Proxy the API to the standalone harness server (npm run serve, port
+		// 8787 by default) so the client calls `/api/*` same-origin: no CORS in
+		// dev, and the frontend never hardcodes the backend's host. SSE works
+		// through the proxy as a plain unbuffered HTTP pipe. Override the target
+		// with VITE_API_TARGET if the server runs elsewhere.
+		proxy: {
+			'/api': {
+				target: process.env.VITE_API_TARGET ?? 'http://localhost:8787',
+				changeOrigin: true
+			}
+		}
+	}
 });
