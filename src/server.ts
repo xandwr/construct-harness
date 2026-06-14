@@ -35,11 +35,17 @@ import { EventStore, type Event } from "./events.ts";
 import { OpenAIEmbedder, EmbeddingError, type Embedder } from "./embeddings.ts";
 import { Session } from "./session.ts";
 import type { LoopEvent } from "./bridge/loop.ts";
+import { NotesStore, Note, NoteError, type NoteFrontmatter } from "./notes.ts";
+import { NotesService } from "./notesService.ts";
+import { noteTools } from "./noteTools.ts";
 
 const BASE_SYSTEM =
     "You are a helpful, concise assistant: a long-lived Construct that remembers " +
     "across conversations. Save durable facts and preferences with memory_save, and " +
-    "recall them with memory_recall. Don't save transient chatter.";
+    "recall them with memory_recall. Don't save transient chatter. For longer-form " +
+    "documentation the human also edits (runbooks, references, design notes), use the " +
+    "knowledge base: note_save / note_update to write, note_recall to read it when " +
+    "relevant, note_link to relate a note to a memory or another note.";
 
 /** Compaction threshold (estimated tokens), well below the model's real window
  *  so there's headroom for the next turn. Overridable via COMPACT_AT. */
@@ -49,13 +55,20 @@ const DEFAULT_COMPACT_AT = 120_000;
 const DEFAULT_PAGE = 100;
 
 /** What the server holds for its lifetime: the stores it reads, the one live
- *  Session it drives, and a close() that releases the database handles. */
+ *  Session it drives, the knowledge-base service, and a close() that releases the
+ *  database handles. `notes` is optional so the server still runs without a KB
+ *  (the routes 503 cleanly), but the default wiring always provides one. */
 interface ServerDeps {
     store: MemoryStore;
     events: EventStore;
     session: Session;
+    notes?: NotesService;
+    notesStore?: NotesStore;
     close(): void;
 }
+
+/** Where the knowledge-base markdown folder lives, mirroring MEMORY_DB. */
+const DEFAULT_KB_DIR = "kb";
 
 /**
  * Construct the cloud embedder when an OpenAI key is configured, else undefined
@@ -97,25 +110,51 @@ function buildDeps(): ServerDeps {
     const embedder = makeEmbedder();
     const compactAt = Number(process.env.COMPACT_AT) || DEFAULT_COMPACT_AT;
 
+    // The knowledge base shares the same database file (one schema, one migration
+    // runner) and a markdown folder on disk. The NotesService starts its watcher
+    // asynchronously: an initial scan adopts any files created while the process
+    // was down, then live two-way sync begins. A failure to start the watcher is
+    // logged but non-fatal: the in-app KB still works over the API.
+    const kbDir = process.env.KB_DIR ?? DEFAULT_KB_DIR;
+    const notesStore = new NotesStore(dbPath);
+    const notes = new NotesService({ store: notesStore, root: kbDir, embedder });
+
     const session = new Session({
         client,
         system: BASE_SYSTEM,
         store,
         events,
         embedder,
+        // The agent opts into the KB: it gets the note tools (save/update/recall/
+        // link) but notes are not auto-injected into context the way memories are.
+        tools: noteTools(notes, notesStore, embedder),
         compaction: { thresholdTokens: compactAt },
         providerOptions: { cacheSystem: true },
     });
+
+    notes
+        .start()
+        .then(() => console.log(`  knowledge base watching: ${notes.kbRoot}`))
+        .catch((err) =>
+            console.warn(
+                `knowledge-base sync disabled: ${err instanceof Error ? err.message : String(err)}`,
+            ),
+        );
 
     return {
         store,
         events,
         session,
+        notes,
+        notesStore,
         close() {
-            // Close the events handle first, then memory: both point at the same
-            // file, and closing checkpoints the WAL, so order only affects which
-            // one truncates it. Either order is correct; this is deterministic.
+            // Stop the watcher first so no inbound event races the store closing.
+            notes.close();
+            // Close the handles. All point at the same file; closing checkpoints
+            // the WAL, so order only affects which one truncates it. Either order
+            // is correct; this is deterministic.
             events.close();
+            notesStore.close();
             store.close();
         },
     };
@@ -153,7 +192,7 @@ function statusForKind(kind: ErrorKind): number {
  *  protect with a strict origin allow-list. */
 function cors(res: ServerResponse): void {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
@@ -197,6 +236,33 @@ function eventToJson(e: Event) {
         meta: e.meta ?? null,
         session: e.session ?? null,
         correlation: e.correlation ?? null,
+    };
+}
+
+/** Serialize a note for the list wire shape (no body, for a compact list). */
+function noteToSummaryJson(n: Note) {
+    return {
+        id: n.id,
+        uuid: n.uuid,
+        path: n.path,
+        title: n.title,
+        frontmatter: n.frontmatter,
+        created: n.created,
+        updated: n.updated,
+    };
+}
+
+/** Serialize a note for the detail wire shape (with body and its links). */
+function noteToDetailJson(notesStore: NotesStore, n: Note) {
+    return {
+        ...noteToSummaryJson(n),
+        content: n.content,
+        links: notesStore.linksFrom(n.id).map((l) => ({
+            id: l.id,
+            toMemory: l.toMemory,
+            toNote: l.toNote,
+            kind: l.kind,
+        })),
     };
 }
 
@@ -335,6 +401,175 @@ async function streamChat(session: Session, text: string, res: ServerResponse): 
     }
 }
 
+// ── Knowledge-base routes ────────────────────────────────────────────────────
+
+/** Read a request body and parse it as a JSON object, or return null on any
+ *  failure (the caller then 400s). Bounded by {@link readBody}. */
+async function readJsonObject(req: IncomingMessage): Promise<Record<string, unknown> | null> {
+    try {
+        const body = await readBody(req);
+        const parsed: unknown = JSON.parse(body || "{}");
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+        return parsed as Record<string, unknown>;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Handle every `/api/notes` and `/api/notes/:uuid` request: the KB's read and
+ * write surface. All mutations go through {@link NotesService}, so a write here
+ * and a file saved in an editor converge to the same row (the unified write
+ * path). Translates {@link NoteError} (bad input, a path/uuid clash) to a 400 so
+ * the client gets a real message rather than an opaque 500.
+ *
+ *  - GET    /api/notes            list (optional `q` search, `prefix` folder)
+ *  - GET    /api/notes/:uuid      one note with body + links
+ *  - POST   /api/notes            create { title, content, path?, frontmatter? }
+ *  - PUT    /api/notes/:uuid      update { title?, content?, path?, frontmatter? }
+ *  - DELETE /api/notes/:uuid      delete
+ */
+async function handleNotes(
+    req: IncomingMessage,
+    res: ServerResponse,
+    deps: ServerDeps,
+    url: URL,
+    path: string,
+): Promise<void> {
+    const { notes, notesStore } = deps;
+    if (!notes || !notesStore) {
+        sendJson(res, 503, { error: "knowledge base is not configured" });
+        return;
+    }
+
+    // The collection endpoint: list (GET) and create (POST).
+    if (path === "/api/notes") {
+        if (req.method === "GET") {
+            const limit = clampPage(url.searchParams.get("limit"), DEFAULT_PAGE, 1000);
+            const q = url.searchParams.get("q");
+            const prefix = url.searchParams.get("prefix") ?? undefined;
+            const rows = (
+                q
+                    ? notesStore.search(q, { limit, pathPrefix: prefix })
+                    : notesStore.all({ limit, pathPrefix: prefix })
+            ).map(noteToSummaryJson);
+            sendJson(res, 200, { notes: rows, total: notesStore.count() });
+            return;
+        }
+        if (req.method === "POST") {
+            const body = await readJsonObject(req);
+            if (!body) {
+                sendJson(res, 400, { error: "invalid JSON body" });
+                return;
+            }
+            if (typeof body.title !== "string" || body.title.trim() === "") {
+                sendJson(res, 400, { error: "title must be a non-empty string" });
+                return;
+            }
+            try {
+                const result = await notes.create({
+                    title: body.title,
+                    content: typeof body.content === "string" ? body.content : "",
+                    path: typeof body.path === "string" ? body.path : undefined,
+                    frontmatter: asFrontmatter(body.frontmatter),
+                });
+                sendJson(res, 201, { note: noteToDetailJson(notesStore, result.note) });
+            } catch (err) {
+                sendNoteError(res, err);
+            }
+            return;
+        }
+        sendJson(res, 405, { error: `method ${req.method} not allowed on /api/notes` });
+        return;
+    }
+
+    // The item endpoint: /api/notes/:uuid (read, update, delete).
+    const uuid = decodeURIComponent(path.slice("/api/notes/".length));
+    if (uuid === "" || uuid.includes("/")) {
+        sendJson(res, 404, { error: "note not found" });
+        return;
+    }
+    const existing = notesStore.getByUuid(uuid);
+
+    if (req.method === "GET") {
+        if (!existing) {
+            sendJson(res, 404, { error: "note not found" });
+            return;
+        }
+        sendJson(res, 200, { note: noteToDetailJson(notesStore, existing) });
+        return;
+    }
+
+    if (req.method === "PUT") {
+        if (!existing) {
+            sendJson(res, 404, { error: "note not found" });
+            return;
+        }
+        const body = await readJsonObject(req);
+        if (!body) {
+            sendJson(res, 400, { error: "invalid JSON body" });
+            return;
+        }
+        // Build a patch from only the provided fields, so an omitted field is left
+        // untouched rather than cleared.
+        const patch: Parameters<NotesService["update"]>[1] = {};
+        if (typeof body.title === "string") patch.title = body.title;
+        if (typeof body.content === "string") patch.content = body.content;
+        if (typeof body.path === "string") patch.path = body.path;
+        if ("frontmatter" in body) patch.frontmatter = asFrontmatter(body.frontmatter);
+        try {
+            const result = await notes.update(existing.id, patch);
+            if (!result) {
+                sendJson(res, 404, { error: "note not found" });
+                return;
+            }
+            sendJson(res, 200, { note: noteToDetailJson(notesStore, result.note) });
+        } catch (err) {
+            sendNoteError(res, err);
+        }
+        return;
+    }
+
+    if (req.method === "DELETE") {
+        if (!existing) {
+            sendJson(res, 404, { error: "note not found" });
+            return;
+        }
+        const removed = await notes.remove(existing.id);
+        sendJson(res, 200, { deleted: removed });
+        return;
+    }
+
+    sendJson(res, 405, { error: `method ${req.method} not allowed on ${path}` });
+}
+
+/** Coerce an unknown request field into a frontmatter map, dropping any value
+ *  that isn't a supported scalar or string array (the store re-validates too). */
+function asFrontmatter(value: unknown): NoteFrontmatter {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+    const out: NoteFrontmatter = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+        if (v === null || typeof v === "string" || typeof v === "boolean") {
+            out[k] = v;
+        } else if (typeof v === "number" && Number.isFinite(v)) {
+            out[k] = v;
+        } else if (Array.isArray(v) && v.every((x) => typeof x === "string")) {
+            out[k] = v as string[];
+        }
+    }
+    return out;
+}
+
+/** Map a NoteError to a 400 (bad input / clash); anything else to a 500. */
+function sendNoteError(res: ServerResponse, err: unknown): void {
+    if (err instanceof NoteError) {
+        sendJson(res, 400, { error: err.message });
+        return;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    sendJson(res, 500, { error: message });
+}
+
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /** Build the request handler over a set of deps. Pure routing: it owns no
@@ -405,6 +640,14 @@ export function createHandler(deps: ServerDeps) {
                 const kind = url.searchParams.get("kind") ?? undefined;
                 const rows = deps.events.recent({ limit, kind }).map(eventToJson);
                 sendJson(res, 200, { events: rows, total: deps.events.count() });
+                return;
+            }
+
+            // Knowledge-base routes: list/read are GETs; create/update/delete are
+            // the harness's first write endpoints, all funneling through the one
+            // NotesService write path so a UI write and a file save converge.
+            if (path === "/api/notes" || path.startsWith("/api/notes/")) {
+                await handleNotes(req, res, deps, url, path);
                 return;
             }
 

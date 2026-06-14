@@ -6,6 +6,10 @@
 *.sqlite-wal
 *.sqlite-shm
 
+# local knowledge-base markdown folder (the two-way-synced KB; the db is the
+# source of truth, these files are a working copy openable in an editor)
+/kb/
+
 # secrets
 .env
 .env.*

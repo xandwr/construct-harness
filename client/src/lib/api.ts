@@ -45,6 +45,31 @@ export interface WireMemory {
     updated: number;
 }
 
+/** A knowledge-base note in the list (summary) shape: no body. */
+export interface WireNoteSummary {
+    id: number;
+    uuid: string;
+    path: string;
+    title: string;
+    frontmatter: Record<string, string | number | boolean | null | string[]>;
+    created: number;
+    updated: number;
+}
+
+/** One relation a note holds (note -> memory or note -> note). */
+export interface WireNoteLink {
+    id: number;
+    toMemory: number | null;
+    toNote: number | null;
+    kind: string | null;
+}
+
+/** A note in the detail shape: summary fields plus body and links. */
+export interface WireNote extends WireNoteSummary {
+    content: string;
+    links: WireNoteLink[];
+}
+
 /** Thrown when a JSON read fails; carries the HTTP status so a caller can tell
  *  a 401 (no/invalid API key on the server) from a 502 (upstream blip). */
 export class ApiError extends Error {
@@ -97,6 +122,79 @@ export function getMemories(
 /** The raw event log, newest first. */
 export function getLog(fetchFn?: typeof fetch): Promise<{ events: WireEvent[]; total: number }> {
     return getJson("/api/log", fetchFn);
+}
+
+/** Run a JSON write (POST/PUT/DELETE), throwing {@link ApiError} on a non-2xx so
+ *  callers can surface the server's message (a 400 path clash, a 404, ...). */
+async function writeJson<T>(
+    method: "POST" | "PUT" | "DELETE",
+    path: string,
+    body?: unknown,
+    fetchFn: typeof fetch = fetch,
+): Promise<T> {
+    const res = await fetchFn(path, {
+        method,
+        headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new ApiError(
+            (errBody as { error?: string }).error ?? `request failed (${res.status})`,
+            res.status,
+        );
+    }
+    return res.json() as Promise<T>;
+}
+
+/** The knowledge-base note list (summary shape), newest first. Optional `q`
+ *  full-text search and `prefix` folder filter. */
+export function getNotes(
+    opts: { q?: string; prefix?: string } = {},
+    fetchFn?: typeof fetch,
+): Promise<{ notes: WireNoteSummary[]; total: number }> {
+    const params = new URLSearchParams();
+    if (opts.q) params.set("q", opts.q);
+    if (opts.prefix) params.set("prefix", opts.prefix);
+    const qs = params.toString();
+    return getJson(`/api/notes${qs ? `?${qs}` : ""}`, fetchFn);
+}
+
+/** One note with its body and links. */
+export function getNote(uuid: string, fetchFn?: typeof fetch): Promise<{ note: WireNote }> {
+    return getJson(`/api/notes/${encodeURIComponent(uuid)}`, fetchFn);
+}
+
+/** Create a note. Returns the created note (detail shape). */
+export function createNote(
+    input: {
+        title: string;
+        content: string;
+        path?: string;
+        frontmatter?: WireNoteSummary["frontmatter"];
+    },
+    fetchFn?: typeof fetch,
+): Promise<{ note: WireNote }> {
+    return writeJson("POST", "/api/notes", input, fetchFn);
+}
+
+/** Update a note by uuid. Only the provided fields change. */
+export function updateNote(
+    uuid: string,
+    patch: {
+        title?: string;
+        content?: string;
+        path?: string;
+        frontmatter?: WireNoteSummary["frontmatter"];
+    },
+    fetchFn?: typeof fetch,
+): Promise<{ note: WireNote }> {
+    return writeJson("PUT", `/api/notes/${encodeURIComponent(uuid)}`, patch, fetchFn);
+}
+
+/** Delete a note by uuid. */
+export function deleteNote(uuid: string, fetchFn?: typeof fetch): Promise<{ deleted: boolean }> {
+    return writeJson("DELETE", `/api/notes/${encodeURIComponent(uuid)}`, undefined, fetchFn);
 }
 
 /** The events the chat SSE stream delivers, in the same `kind` vocabulary the

@@ -30,6 +30,15 @@ export * from "./embeddings.ts";
 export * from "./events.ts";
 export * from "./memoryTools.ts";
 
+// The knowledge base: a markdown frontmatter (de)serializer, the notes store
+// (a separate corpus linked to memory), the two-way file sync engine, and the
+// agent tools that read/write notes.
+export * from "./frontmatter.ts";
+export * from "./notes.ts";
+export * from "./notesFile.ts";
+export * from "./notesService.ts";
+export * from "./noteTools.ts";
+
 // Context engineering: passive context, compaction, usage accounting.
 export * from "./context.ts";
 export * from "./compaction.ts";

@@ -307,6 +307,134 @@ const MIGRATIONS: ReadonlyArray<{ name: string; up: (db: DatabaseSync) => void }
             `);
         },
     },
+    {
+        // The knowledge-base `notes` table: human-and-agent-editable markdown,
+        // a separate corpus from `memory` (see NotesStore in notes.ts). It lives
+        // in the SAME database file and under the SAME user_version as `memory`
+        // and `events`, so it ships as a migration in this one authoritative
+        // array rather than a second runner.
+        //
+        // The two columns that make two-way file sync tractable, and that the
+        // memory machinery does NOT have, are:
+        //  - `uuid`: a stable join key written into each file's frontmatter, so a
+        //    note's identity survives a rename/move in either direction (the path
+        //    can change; the uuid never does).
+        //  - `path`: the note's relative location inside the KB folder; the
+        //    "folder structure" is just this column, not a separate index.
+        //  - `content_hash`: a hash of the synced content, the basis of conflict
+        //    detection (cheaper and more reliable than timestamp comparison).
+        // `frontmatter` keeps any human-added keys we don't model as columns, so
+        // a person can add arbitrary metadata without a schema change.
+        name: "create notes table with fts and vector indices",
+        up(db) {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS notes (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uuid         TEXT NOT NULL UNIQUE,
+                    path         TEXT NOT NULL UNIQUE,
+                    title        TEXT NOT NULL,
+                    content      TEXT NOT NULL,
+                    frontmatter  TEXT,
+                    content_hash TEXT NOT NULL,
+                    created      INTEGER NOT NULL,
+                    updated      INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes (updated DESC);
+                CREATE INDEX IF NOT EXISTS idx_notes_path ON notes (path);
+
+                -- External-content FTS5 over content (same pattern as memory_fts):
+                -- the porter stemmer folds morphological variants so recall is
+                -- robust to exact wording. Title is indexed alongside content so a
+                -- query matching only the title still surfaces the note.
+                CREATE VIRTUAL TABLE notes_fts USING fts5(
+                    title,
+                    content,
+                    content='notes',
+                    content_rowid='id',
+                    tokenize='porter'
+                );
+
+                CREATE TRIGGER notes_ai AFTER INSERT ON notes BEGIN
+                    INSERT INTO notes_fts (rowid, title, content)
+                        VALUES (new.id, new.title, new.content);
+                END;
+                CREATE TRIGGER notes_ad AFTER DELETE ON notes BEGIN
+                    INSERT INTO notes_fts (notes_fts, rowid, title, content)
+                        VALUES ('delete', old.id, old.title, old.content);
+                END;
+                CREATE TRIGGER notes_au AFTER UPDATE ON notes BEGIN
+                    INSERT INTO notes_fts (notes_fts, rowid, title, content)
+                        VALUES ('delete', old.id, old.title, old.content);
+                    INSERT INTO notes_fts (rowid, title, content)
+                        VALUES (new.id, new.title, new.content);
+                END;
+
+                -- Selective vector index (same pattern as memory_vec): vectors are
+                -- written by the application (an embed is a network call), never by
+                -- an insert trigger. We trigger on DELETE and on content UPDATE so a
+                -- deleted note's vector goes with it and an edited note's stale
+                -- vector is dropped for re-embed.
+                CREATE TABLE IF NOT EXISTS notes_vec (
+                    rowid INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
+                    dim   INTEGER NOT NULL,
+                    vec   BLOB NOT NULL
+                );
+
+                CREATE TRIGGER notes_vec_ad AFTER DELETE ON notes BEGIN
+                    DELETE FROM notes_vec WHERE rowid = old.id;
+                END;
+
+                CREATE TRIGGER notes_vec_au AFTER UPDATE OF content ON notes
+                    WHEN new.content <> old.content
+                BEGIN
+                    DELETE FROM notes_vec WHERE rowid = old.id;
+                END;
+            `);
+        },
+    },
+    {
+        // The "linked" half of "separate store, linked": explicit relations from
+        // a note to the memories and other notes it references. This is
+        // deliberately NOT an Obsidian-style backlink graph: it stores the edges
+        // a caller asserts, and the reverse lookup is a single indexed query, not
+        // a transitive graph computation.
+        //
+        // A link points at a memory XOR a note when created (the store enforces
+        // exactly-one at insert time). The cascades match each side's lifetime:
+        // deleting the from-note drops its outgoing links; deleting a linked note
+        // drops links pointing at it; a linked memory going away nulls the pointer
+        // (a note's link should not vanish silently just because the memory it
+        // referenced was forgotten, the way memory_meta nulls a deleted event).
+        //
+        // The CHECK is therefore "AT MOST one target", not "exactly one": the
+        // exactly-one rule is an insert-time invariant the application owns, but a
+        // to_memory SET NULL legitimately leaves a memory-link with both columns
+        // null (the link survives, its target forgotten). A stricter "exactly one"
+        // CHECK would make that SET NULL violate the constraint and block the
+        // memory's deletion outright, which is the wrong failure.
+        name: "add note_links relation table",
+        up(db) {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS note_links (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    from_note INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+                    to_memory INTEGER REFERENCES memory(id) ON DELETE SET NULL,
+                    to_note   INTEGER REFERENCES notes(id) ON DELETE CASCADE,
+                    kind      TEXT,
+                    created   INTEGER NOT NULL,
+                    -- At most one target set: rules out a link pointing at both a
+                    -- memory and a note. (Exactly-one is enforced by the store at
+                    -- insert; SET NULL may later leave both null, which is allowed.)
+                    CHECK (NOT (to_memory IS NOT NULL AND to_note IS NOT NULL))
+                );
+                -- Forward lookup (a note's outgoing links) and reverse lookups (who
+                -- links to this memory / this note), each a single indexed scan.
+                CREATE INDEX IF NOT EXISTS idx_note_links_from ON note_links (from_note);
+                CREATE INDEX IF NOT EXISTS idx_note_links_to_memory ON note_links (to_memory);
+                CREATE INDEX IF NOT EXISTS idx_note_links_to_note ON note_links (to_note);
+            `);
+        },
+    },
 ];
 
 /** The schema version this build of the code expects. */
