@@ -752,6 +752,44 @@ function captured(json: unknown): string {
     return JSON.stringify(json);
 }
 
+// ── Context inspector ────────────────────────────────────────────────────────
+
+test("GET /api/context previews the default conversation's context", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    deps.store.save(new Memory({ content: "user prefers dark mode" }));
+    deps.goals.create({ content: "honor the house style" }); // shared goal
+
+    const { status, json } = await call(deps, getReq("/api/context?q=what%20theme"));
+    assert.equal(status, 200);
+    // The standing sections are assembled: base always, goals (shared), and the
+    // matching memory.
+    const names = json.sections.map((s: any) => s.name);
+    assert.ok(names.includes("base"));
+    assert.ok(names.includes("goals"));
+    assert.ok(json.totalTokens > 0);
+    deps.close();
+});
+
+test("GET /api/context is read-only: it does not reinforce memory or bring a session live", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const m = deps.store.save(new Memory({ content: "the launch is on Tuesday" }));
+    assert.equal(deps.store.get(m.id)!.lastSurfaced, undefined);
+
+    // Inspect a brand-new session id that isn't live in the pool.
+    const liveBefore = deps.sessions.ids().length;
+    const { status } = await call(deps, getReq("/api/context?session=ghost&q=when%20is%20launch"));
+    assert.equal(status, 200);
+
+    // peek resumed a transient session, but it was NOT added to the pool: the
+    // inspector must not silently bring a past conversation live (that's what
+    // sending a turn does).
+    assert.equal(deps.sessions.ids().length, liveBefore, "inspect brought a session live");
+    assert.ok(!deps.sessions.has("ghost"), "ghost session must not be pooled");
+    // And the surfaced memory was not reinforced.
+    assert.equal(deps.store.get(m.id)!.lastSurfaced, undefined, "inspect reinforced a memory");
+    deps.close();
+});
+
 // ── Server-tool resolution ──────────────────────────────────────────────────
 
 test("resolveServerTools defaults to live web access when unset", () => {

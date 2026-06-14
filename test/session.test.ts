@@ -19,7 +19,7 @@ import type { LoopEvent } from "../src/bridge/loop.ts";
 import type { TurnResult } from "../src/session.ts";
 import { RoleType } from "../src/types.ts";
 import type { ToolDef } from "../src/types.ts";
-import { MemoryStore } from "../src/memory.ts";
+import { MemoryStore, Memory } from "../src/memory.ts";
 import { EventStore } from "../src/events.ts";
 import { DREAM_EVENT_KIND } from "../src/dreaming.ts";
 import { GoalStore } from "../src/goals.ts";
@@ -1049,4 +1049,125 @@ test("a background embed resolving after the store closes does not throw", async
     release();
     // Must not reject despite writing to a closed store.
     await session.flushEmbeddings();
+});
+
+// ---------------------------------------------------------------------------
+// inspectContext: a read-only preview of the turn's context
+// ---------------------------------------------------------------------------
+
+test("inspectContext assembles base, memory, and goal sections with token estimates", async () => {
+    const store = new MemoryStore(":memory:");
+    const goals = new GoalStore(":memory:");
+    try {
+        store.save(new Memory({ content: "user's name is Ada" }));
+        goals.create({ content: "remember to greet warmly" }); // global/shared goal
+        const session = new Session({
+            client: new FakeClient([]),
+            system: "BASE-GUIDE",
+            store,
+            goals,
+        });
+
+        const preview = await session.inspectContext("what is my name");
+        const byName = Object.fromEntries(preview.sections.map((s) => [s.name, s]));
+
+        // Base guidance is always present.
+        assert.ok(byName.base, "base section present");
+        assert.match(byName.base.text, /BASE-GUIDE/);
+
+        // The matching memory surfaced, with its id attributed.
+        assert.ok(byName.memory, "memory section present");
+        assert.match(byName.memory.text, /Ada/);
+        assert.ok((byName.memory.memoryIds ?? []).length >= 1, "memory ids attributed");
+
+        // The shared goal stands in the goals section.
+        assert.ok(byName.goals, "goals section present");
+        assert.match(byName.goals.text, /greet warmly/);
+        assert.ok((byName.goals.goalIds ?? []).length >= 1, "goal ids attributed");
+
+        // Every section has a positive token estimate, and the total is their sum.
+        for (const s of preview.sections) assert.ok(s.tokens > 0, `${s.name} estimated`);
+        assert.equal(
+            preview.totalTokens,
+            preview.sections.reduce((n, s) => n + s.tokens, 0),
+        );
+    } finally {
+        store.close();
+        goals.close();
+    }
+});
+
+test("inspectContext does NOT reinforce the memories it surfaces", async () => {
+    const store = new MemoryStore(":memory:");
+    try {
+        const m = store.save(new Memory({ content: "deploys go out on Fridays" }));
+        // Baseline: a fresh memory has never surfaced.
+        assert.equal(store.get(m.id)!.lastSurfaced, undefined);
+        const strengthBefore = store.get(m.id)!.strength;
+
+        const session = new Session({ client: new FakeClient([]), system: "S", store });
+        // Inspect twice against a query that surfaces the memory.
+        await session.inspectContext("when do deploys go out");
+        await session.inspectContext("when do deploys go out");
+
+        const after = store.get(m.id)!;
+        // The load-bearing property: inspecting recalled the memory but did NOT
+        // reinforce it — strength and the surfacing stamp are untouched. (A real
+        // send() would have bumped strength and stamped lastSurfaced.)
+        assert.equal(after.lastSurfaced, undefined, "inspect must not stamp a surfacing");
+        assert.equal(after.strength, strengthBefore, "inspect must not strengthen");
+    } finally {
+        store.close();
+    }
+});
+
+test("inspectContext appends no events and does not touch goals", async () => {
+    const events = new EventStore(":memory:");
+    const goals = new GoalStore(":memory:");
+    try {
+        const g = goals.create({ content: "a standing goal" });
+        const goalUpdatedBefore = goals.get(g.id)!.updated;
+        const session = new Session({
+            client: new FakeClient([]),
+            system: "S",
+            events,
+            goals,
+        });
+        const eventsBefore = events.count();
+
+        await session.inspectContext("anything at all");
+
+        // No event was logged by the preview (a real send appends user/assistant
+        // turns and tool events).
+        assert.equal(events.count(), eventsBefore, "inspect appended events");
+        // The goal row is byte-for-byte unchanged (no status flip, no updated bump).
+        assert.equal(goals.get(g.id)!.updated, goalUpdatedBefore, "inspect mutated a goal");
+    } finally {
+        events.close();
+        goals.close();
+    }
+});
+
+test("inspectContext renders the working mind without ticking it", async () => {
+    // Drive a real turn first so the working mind holds some train-of-thought,
+    // then inspect twice and confirm the rendered mind doesn't change between
+    // inspections (ticking would age it).
+    const events = new EventStore(":memory:");
+    try {
+        const session = new Session({
+            client: new FakeClient([textTurn("the answer is 42, and here is why it matters")]),
+            system: "S",
+            events,
+        });
+        await send(session, "explain the answer");
+
+        const first = await session.inspectContext("follow up");
+        const second = await session.inspectContext("follow up");
+        const mindOf = (p: Awaited<ReturnType<Session["inspectContext"]>>) =>
+            p.sections.find((s) => s.name === "workingMind")?.text ?? "";
+        // Identical across two inspections: no tick aged the mind between them.
+        assert.equal(mindOf(first), mindOf(second), "inspect aged the working mind");
+    } finally {
+        events.close();
+    }
 });

@@ -34,6 +34,7 @@ export const APPS: AppDef[] = [
     { id: "kb", title: "knowledge base", href: "/kb", icon: "knowledge-base" },
     { id: "log", title: "event log", href: "/log", icon: "event-log" },
     { id: "dreams", title: "dreams", href: "/dreams", icon: "dreams" },
+    { id: "context", title: "context", href: "/context", icon: "context" },
     { id: "settings", title: "settings", href: "/settings", icon: "settings" },
 ];
 

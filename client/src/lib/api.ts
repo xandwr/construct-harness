@@ -234,6 +234,43 @@ export function getStatus(fetchFn?: typeof fetch): Promise<WireStatus> {
     return getJson("/api/status", fetchFn);
 }
 
+/** One ingredient of a context preview: a named slice of what the next turn would
+ *  see, with its text, a token estimate, and any source ids behind it. */
+export interface WireContextSection {
+    name: string;
+    text: string;
+    tokens: number;
+    memoryIds?: number[];
+    goalIds?: number[];
+    dreamId?: number;
+}
+
+/** A read-only preview of the context a turn would be built from, as
+ *  `/api/context` returns it. Producing it mutates nothing on the server. */
+export interface WireContext {
+    query: string;
+    session: string;
+    sections: WireContextSection[];
+    totalTokens: number;
+}
+
+/**
+ * Preview the context a turn would be built from, for the inspector. `session`
+ * targets a conversation (omit for the default); `q` is the draft to recall
+ * against. Read-only on the server: it does not reinforce memory, tick the
+ * working mind, or append events, so it's safe to call per keystroke.
+ */
+export function getContext(
+    opts: { session?: string; q?: string } = {},
+    fetchFn?: typeof fetch,
+): Promise<WireContext> {
+    const params = new URLSearchParams();
+    if (opts.session) params.set("session", opts.session);
+    if (opts.q) params.set("q", opts.q);
+    const qs = params.toString();
+    return getJson(`/api/context${qs ? `?${qs}` : ""}`, fetchFn);
+}
+
 /** The accumulated dreams, newest first: each a disposable persona's choice on a
  *  scenario drawn from the corpus. The dreams applet renders this directly. */
 export function getDreams(fetchFn?: typeof fetch): Promise<{ dreams: WireDream[]; total: number }> {

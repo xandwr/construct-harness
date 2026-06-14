@@ -18,7 +18,8 @@ import { runLoopStream } from "./bridge/loop.ts";
 import type { CompactionConfig, LoopEvent } from "./bridge/loop.ts";
 import type { ModelClient, ProviderOptions } from "./bridge/types.ts";
 import type { ContextProvider } from "./context.ts";
-import { temporalContext } from "./context.ts";
+import { temporalContext, applyContext } from "./context.ts";
+import { estimateTextTokens } from "./usage.ts";
 import { WorkingMind, workingMindContext } from "./workingMind.ts";
 import type { WorkingMindOptions } from "./workingMind.ts";
 import { MemoryStore, MAX_LIMIT } from "./memory.ts";
@@ -148,6 +149,52 @@ export interface TurnResult {
     compactions: number;
     /** Cumulative token usage for this turn's run. */
     usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number };
+}
+
+/** One section of a {@link ContextInspection}: a named slice of what the next
+ *  turn would see, with its text, a crude token estimate, and any structured ids
+ *  the section carries (the memory/goal/dream rows behind it), so a reader can
+ *  trace a line back to its source. */
+export interface ContextSection {
+    /** A stable name for the ingredient: "base", "memory", "goals", "dream",
+     *  "temporal", "workingMind", … */
+    name: string;
+    /** The text this section would contribute to the turn (system channel). */
+    text: string;
+    /** Crude token estimate for {@link text}, by the same heuristic the
+     *  compaction gate uses. Approximate, not a tokenizer. */
+    tokens: number;
+    /** Memory store ids that surfaced in this section (the "memory" section). */
+    memoryIds?: number[];
+    /** Goal ids standing in this section (the "goals" section). */
+    goalIds?: number[];
+    /** Dream event id pushed in this section (the "dream" section). */
+    dreamId?: number;
+}
+
+/**
+ * A read-only preview of the context a turn would be built from, without sending
+ * anything to the model and without the side effects a real turn has. Returned by
+ * {@link Session.inspectContext}.
+ *
+ * The load-bearing property: producing this must NOT mutate state. A real
+ * {@link Session.send} reinforces every memory that surfaced (a durable strength
+ * write), warms the working mind, logs events, and embeds the message. The
+ * inspection deliberately does none of that — it recalls memory read-only, runs
+ * the passive providers (all read-only), and renders the working mind without
+ * ticking it. So a UI can poll "what does the Construct see for this draft?"
+ * freely, the same way {@link handleStatus} can be polled.
+ */
+export interface ContextInspection {
+    /** The draft/query the recall was computed against. */
+    query: string;
+    /** The session this preview was built for. */
+    session: string;
+    /** Every ingredient, in the order it folds into the turn. */
+    sections: ContextSection[];
+    /** Sum of the per-section token estimates: a rough size for the whole
+     *  injected context (system prefix), not the full request. */
+    totalTokens: number;
 }
 
 /**
@@ -318,6 +365,102 @@ export class Session {
         // `recent` is newest-first; reverse to natural reading order so the
         // transcript reads top-to-bottom like the conversation it records.
         return this.events.recent({ session: this.sessionId, limit }).reverse();
+    }
+
+    /**
+     * Preview the context a turn would be built from for `query`, WITHOUT calling
+     * the model and WITHOUT the side effects a real {@link send} has. The
+     * diagnostic behind the context inspector.
+     *
+     * It assembles the same ingredients {@link buildSystem} and the loop's
+     * passive-context pass would (base guidance, recalled memory, the standing
+     * goal/dream/temporal/working-mind injections), broken out per section with a
+     * token estimate and the source ids behind each, but it is strictly read-only:
+     *
+     *  - memory recall goes through {@link recallContextDetailed} and the
+     *    reinforce loop is deliberately omitted, so inspecting does not strengthen
+     *    the memories that surface (the property a real turn has and this must not).
+     *  - the working mind is *rendered*, never noted or ticked, so its warmth and
+     *    train of thought are unchanged.
+     *  - no event is appended, no message embedded, no goal touched.
+     *
+     * So a UI can recompute this for every keystroke of a draft without perturbing
+     * the Construct's state. Mirrors the loop's fold order: base first, then the
+     * per-provider contributions in provider order.
+     */
+    async inspectContext(query: string): Promise<ContextInspection> {
+        const sections: ContextSection[] = [];
+        const push = (s: Omit<ContextSection, "tokens">) => {
+            const text = s.text;
+            if (!text.trim()) return;
+            sections.push({ ...s, text, tokens: estimateTextTokens(text) });
+        };
+
+        // 1. Base system guidance: always present, ahead of everything.
+        push({ name: "base", text: this.cfg.system });
+
+        // 2. Recalled memory for this query — READ-ONLY. recallContextDetailed
+        // searches the store and ranks; it does not reinforce. We skip the
+        // reinforce loop buildSystem runs, which is the whole point: inspecting
+        // must not strengthen what it surfaces.
+        if (this.cfg.store) {
+            const recalled = await recallContextDetailed(this.cfg.store, {
+                query,
+                embedder: this.cfg.embedder,
+                limit: this.cfg.recallLimit,
+            });
+            if (recalled.text) {
+                push({
+                    name: "memory",
+                    text: recalled.text,
+                    memoryIds: recalled.memories.map((m) => m.id),
+                });
+            }
+        }
+
+        // 3. The passive providers, each run on its own so the preview can
+        // attribute text to the named ingredient (applyContext joins them into one
+        // system turn, which is right for a real turn but loses the breakdown a
+        // debug view wants). Every provider here is read-only; the working-mind
+        // provider renders without ticking. A provider that throws is skipped, the
+        // way the loop drops a failing provider for the turn.
+        const scope = {
+            messages: this.conversation,
+            turn: this.conversation.length === 0 ? 0 : Math.ceil(this.conversation.length / 2),
+            sessionStart: this.startedAt,
+        };
+        for (const provider of this.context) {
+            let contribution;
+            try {
+                contribution = await provider.contribute(scope);
+            } catch {
+                continue;
+            }
+            if (!contribution?.system?.trim()) continue;
+            // Enrich a couple of sections with their source ids, read fresh from
+            // the same stores the provider read (read-only lookups, no mutation).
+            const extra: { memoryIds?: number[]; goalIds?: number[]; dreamId?: number } = {};
+            if (provider.name === "goals" && this.cfg.goals) {
+                const ids = [
+                    ...this.cfg.goals
+                        .list({ status: "active", scope: "global", limit: MAX_LIMIT })
+                        .map((g) => g.id),
+                    ...this.cfg.goals
+                        .list({
+                            status: "active",
+                            scope: "session",
+                            session: this.sessionId,
+                            limit: MAX_LIMIT,
+                        })
+                        .map((g) => g.id),
+                ];
+                if (ids.length) extra.goalIds = ids;
+            }
+            push({ name: provider.name, text: contribution.system, ...extra });
+        }
+
+        const totalTokens = sections.reduce((sum, s) => sum + s.tokens, 0);
+        return { query, session: this.sessionId, sections, totalTokens };
     }
 
     /**

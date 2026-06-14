@@ -127,3 +127,13 @@ export function estimateTokens(messages: readonly Message[]): number {
     }
     return total;
 }
+
+/**
+ * Estimate the token cost of a bare string, using the same crude chars-per-token
+ * heuristic {@link estimateTokens} applies to text parts. For per-section
+ * accounting (the context inspector) where there's no surrounding `Message`
+ * framing to charge for, so the per-message overhead is deliberately excluded.
+ */
+export function estimateTextTokens(text: string): number {
+    return Math.ceil(text.length / CHARS_PER_TOKEN);
+}

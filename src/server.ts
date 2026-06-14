@@ -35,6 +35,8 @@
  *                                  `/` menu (mirrors {@link BUILTIN_COMMANDS}).
  *  - `GET  /api/status`          — read-only runtime status (model, tools, storage,
  *                                  features), for the settings page. No secrets.
+ *  - `GET  /api/context`         — preview the context a turn would be built from
+ *                                  for a draft (read-only; mutates nothing).
  *
  * Run it with `npm run serve` (see package.json). It speaks only core types and
  * the stores' public surface, so it stays as provider-neutral as everything
@@ -217,6 +219,24 @@ export class SessionPool {
         const resumed = await Session.resume({ ...this.config(), sessionId: id });
         this.sessions.set(resumed.id, resumed);
         return resumed;
+    }
+
+    /**
+     * Get a Session for `id` for a *read-only* purpose (the context inspector),
+     * without registering a new live conversation in the pool. If the conversation
+     * is already live, return it (so the preview reflects its real in-memory
+     * state — its working mind, its rehydrated history). Otherwise resume a
+     * *transient* Session from the log and return it WITHOUT adding it to the pool:
+     * inspecting a past conversation must not silently bring it live, the way
+     * sending a turn (via {@link resolve}) deliberately does. With no `id`, preview
+     * the default conversation.
+     */
+    async peek(id: string | undefined): Promise<Session> {
+        if (!id) return this.sessions.get(this.defaultId)!;
+        const live = this.sessions.get(id);
+        if (live) return live;
+        // Transient: resumed for this read only, never pooled.
+        return Session.resume({ ...this.config(), sessionId: id });
     }
 }
 
@@ -1208,6 +1228,31 @@ function handleStatus(res: ServerResponse, deps: ServerDeps): void {
     });
 }
 
+// ── Context inspector route ──────────────────────────────────────────────────
+
+/**
+ * Preview the context a turn would be built from, for the context inspector: what
+ * the Construct actually sees before it answers, assembled but never sent.
+ *
+ *  - GET /api/context?session=<id>&q=<draft>
+ *
+ * Delegates to {@link Session.inspectContext}, which is read-only by construction
+ * (it recalls memory without reinforcing, renders the working mind without
+ * ticking, and touches no goal or event). To keep the *whole* request read-only,
+ * we {@link SessionPool.peek} rather than {@link SessionPool.resolve}: a past
+ * conversation is resumed transiently for this read and never brought live in the
+ * pool, so opening the inspector on an old conversation doesn't change what's
+ * loaded. `q` defaults to empty (recall against an empty draft still shows the
+ * standing injections: goals, the last dream, the working mind).
+ */
+async function handleContext(res: ServerResponse, deps: ServerDeps, url: URL): Promise<void> {
+    const session = url.searchParams.get("session") ?? undefined;
+    const q = url.searchParams.get("q") ?? "";
+    const target = await deps.sessions.peek(session);
+    const inspection = await target.inspectContext(q);
+    sendJson(res, 200, inspection);
+}
+
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /** Build the request handler over a set of deps. Pure routing: it owns no
@@ -1236,6 +1281,15 @@ export function createHandler(deps: ServerDeps) {
             // rows. No secrets leave (the embedder is a yes/no).
             if (req.method === "GET" && path === "/api/status") {
                 handleStatus(res, deps);
+                return;
+            }
+
+            // The context inspector: a read-only preview of what a turn would be
+            // built from for a draft, with per-section token estimates and source
+            // ids. Assembles the context but never sends it, and mutates nothing
+            // (no reinforce, no working-mind tick, no event append).
+            if (req.method === "GET" && path === "/api/context") {
+                await handleContext(res, deps, url);
                 return;
             }
 
