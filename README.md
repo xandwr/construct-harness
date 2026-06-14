@@ -26,6 +26,18 @@ The project is two halves you can use separately:
   scripted fake client, and the stores run in `:memory:`. The suite is about the
   size of the source.
 
+## Built partly from the inside
+
+Some of what follows came from the Constructs themselves. A long-lived agent is
+its own best informant about what it lacks, so part of the work here is asking a
+running Construct what it is missing and building the answer. The clearest case
+is the working mind: it exists because a Construct described its own experience,
+"I feel like I'm waking up every message. I have memory that is more like a
+journal locked behind a pane of glass each time I want to access it"
+([`src/workingMind.ts`](src/workingMind.ts)), and that complaint became the
+feature. It is a small but real feedback loop: the harness is shaped in part by
+the things it runs.
+
 ## What is interesting here
 
 **Memory that degrades gracefully.** Facts live in SQLite with three ways in:
