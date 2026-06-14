@@ -65,6 +65,20 @@
 	function personaLine(d: WireDream): string {
 		return d.persona.role ? `${d.persona.name}, ${d.persona.role}` : d.persona.name;
 	}
+
+	// Which dreams are expanded. Dreams collapse by default: the scenario and
+	// choice are several lines each, so an unfiltered list is a wall of text.
+	// Collapsed, each dream is clamped to a couple of lines with a trailing
+	// ellipsis ("…") where the text would have wrapped on; clicking the body
+	// toggles it open to read in full. Keyed by dream id so the set survives a
+	// prepend from + dream.
+	let expanded = $state<Set<number>>(new Set());
+
+	function toggle(id: number) {
+		const next = new Set(expanded);
+		next.has(id) ? next.delete(id) : next.add(id);
+		expanded = next;
+	}
 </script>
 
 <AppHeader title={app.title} icon={app.icon}>
@@ -86,7 +100,18 @@
 		</div>
 	{:else}
 		{#each dreams as d (d.id)}
-			<div class="border-b border-border/40 px-4 py-3 text-xs">
+			{@const open = expanded.has(d.id)}
+			<!-- A collapsible section per dream. The persona/timestamp line is the
+			     header; the scenario and choice are the body. Clicking anywhere in
+			     the body toggles the section open or shut: collapsed clamps each
+			     to a couple of lines with a "…" where the text would have wrapped
+			     on, expanded shows it whole. A button so it's keyboard-reachable. -->
+			<button
+				type="button"
+				class="block w-full cursor-pointer border-b border-border/40 px-4 py-3 text-left text-xs hover:bg-surface/30"
+				aria-expanded={open}
+				onclick={() => toggle(d.id)}
+			>
 				<div class="flex items-baseline justify-between gap-3">
 					<span class="text-muted">{personaLine(d)}</span>
 					<span class="text-faint shrink-0 text-[10px] lowercase" title={iso(d.ts)}
@@ -95,12 +120,17 @@
 				</div>
 				<!-- The dilemma the persona faced, then the choice it made. The choice
 				     is free prose ("choose, and say why"), not a verdict, so it reads
-				     as the dreamer's reasoning rather than a pass/fail. -->
-				<div class="text-text mt-1">{d.scenario}</div>
-				<div class="text-muted border-glow/30 mt-2 border-l-2 pl-3 whitespace-pre-wrap">
+				     as the dreamer's reasoning rather than a pass/fail. When collapsed,
+				     line-clamp truncates each with a trailing ellipsis. -->
+				<div class="text-text mt-1 {open ? '' : 'line-clamp-2'}">{d.scenario}</div>
+				<div
+					class="text-muted border-glow/30 mt-2 border-l-2 pl-3 whitespace-pre-wrap {open
+						? ''
+						: 'line-clamp-2'}"
+				>
 					{d.choice}
 				</div>
-			</div>
+			</button>
 		{/each}
 	{/if}
 </div>
