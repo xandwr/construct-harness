@@ -3,6 +3,7 @@
 	import { page } from '$app/state';
 	import { APPS, activeApp } from '$lib/apps';
 	import Icon from '$lib/Icon.svelte';
+	import UserStatus from '$lib/UserStatus.svelte';
 	import '../style.css';
 
 	let { children } = $props();
@@ -43,6 +44,12 @@
 				</li>
 			{/each}
 		</ul>
+
+		<!-- The human's presence pins to the bottom of the spine, where Discord puts
+		     yours: the spacer pushes it down, the rule sets it off from the apps. -->
+		<div class="mt-auto border-t border-border">
+			<UserStatus />
+		</div>
 	</nav>
 
 	<!-- The active applet. -->

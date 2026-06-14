@@ -366,6 +366,41 @@ export function updateSettings(patch: SettingsPatch, fetchFn?: typeof fetch): Pr
     return writeJson("PATCH", "/api/settings", patch, fetchFn);
 }
 
+/** The human's presence states, in display order. `online`/`away` are computed
+ *  from when the user last sent a message; `dnd`/`offline` are also pinnable by
+ *  hand. Mirrors `PresenceState` in `src/presence.ts`. */
+export type PresenceState = "online" | "away" | "dnd" | "offline";
+
+/** The presence as `/api/presence` returns it: the state to show plus the inputs
+ *  behind it. `manual` is true when `state` comes from a pinned override rather
+ *  than the automatic Online/Away-by-activity axis. Mirrors `Presence` in
+ *  `src/presence.ts`. */
+export interface WirePresence {
+    state: PresenceState;
+    manual: boolean;
+    override: "dnd" | "offline" | null;
+    lastActiveTs: number | null;
+    idleMs: number | null;
+}
+
+/** The states a human may pin via {@link setPresence}. `online` clears any
+ *  override back to the automatic axis (it does not freeze Online); `dnd` and
+ *  `offline` pin that state. `away` is intentionally absent: it's derived from
+ *  silence, not a status you announce. */
+export type PresenceChoice = "online" | "dnd" | "offline";
+
+/** Read the human's current presence (computed server-side). The header polls
+ *  this so Away surfaces after silence without a new message. */
+export function getPresence(fetchFn?: typeof fetch): Promise<WirePresence> {
+    return getJson("/api/presence", fetchFn);
+}
+
+/** Pin a manual presence, or clear back to automatic with `online`. Returns the
+ *  freshly computed {@link WirePresence} so the caller re-renders from one reply. */
+export function setPresence(state: PresenceChoice, fetchFn?: typeof fetch): Promise<WirePresence> {
+    return writeJson("PUT", "/api/presence", { state }, fetchFn);
+}
+
 /** One ingredient of a context preview: a named slice of what the next turn would
  *  see, with its text, a token estimate, and any source ids behind it. */
 export interface WireContextSection {

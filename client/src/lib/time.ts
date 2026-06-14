@@ -45,3 +45,16 @@ export function exactWhen(ms: number): string {
 export function iso(ms: number): string {
     return new Date(ms).toISOString();
 }
+
+/** A coarse "how long ago" from a millisecond gap: "just now", "22m ago",
+ *  "3h ago", "2d ago". For the presence read ("active 22m ago"), where the exact
+ *  second doesn't matter — only roughly how stale the human's last message is. */
+export function agoFromMs(gapMs: number): string {
+    const s = Math.max(0, Math.floor(gapMs / 1000));
+    if (s < 45) return "just now";
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
+}

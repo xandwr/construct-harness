@@ -78,6 +78,7 @@ import { shellTools, resolveShellPolicy, type ShellPolicyMode } from "./shellToo
 import { BUILTIN_COMMANDS } from "./commands.ts";
 import { dreamLoop, DREAM_EVENT_KIND, type Dream } from "./dreaming.ts";
 import { SYSTEM_PROMPT } from "./systemPrompt.ts";
+import { UserPresence, type Override } from "./presence.ts";
 
 // The base system prompt lives in SYSTEM.md at the repo root (see
 // systemPrompt.ts), not inline here, so the Construct's persona is a markdown
@@ -111,6 +112,11 @@ interface ServerDeps {
      *  Each one accepts new turns; a conversation only in the log (not here) is a
      *  past one waiting to be resumed into the pool on its next turn. */
     sessions: SessionPool;
+    /** The human's presence (Online/Away/DND/Offline), computed from when they
+     *  last sent a message plus any manual override they pinned. Touched on every
+     *  user turn (the chat route), read by `/api/presence`, written by a PUT to
+     *  the same. In-process for the process's life; see {@link UserPresence}. */
+    presence: UserPresence;
     notes?: NotesService;
     notesStore?: NotesStore;
     /** The live runtime knobs the settings page reads and writes: the model in
@@ -439,6 +445,12 @@ function buildDeps(): ServerDeps {
     });
     const sessions = new SessionPool(sessionConfig);
 
+    // The human's presence. Seed last-activity with boot time so a freshly
+    // launched daemon reads Online rather than "never seen": today the client and
+    // daemon launch together, so a booted process means a present human. The first
+    // user message re-touches it; 15 minutes of silence flips it to Away.
+    const presence = new UserPresence(Date.now());
+
     notes
         .start()
         .then(() => console.log(`  knowledge base watching: ${notes.kbRoot}`))
@@ -472,6 +484,7 @@ function buildDeps(): ServerDeps {
         events,
         goals,
         sessions,
+        presence,
         notes,
         notesStore,
         runtime,
@@ -1617,6 +1630,52 @@ async function handleSettings(
     handleStatus(res, deps);
 }
 
+// ── Presence route ───────────────────────────────────────────────────────────
+
+/**
+ * The human's presence surface: read it, or pin/clear a manual override.
+ *
+ *  - GET  /api/presence            the computed presence right now.
+ *  - PUT  /api/presence  { state } pin a manual status, where `state` is
+ *                                  `online` (clears the override back to the
+ *                                  automatic Online/Away-by-activity axis), `dnd`,
+ *                                  or `offline`. `away` is rejected: it's derived
+ *                                  from silence, not a status you announce.
+ *
+ * Both compute against one `Date.now()` and return the same {@link Presence}
+ * shape, so the client renders the dot and updates from one reply. The state is
+ * in-process (see {@link UserPresence}); a restart re-seeds Online from boot.
+ */
+async function handlePresence(
+    req: IncomingMessage,
+    res: ServerResponse,
+    deps: ServerDeps,
+): Promise<void> {
+    if (req.method === "GET") {
+        sendJson(res, 200, deps.presence.read(Date.now()));
+        return;
+    }
+    if (req.method === "PUT") {
+        const body = await readJsonObject(req);
+        if (!body) {
+            sendJson(res, 400, { error: "invalid JSON body" });
+            return;
+        }
+        const want = body.state;
+        // Only the pinnable states are accepted. `online` is the clear-to-automatic
+        // value; `away` is intentionally absent (derived, not announced).
+        if (want !== "online" && want !== "dnd" && want !== "offline") {
+            sendJson(res, 400, {
+                error: 'state must be "online" (clears the override), "dnd", or "offline"',
+            });
+            return;
+        }
+        sendJson(res, 200, deps.presence.setOverride(want as "online" | Override, Date.now()));
+        return;
+    }
+    sendJson(res, 405, { error: `method ${req.method} not allowed on /api/presence` });
+}
+
 // ── Context inspector route ──────────────────────────────────────────────────
 
 /**
@@ -1826,6 +1885,16 @@ export function createHandler(deps: ServerDeps) {
                 return;
             }
 
+            // The human's presence. GET computes it from when they last sent a
+            // message plus any pinned override; PUT pins/clears that override
+            // (online clears back to automatic, dnd/offline pin). The status dot
+            // the client shows reads from here and polls so Away surfaces after
+            // silence without a message.
+            if (path === "/api/presence") {
+                await handlePresence(req, res, deps);
+                return;
+            }
+
             // The context inspector: a read-only preview of what a turn would be
             // built from for a draft, with per-section token estimates and source
             // ids. Assembles the context but never sends it, and mutates nothing
@@ -1967,6 +2036,11 @@ export function createHandler(deps: ServerDeps) {
                 // here where we can still send a real error status. Once streamChat
                 // writes the SSE head we can only report errors in-band.
                 const session = await deps.sessions.resolve(wantSession);
+                // The human just sent something, so they're here: advance presence
+                // (Online again, Away countdown restarted) and lift an `offline`
+                // override — you can't be talking and offline. A pinned `dnd`
+                // survives: present and not-to-be-disturbed are compatible.
+                deps.presence.touch(Date.now());
                 await streamChat(session, text, res, images);
                 return;
             }

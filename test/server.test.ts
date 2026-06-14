@@ -32,6 +32,7 @@ import { EventStore } from "../src/events.ts";
 import { GoalStore } from "../src/goals.ts";
 import { RuntimeConfig } from "../src/runtimeConfig.ts";
 import { AnthropicClient } from "../src/bridge/anthropic.ts";
+import { UserPresence } from "../src/presence.ts";
 import { FakeClient, textTurn, callTurn } from "./helpers/fakeClient.ts";
 
 /** A captured response: status, headers, and the concatenated body. For SSE the
@@ -127,6 +128,10 @@ function makeDeps(client: FakeClient) {
         events,
         goals,
         sessions,
+        // Boot presence with no seed activity so a read is deterministic (Away
+        // until a chat turn touches it); presence-specific tests drive the clock
+        // through the UserPresence class directly.
+        presence: new UserPresence(),
         // The scripted client, exposed so a resume test can read the messages the
         // model was handed (FakeClient records every call's params).
         client,
@@ -155,6 +160,7 @@ function makeSharedDeps(client: FakeClient) {
         events,
         goals,
         sessions,
+        presence: new UserPresence(),
         client,
         close() {
             events.close();
@@ -1203,6 +1209,7 @@ test("a server-tool toggle reaches a live conversation's next turn", async () =>
         events,
         goals,
         sessions,
+        presence: new UserPresence(),
         client,
         runtime,
         close() {
@@ -1296,4 +1303,83 @@ test("resolveServerTools parses an explicit comma-separated set", () => {
     ]);
     // Whitespace and case are tolerated; an unknown name is dropped, not fatal.
     assert.deepEqual(resolveServerTools(" Web_Search , bogus "), ["web_search"]);
+});
+
+// ── Presence routes ──────────────────────────────────────────────────────────
+
+test("GET /api/presence reports the computed presence", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    // Seed activity through the public surface so the read is Online.
+    deps.presence.touch(Date.now());
+    const { status, json } = await call(deps, getReq("/api/presence"));
+    assert.equal(status, 200);
+    assert.equal(json.state, "online");
+    assert.equal(json.manual, false);
+    assert.equal(json.override, null);
+    deps.close();
+});
+
+test("PUT /api/presence pins DND as a manual override", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const { status, json } = await call(
+        deps,
+        bodyReq("PUT", "/api/presence", JSON.stringify({ state: "dnd" })),
+    );
+    assert.equal(status, 200);
+    assert.equal(json.state, "dnd");
+    assert.equal(json.manual, true);
+    assert.equal(json.override, "dnd");
+    // And a follow-up GET still reflects it.
+    const after = await call(deps, getReq("/api/presence"));
+    assert.equal(after.json.state, "dnd");
+    deps.close();
+});
+
+test('PUT /api/presence with state "online" clears the override back to automatic', async () => {
+    const deps = makeDeps(new FakeClient([]));
+    await call(deps, bodyReq("PUT", "/api/presence", JSON.stringify({ state: "dnd" })));
+    const { json } = await call(
+        deps,
+        bodyReq("PUT", "/api/presence", JSON.stringify({ state: "online" })),
+    );
+    assert.equal(json.override, null);
+    assert.equal(json.manual, false);
+    deps.close();
+});
+
+test("PUT /api/presence rejects a non-pinnable or unknown state with a 400", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    // `away` is derived, not announceable.
+    const away = await call(
+        deps,
+        bodyReq("PUT", "/api/presence", JSON.stringify({ state: "away" })),
+    );
+    assert.equal(away.status, 400);
+    // And outright garbage is rejected the same way, nothing pinned.
+    const junk = await call(
+        deps,
+        bodyReq("PUT", "/api/presence", JSON.stringify({ state: "busy" })),
+    );
+    assert.equal(junk.status, 400);
+    assert.equal((await call(deps, getReq("/api/presence"))).json.override, null);
+    deps.close();
+});
+
+test("a chat turn touches presence, clearing an offline override", async () => {
+    const deps = makeDeps(new FakeClient([textTurn("hi")]));
+    // Pin offline, then send a real chat turn: talking means present, so offline lifts.
+    await call(deps, bodyReq("PUT", "/api/presence", JSON.stringify({ state: "offline" })));
+    assert.equal((await call(deps, getReq("/api/presence"))).json.state, "offline");
+    await call(deps, postReq("/api/chat", JSON.stringify({ message: "hello" })));
+    const after = await call(deps, getReq("/api/presence"));
+    assert.equal(after.json.state, "online");
+    assert.equal(after.json.override, null);
+    deps.close();
+});
+
+test("non-GET/PUT /api/presence is 405", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const { status } = await call(deps, bodyReq("DELETE", "/api/presence"));
+    assert.equal(status, 405);
+    deps.close();
 });
