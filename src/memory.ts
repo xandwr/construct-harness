@@ -31,6 +31,81 @@ export class MemoryError extends Error {
 export const MIN_IMPORTANCE = 0;
 export const MAX_IMPORTANCE = 1;
 
+// ── Durable strength: decay + reinforcement by resurfacing ────────────────────
+//
+// `importance` is the explicit dial a caller (or the model) sets and we never
+// touch behind their back. `strength` is the orthogonal, harness-managed signal:
+// a memory earns it by *resurfacing* and loses it by going untouched, so the
+// store learns which memories keep proving relevant and ranks them up, and lets
+// the ones that never come up settle toward the floor. It is the working mind's
+// recency+reinforcement law (see workingMind.ts) made durable: where the mind's
+// warmth is in-process and resets on restart, strength persists in the row.
+//
+// The law is lazy and clock-based, so there is no background sweep:
+//  - Decay is computed at read time from real elapsed time since a memory last
+//    surfaced: effectiveStrength = stored * 0.5^(elapsed / HALF_LIFE). The stored
+//    number only moves when the memory actually resurfaces; the clock does the
+//    rest. A memory not surfaced in a long while is weak without anyone touching
+//    its row; resurfacing revives it.
+//  - Reinforcement (see {@link MemoryStore.reinforce}) decays the stored value to
+//    *now* first, then adds a diminishing-returns bump toward the ceiling and
+//    stamps the surfacing time, so repeated resurfacing strengthens with falling
+//    marginal gain rather than running away.
+
+/** A fresh memory starts here: full strength, the same as one just resurfaced. */
+export const INITIAL_STRENGTH = 1;
+/** Strength floor. A memory decays toward but never below this, so a long-idle
+ *  memory loses its ranking edge without vanishing from strength-ordered reads. */
+export const MIN_STRENGTH = 0;
+/** Strength ceiling. Reinforcement approaches but never exceeds this, so a
+ *  much-resurfaced memory can't dominate ranking unboundedly. */
+export const MAX_STRENGTH = 4;
+/** Half-life of strength decay, in ms (default 7 days): the elapsed idle time
+ *  over which an un-resurfaced memory's effective strength halves. */
+export const STRENGTH_HALF_LIFE_MS = 7 * 24 * 60 * 60 * 1000;
+/** Per-resurfacing increment added (post-decay) toward {@link MAX_STRENGTH}. The
+ *  add is scaled by the remaining headroom so gains diminish as strength climbs. */
+export const STRENGTH_REINFORCE_STEP = 0.5;
+
+/**
+ * The decay multiplier for `elapsed` ms of idleness: 0.5^(elapsed / half-life),
+ * clamped to [0, 1]. Pure and exported so both the store and its tests compute
+ * decay the one way. A non-finite or negative elapsed (a clock that went
+ * backwards) is treated as no elapsed time, i.e. no decay.
+ */
+export function strengthDecayFactor(
+    elapsedMs: number,
+    halfLifeMs: number = STRENGTH_HALF_LIFE_MS,
+): number {
+    if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) return 1;
+    if (!Number.isFinite(halfLifeMs) || halfLifeMs <= 0) return 1;
+    return Math.pow(0.5, elapsedMs / halfLifeMs);
+}
+
+/**
+ * A memory's effective (decayed-to-now) strength: its stored strength aged by the
+ * time since it last surfaced. A memory that never surfaced (no `lastSurfaced`)
+ * has not started decaying, so it reads at its stored strength. Clamped into
+ * [{@link MIN_STRENGTH}, {@link MAX_STRENGTH}].
+ */
+export function effectiveStrength(
+    stored: number,
+    lastSurfaced: number | undefined,
+    now: number,
+    halfLifeMs: number = STRENGTH_HALF_LIFE_MS,
+): number {
+    const base = Number.isFinite(stored) ? stored : INITIAL_STRENGTH;
+    if (lastSurfaced === undefined) return clampStrength(base);
+    const decayed = base * strengthDecayFactor(now - lastSurfaced, halfLifeMs);
+    return clampStrength(decayed);
+}
+
+/** Clamp a strength value into [{@link MIN_STRENGTH}, {@link MAX_STRENGTH}]. */
+function clampStrength(n: number): number {
+    if (!Number.isFinite(n)) return INITIAL_STRENGTH;
+    return Math.min(MAX_STRENGTH, Math.max(MIN_STRENGTH, n));
+}
+
 /** Hard ceiling on a single tag, and on the number of tags per memory. */
 export const MAX_TAG_LENGTH = 256;
 export const MAX_TAGS = 64;
@@ -42,6 +117,18 @@ export interface MemoryInput {
     importance?: number;
     /** Defaults to "now"; injectable so tests are deterministic. */
     created?: number;
+    /**
+     * Durable strength (the resurfacing-earned salience signal). Defaults to
+     * {@link INITIAL_STRENGTH} for a fresh memory; the store manages it from there
+     * via {@link MemoryStore.reinforce}. Injectable so tests and reconstruction
+     * from a row can set it; out-of-range values are clamped, not rejected, since
+     * it's a harness-managed accumulator, not user input.
+     */
+    strength?: number;
+    /** Epoch-ms the memory last resurfaced, or undefined if it never has. The
+     *  store stamps this on {@link MemoryStore.reinforce}; injectable for the same
+     *  reasons as {@link strength}. */
+    lastSurfaced?: number;
 }
 
 /** Options for {@link MemoryStore.all} / {@link MemoryStore.search}. */
@@ -52,6 +139,13 @@ export interface QueryOptions {
     offset?: number;
     /** Only return memories carrying ALL of these tags. */
     tags?: string[];
+    /**
+     * "Now" for the effective-strength decay used in ranking, epoch-ms. Defaults
+     * to the wall clock; injectable so a test (or a deterministic replay) can rank
+     * against a fixed instant the same way {@link MemoryStore.reinforce} takes an
+     * injectable `now`. Has no effect on which rows match, only on their order.
+     */
+    now?: number;
 }
 
 /** A memory paired with its cosine similarity to a query vector, from
@@ -468,6 +562,36 @@ const MIGRATIONS: ReadonlyArray<{ name: string; up: (db: DatabaseSync) => void }
             `);
         },
     },
+    {
+        // Durable memory strength: the decay+reinforcement signal a memory earns
+        // by resurfacing (see the STRENGTH_* constants and MemoryStore.reinforce).
+        // Two columns, both on `memory` itself rather than a side table, because
+        // every strength read happens alongside a memory read (ranking) — a join
+        // would buy nothing.
+        //
+        //  - `strength`: the stored salience accumulator, NOT NULL DEFAULT 1 so
+        //    every pre-existing memory adopts the same full-strength baseline a
+        //    freshly-saved one gets (a memory that predates this feature is not
+        //    penalized; it simply hasn't earned extra strength yet).
+        //  - `last_surfaced`: epoch-ms the memory most recently resurfaced, NULL
+        //    until it first does. Decay is measured from here, so a memory that has
+        //    never surfaced reads at its stored strength (no elapsed time, no
+        //    decay) rather than decaying from its creation it never asked for.
+        //
+        // No FTS/vector implications: these are scalar ranking inputs, read in the
+        // same SELECT as the row. The content-update trigger that drops a stale
+        // vector is untouched — editing content doesn't reset earned strength.
+        name: "add memory strength and last_surfaced for resurfacing decay",
+        up(db) {
+            db.exec(`
+                ALTER TABLE memory ADD COLUMN strength REAL NOT NULL DEFAULT ${INITIAL_STRENGTH};
+                ALTER TABLE memory ADD COLUMN last_surfaced INTEGER;
+                -- Strength-ordered reads (ranking tiebreak, and the "weakest" sweep
+                -- a future pruner would want) shouldn't scan the table.
+                CREATE INDEX IF NOT EXISTS idx_memory_strength ON memory (strength DESC);
+            `);
+        },
+    },
 ];
 
 /** The schema version this build of the code expects. */
@@ -526,15 +650,25 @@ export class Memory {
     updated: number;
     tags: string[];
     importance?: number;
+    /** Durable, harness-managed salience: earned by resurfacing, decayed by
+     *  idleness. The *stored* value; see {@link MemoryStore.reinforce} and
+     *  {@link effectiveStrength} for the decayed-to-now reading. */
+    strength: number;
+    /** Epoch-ms this memory last resurfaced, or undefined until it first does.
+     *  Decay is measured from here. */
+    lastSurfaced?: number;
 
     constructor(input: MemoryInput) {
-        const { content, tags, importance, created } = normalizeInput(input);
+        const { content, tags, importance, created, strength, lastSurfaced } =
+            normalizeInput(input);
         this.id = 0;
         this.content = content;
         this.created = created;
         this.updated = created;
         this.tags = tags;
         this.importance = importance;
+        this.strength = strength;
+        this.lastSurfaced = lastSurfaced;
     }
 }
 
@@ -547,6 +681,8 @@ function normalizeInput(input: MemoryInput): {
     tags: string[];
     importance?: number;
     created: number;
+    strength: number;
+    lastSurfaced?: number;
 } {
     if (input === null || typeof input !== "object") {
         throw new MemoryError("memory input must be an object");
@@ -587,7 +723,23 @@ function normalizeInput(input: MemoryInput): {
         throw new MemoryError("created must be a finite number");
     }
 
-    return { content, tags, importance, created };
+    // Strength is a harness-managed accumulator, not user input: an out-of-range
+    // or absent value clamps to the valid band rather than throwing, so a row read
+    // back (or a caller that fat-fingers it) can never break a save. Default to
+    // INITIAL_STRENGTH for a memory that's never been reinforced.
+    const strength =
+        input.strength === undefined || input.strength === null
+            ? INITIAL_STRENGTH
+            : clampStrength(input.strength);
+
+    let lastSurfaced: number | undefined;
+    if (input.lastSurfaced !== undefined && input.lastSurfaced !== null) {
+        // A non-finite stamp is meaningless for decay; drop it to "never surfaced"
+        // rather than letting it poison the elapsed-time math.
+        lastSurfaced = Number.isFinite(input.lastSurfaced) ? input.lastSurfaced : undefined;
+    }
+
+    return { content, tags, importance, created, strength, lastSurfaced };
 }
 
 /** Dedupe, trim, drop empties, and bound the tag list. */
@@ -621,6 +773,8 @@ interface MemoryRow {
     updated: number;
     tags: string | null;
     importance: number | null;
+    strength: number | null;
+    last_surfaced: number | null;
 }
 
 /**
@@ -634,6 +788,11 @@ function rowToMemory(row: MemoryRow): Memory {
         tags: parseTags(row.tags),
         importance: row.importance ?? undefined,
         created: row.created,
+        // A row predating the strength migration would have no column, but the
+        // migration's DEFAULT backfills it; `?? INITIAL_STRENGTH` is belt-and-
+        // braces for a hand-built row. last_surfaced stays undefined when NULL.
+        strength: row.strength ?? INITIAL_STRENGTH,
+        lastSurfaced: row.last_surfaced ?? undefined,
     });
     m.id = row.id;
     m.updated = row.updated;
@@ -669,6 +828,7 @@ export class MemoryStore {
     private readonly insertStmt;
     private readonly getStmt;
     private readonly updateStmt;
+    private readonly reinforceStmt;
     private readonly deleteStmt;
     private readonly countStmt;
     private readonly clearStmt;
@@ -718,12 +878,18 @@ export class MemoryStore {
         this.schemaVersion = migrate(this.db);
 
         this.insertStmt = this.db.prepare(
-            `INSERT INTO memory (content, created, updated, tags, importance)
-             VALUES (?, ?, ?, ?, ?)`,
+            `INSERT INTO memory (content, created, updated, tags, importance, strength, last_surfaced)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
         );
         this.getStmt = this.db.prepare(`SELECT * FROM memory WHERE id = ?`);
         this.updateStmt = this.db.prepare(
             `UPDATE memory SET content = ?, updated = ?, tags = ?, importance = ? WHERE id = ?`,
+        );
+        // Reinforcement writes only the two strength columns, leaving `updated`
+        // untouched: a resurfacing is not a content edit, and stamping `updated`
+        // would let mere recall masquerade as a revision (and churn recency sorts).
+        this.reinforceStmt = this.db.prepare(
+            `UPDATE memory SET strength = ?, last_surfaced = ? WHERE id = ?`,
         );
         this.deleteStmt = this.db.prepare(`DELETE FROM memory WHERE id = ?`);
         this.countStmt = this.db.prepare(`SELECT COUNT(*) AS n FROM memory`);
@@ -779,12 +945,16 @@ export class MemoryStore {
             memory.updated || norm.created,
             serializeTags(norm.tags),
             norm.importance ?? null,
+            norm.strength,
+            norm.lastSurfaced ?? null,
         );
         memory.id = Number(result.lastInsertRowid);
         memory.content = norm.content;
         memory.tags = norm.tags;
         memory.importance = norm.importance;
         memory.created = norm.created;
+        memory.strength = norm.strength;
+        memory.lastSurfaced = norm.lastSurfaced;
         return memory;
     }
 
@@ -822,6 +992,52 @@ export class MemoryStore {
         existing.importance = merged.importance;
         existing.updated = now;
         return existing;
+    }
+
+    /**
+     * Reinforce a memory because it resurfaced: decay its stored strength to
+     * `now`, add a diminishing-returns bump toward {@link MAX_STRENGTH}, and stamp
+     * `last_surfaced`. This is the one write that moves strength, and it does both
+     * halves of the law in a single step — a memory that hasn't surfaced in a long
+     * time has decayed (the post-decay base is lower), then earns its bump from
+     * there. The more recently and often a memory resurfaces, the higher its
+     * effective strength stays; let it lie idle and it settles back toward the
+     * floor on its own (lazily, at read time).
+     *
+     * The bump scales by remaining headroom (`step * (MAX - base) / MAX`), so the
+     * first resurfacing of a weak memory gains a lot and the tenth of an already-
+     * strong one gains little: reinforcement saturates rather than runs away.
+     *
+     * Returns the refreshed memory, or undefined if no row with that id exists.
+     * `now` is injectable for deterministic tests.
+     */
+    reinforce(id: number, now = Date.now()): Memory | undefined {
+        this.assertOpen();
+        const existing = this.get(id);
+        if (!existing) return undefined;
+
+        // Decay the stored strength to now first (the idle penalty), then bump.
+        const decayed = effectiveStrength(existing.strength, existing.lastSurfaced, now);
+        const headroom = (MAX_STRENGTH - decayed) / MAX_STRENGTH;
+        const next = clampStrength(decayed + STRENGTH_REINFORCE_STEP * Math.max(0, headroom));
+
+        this.reinforceStmt.run(next, now, id);
+        existing.strength = next;
+        existing.lastSurfaced = now;
+        return existing;
+    }
+
+    /**
+     * A memory's effective strength right now: its stored strength aged by the
+     * time since it last surfaced (see {@link effectiveStrength}). This is the
+     * value ranking uses, not the raw stored number. Returns undefined if no row
+     * with that id exists. `now` is injectable for deterministic tests.
+     */
+    strengthOf(id: number, now = Date.now()): number | undefined {
+        this.assertOpen();
+        const m = this.get(id);
+        if (!m) return undefined;
+        return effectiveStrength(m.strength, m.lastSurfaced, now);
     }
 
     get(id: number): Memory | undefined {
@@ -876,14 +1092,22 @@ export class MemoryStore {
         }
 
         // bm25() is ascending (more-negative = better), so order by it directly,
-        // then let importance break ties among comparably-relevant rows.
+        // then by effective (decayed-to-now) strength so the memories that keep
+        // resurfacing rank above comparably-relevant idle ones, and finally let
+        // importance break any remaining ties. The strength expression mirrors
+        // effectiveStrength() in SQL (see strengthSql).
+        const { expr: strengthExpr, params: strengthParams } = strengthSql(
+            "m",
+            opts.now ?? Date.now(),
+        );
         const sql =
             `SELECT m.* FROM memory_fts ` +
             `JOIN memory m ON m.id = memory_fts.rowid ` +
             `WHERE ${where.join(" AND ")} ` +
-            `ORDER BY bm25(memory_fts), m.importance IS NULL, m.importance DESC ` +
+            `ORDER BY bm25(memory_fts), ${strengthExpr} DESC, ` +
+            `m.importance IS NULL, m.importance DESC ` +
             `LIMIT ? OFFSET ?`;
-        params.push(limit, offset);
+        params.push(...strengthParams, limit, offset);
 
         const rows = this.db.prepare(sql).all(...(params as never[])) as unknown as MemoryRow[];
         return rows.map(rowToMemory);
@@ -955,6 +1179,7 @@ export class MemoryStore {
         const limit = clampLimit(opts.limit);
         const offset = Math.max(0, Math.floor(opts.offset ?? 0));
         const filterTags = normalizeTags(opts.tags);
+        const now = opts.now ?? Date.now();
 
         // Join the memory row in so we can apply the same tag filter as the other
         // queries and reconstruct full Memory objects without a second lookup.
@@ -978,10 +1203,18 @@ export class MemoryStore {
             const score = cosineSimilarity(query, blobToVector(row.vec));
             scored.push({ memory: rowToMemory(row), score });
         }
-        // Highest similarity first; importance breaks ties among equally-similar
-        // memories (mirrors the lexical path's secondary sort).
+        // Highest similarity first; among comparably-similar memories, the ones
+        // that keep proving relevant (higher effective strength) and then the more
+        // important ones rank up. Strength sits between similarity and importance:
+        // it's the earned, decaying signal, a finer discriminator than the static
+        // importance dial but subordinate to actual meaning-match. We treat scores
+        // within EPS as tied so a hair of cosine noise doesn't override strength.
+        const strengthOf = (m: Memory) => effectiveStrength(m.strength, m.lastSurfaced, now);
         scored.sort(
-            (a, b) => b.score - a.score || (b.memory.importance ?? 0) - (a.memory.importance ?? 0),
+            (a, b) =>
+                tiebreak(a.score, b.score) ||
+                strengthOf(b.memory) - strengthOf(a.memory) ||
+                (b.memory.importance ?? 0) - (a.memory.importance ?? 0),
         );
         return scored.slice(offset, offset + limit);
     }
@@ -1070,12 +1303,20 @@ export class MemoryStore {
             params.push(`%"${escapeLike(tag)}"%`);
         }
 
+        // Importance leads (the explicit dial), then effective strength (the
+        // earned, decaying signal), then recency — so among equally-important
+        // memories the ones that keep resurfacing sort above idle ones, and a
+        // never-reinforced memory still falls back to recency order as before.
+        const { expr: strengthExpr, params: strengthParams } = strengthSql(
+            "memory",
+            opts.now ?? Date.now(),
+        );
         const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
         const sql =
             `SELECT * FROM memory ${whereSql} ` +
-            `ORDER BY importance IS NULL, importance DESC, created DESC ` +
+            `ORDER BY importance IS NULL, importance DESC, ${strengthExpr} DESC, created DESC ` +
             `LIMIT ? OFFSET ?`;
-        params.push(limit, offset);
+        params.push(...strengthParams, limit, offset);
 
         const rows = this.db.prepare(sql).all(...(params as never[])) as unknown as MemoryRow[];
         return rows.map(rowToMemory);
@@ -1140,4 +1381,38 @@ export class MemoryStore {
 
 function serializeTags(tags: string[]): string | null {
     return tags.length ? JSON.stringify(tags) : null;
+}
+
+/**
+ * Build the SQL expression for a memory's effective (decayed-to-now) strength,
+ * the in-database mirror of {@link effectiveStrength}, for use in ORDER BY. A row
+ * that never surfaced (`last_surfaced IS NULL`) reads at its stored `strength`
+ * with no decay; otherwise the stored value is multiplied by
+ * `pow(0.5, elapsed / half_life)`. The result is clamped to
+ * [{@link MIN_STRENGTH}, {@link MAX_STRENGTH}] so it can never sort outside the band.
+ *
+ * `alias` is the table/alias the `strength`/`last_surfaced` columns live under in
+ * the query (e.g. "m" for a join, "memory" for a bare select). The two bound
+ * params are [now, halfLifeMs], appended by the caller in order; SQLite's `pow`
+ * and `max`/`min` (math/scalar functions) evaluate it per row.
+ */
+function strengthSql(alias: string, now: number): { expr: string; params: number[] } {
+    const s = `${alias}.strength`;
+    const ls = `${alias}.last_surfaced`;
+    // CASE keeps a NULL last_surfaced from poisoning the arithmetic into NULL.
+    const decayed =
+        `CASE WHEN ${ls} IS NULL THEN ${s} ` + `ELSE ${s} * pow(0.5, (? - ${ls}) / ?) END`;
+    const expr = `max(${MIN_STRENGTH}, min(${MAX_STRENGTH}, ${decayed}))`;
+    return { expr, params: [now, STRENGTH_HALF_LIFE_MS] };
+}
+
+/** Two cosine scores within this band are treated as equal, so the next sort key
+ *  (strength) decides between them. Small enough that genuinely better matches
+ *  still win on similarity; large enough that float noise doesn't. */
+const SCORE_TIE_EPS = 1e-6;
+
+/** Descending compare on two scores, collapsing a within-EPS difference to a tie
+ *  (0) so the caller's next comparator breaks it. */
+function tiebreak(a: number, b: number): number {
+    return Math.abs(a - b) < SCORE_TIE_EPS ? 0 : b - a;
 }

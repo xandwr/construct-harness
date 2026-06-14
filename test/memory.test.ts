@@ -25,6 +25,12 @@ import {
     MAX_TAG_LENGTH,
     DEFAULT_LIMIT,
     MAX_LIMIT,
+    INITIAL_STRENGTH,
+    MAX_STRENGTH,
+    MIN_STRENGTH,
+    STRENGTH_HALF_LIFE_MS,
+    strengthDecayFactor,
+    effectiveStrength,
 } from "../src/memory.ts";
 import { EventStore } from "../src/events.ts";
 
@@ -835,5 +841,202 @@ test("clearProvenance drops the link but keeps the memory", () => {
         assert.ok(memStore.get(m.id), "memory itself must survive clearProvenance");
         // Idempotent: clearing again removes nothing.
         assert.equal(memStore.clearProvenance(m.id), false);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Durable strength: decay + reinforcement by resurfacing
+//
+// `strength` is the harness-managed salience a memory earns by resurfacing and
+// loses by going idle: the working mind's recency+reinforcement law made durable
+// in the row. These tests pin the pure decay math, the reinforce() write (decay-
+// to-now then a diminishing bump), the lazy clock-based read, and the feed into
+// each ranking path. Time is always injected so decay is deterministic.
+// ---------------------------------------------------------------------------
+
+test("a fresh memory starts at full strength and has never surfaced", () => {
+    const store = freshStore();
+    const m = store.save(mem("new fact"));
+    assert.equal(m.strength, INITIAL_STRENGTH);
+    assert.equal(m.lastSurfaced, undefined);
+    // Effective strength of a never-surfaced memory is its stored strength: no
+    // elapsed time, no decay, regardless of how far "now" is from creation.
+    assert.equal(store.strengthOf(m.id, m.created + 10 * STRENGTH_HALF_LIFE_MS), INITIAL_STRENGTH);
+    store.close();
+});
+
+test("strengthDecayFactor halves over one half-life and treats non-elapsed as no decay", () => {
+    assert.equal(strengthDecayFactor(0), 1);
+    assert.equal(strengthDecayFactor(-100), 1, "a backwards clock doesn't amplify");
+    assert.equal(strengthDecayFactor(STRENGTH_HALF_LIFE_MS), 0.5);
+    assert.ok(Math.abs(strengthDecayFactor(2 * STRENGTH_HALF_LIFE_MS) - 0.25) < 1e-12);
+});
+
+test("effectiveStrength decays a surfaced memory but leaves a never-surfaced one whole", () => {
+    // never surfaced: stored value, untouched by elapsed time.
+    assert.equal(effectiveStrength(2, undefined, 9_999), 2);
+    // surfaced one half-life ago: halved.
+    const now = 1_000_000;
+    assert.equal(effectiveStrength(2, now - STRENGTH_HALF_LIFE_MS, now), 1);
+    // clamped into the band.
+    assert.equal(effectiveStrength(99, undefined, now), MAX_STRENGTH);
+    assert.equal(effectiveStrength(-5, undefined, now), MIN_STRENGTH);
+});
+
+test("reinforce decays to now, bumps with diminishing returns, and stamps the surfacing", () => {
+    const store = freshStore();
+    const t0 = 1_700_000_000_000;
+    const m = store.save(mem("recurring fact", { created: t0 }));
+
+    // First resurfacing at t0: from 1.0, bump = step * (MAX-1)/MAX.
+    const r1 = store.reinforce(m.id, t0)!;
+    assert.ok(r1.strength > INITIAL_STRENGTH, "first resurfacing strengthens");
+    assert.equal(r1.lastSurfaced, t0, "surfacing time stamped");
+
+    // A second resurfacing at the same instant gains less (diminishing returns).
+    const gain1 = r1.strength - INITIAL_STRENGTH;
+    const r2 = store.reinforce(m.id, t0)!;
+    const gain2 = r2.strength - r1.strength;
+    assert.ok(gain2 < gain1, "marginal gain falls as strength climbs");
+    assert.ok(r2.strength <= MAX_STRENGTH, "never exceeds the ceiling");
+
+    // Resurfacing after a long idle gap: the stored value is decayed to now
+    // first, so the post-bump result can be *lower* than before the gap.
+    const late = t0 + 4 * STRENGTH_HALF_LIFE_MS; // decays r2 to ~1/16th
+    const r3 = store.reinforce(m.id, late)!;
+    assert.ok(r3.strength < r2.strength, "a long-idle memory loses ground despite resurfacing");
+    assert.equal(r3.lastSurfaced, late);
+    store.close();
+});
+
+test("reinforce on a missing id returns undefined and writes nothing", () => {
+    const store = freshStore();
+    assert.equal(store.reinforce(999), undefined);
+    assert.equal(store.strengthOf(999), undefined);
+    store.close();
+});
+
+test("strength saturates toward but never exceeds the ceiling under repeated resurfacing", () => {
+    const store = freshStore();
+    const t0 = 1_700_000_000_000;
+    const m = store.save(mem("very hot fact", { created: t0 }));
+    for (let i = 0; i < 50; i++) store.reinforce(m.id, t0);
+    const s = store.strengthOf(m.id, t0)!;
+    assert.ok(s <= MAX_STRENGTH, "bounded above");
+    assert.ok(s > MAX_STRENGTH - 0.01, "but climbs arbitrarily close with enough resurfacing");
+    store.close();
+});
+
+test("a frequently-resurfaced memory ranks above equally-recent idle peers", () => {
+    const store = freshStore();
+    const t0 = 1_700_000_000_000;
+    store.save(mem("alpha note", { created: t0 }));
+    const hot = store.save(mem("beta note", { created: t0 }));
+    store.save(mem("gamma note", { created: t0 }));
+    // beta keeps resurfacing; alpha and gamma never do.
+    for (let i = 0; i < 5; i++) store.reinforce(hot.id, t0);
+
+    // all() (importance/strength/recency) and the FTS path both float beta up,
+    // read at the reinforcement instant so its strength hasn't decayed.
+    const byAll = store.all({ now: t0 }).map((x) => x.content.split(" ")[0]);
+    assert.equal(byAll[0], "beta", "strongest leads importance-tied, equally-recent peers");
+
+    const byFts = store.searchRelevant("note", { now: t0 }).map((x) => x.content.split(" ")[0]);
+    assert.equal(byFts[0], "beta", "and leads comparably-relevant FTS hits");
+    store.close();
+});
+
+test("a once-strong memory left idle decays back below its full-strength peers", () => {
+    const store = freshStore();
+    const t0 = 1_700_000_000_000;
+    const fresh1 = store.save(mem("alpha note", { created: t0 }));
+    const wasHot = store.save(mem("beta note", { created: t0 }));
+    store.save(mem("gamma note", { created: t0 }));
+    void fresh1;
+    for (let i = 0; i < 5; i++) store.reinforce(wasHot.id, t0); // beta strong at t0
+
+    // Read far in the future: beta has been idle for many half-lives and decays
+    // below the full-strength (never-surfaced => no decay) alpha/gamma.
+    const late = t0 + 5 * STRENGTH_HALF_LIFE_MS;
+    assert.ok(
+        store.strengthOf(wasHot.id, late)! < INITIAL_STRENGTH,
+        "the once-hot memory has cooled below a fresh one",
+    );
+    const order = store.all({ now: late }).map((x) => x.content.split(" ")[0]);
+    assert.notEqual(order[0], "beta", "and no longer leads");
+    store.close();
+});
+
+test("reinforce does not bump `updated` (resurfacing isn't a content edit)", () => {
+    const store = freshStore();
+    const t0 = 1_700_000_000_000;
+    const m = store.save(mem("fact", { created: t0 }));
+    const updatedBefore = store.get(m.id)!.updated;
+    store.reinforce(m.id, t0 + 1_000_000);
+    assert.equal(
+        store.get(m.id)!.updated,
+        updatedBefore,
+        "recall must not masquerade as a revision",
+    );
+    store.close();
+});
+
+test("editing content keeps earned strength (an edit isn't a forget-and-resave)", () => {
+    const store = freshStore();
+    const t0 = 1_700_000_000_000;
+    const m = store.save(mem("old wording", { created: t0 }));
+    for (let i = 0; i < 3; i++) store.reinforce(m.id, t0);
+    const earned = store.get(m.id)!.strength;
+    assert.ok(earned > INITIAL_STRENGTH);
+
+    store.update(m.id, { content: "new wording" });
+    assert.equal(store.get(m.id)!.strength, earned, "an in-place edit preserves earned strength");
+    store.close();
+});
+
+test("strength survives a round-trip through the store", () => {
+    const store = freshStore();
+    const t0 = 1_700_000_000_000;
+    const m = store.save(mem("persisted fact", { created: t0 }));
+    store.reinforce(m.id, t0);
+    const reread = store.get(m.id)!;
+    assert.ok(reread.strength > INITIAL_STRENGTH);
+    assert.equal(reread.lastSurfaced, t0);
+    store.close();
+});
+
+test("a pre-strength database backfills every memory to the full-strength baseline", () => {
+    // Build a faithful pre-strength fixture: open a current store (so the whole
+    // schema migrations 1-8 produce exists — memory_vec, memory_meta, the FTS
+    // index, all of it), insert a row, then *undo* the strength migration on disk
+    // (drop its two columns, roll user_version back to 8). Reopening with the
+    // current code reruns migration 9 over that existing row, which is exactly the
+    // upgrade path a real older database takes.
+    withTempDir((dir) => {
+        const file = join(dir, "legacy.sqlite");
+        const seed = new MemoryStore(file);
+        seed.save(mem("legacy fact", { created: 1, importance: 0.7 }));
+        seed.close();
+
+        // Reach past the store API to simulate the older on-disk shape.
+        const raw = new DatabaseSync(file);
+        raw.exec(`
+            DROP INDEX IF EXISTS idx_memory_strength;
+            ALTER TABLE memory DROP COLUMN strength;
+            ALTER TABLE memory DROP COLUMN last_surfaced;
+            PRAGMA user_version = 8;
+        `);
+        raw.close();
+
+        const store = new MemoryStore(file);
+        assert.equal(store.version, SCHEMA_VERSION, "migrated back up to current");
+        const m = store.all()[0]!;
+        assert.equal(m.content, "legacy fact");
+        assert.equal(m.importance, 0.7, "existing fields are untouched by the migration");
+        assert.equal(m.strength, INITIAL_STRENGTH, "backfilled to the baseline, not penalized");
+        assert.equal(m.lastSurfaced, undefined, "and treated as never surfaced");
+        // And the backfilled memory reinforces normally from there.
+        assert.ok(store.reinforce(m.id, 100)!.strength > INITIAL_STRENGTH);
+        store.close();
     });
 });

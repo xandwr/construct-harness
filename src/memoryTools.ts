@@ -40,6 +40,10 @@ export interface MemoryView {
     importance?: number;
     created: number;
     updated: number;
+    /** Durable, resurfacing-earned salience (the stored value; see
+     *  {@link Memory.strength}). Surfaced so a caller inspecting a memory can see
+     *  how reinforced it is, distinct from the explicit `importance` dial. */
+    strength: number;
 }
 
 function toView(m: Memory): MemoryView {
@@ -50,6 +54,7 @@ function toView(m: Memory): MemoryView {
         importance: m.importance,
         created: m.created,
         updated: m.updated,
+        strength: m.strength,
     };
 }
 

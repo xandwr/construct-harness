@@ -243,6 +243,37 @@ test("a surfaced memory stays warm into a next turn whose message doesn't match 
     }
 });
 
+test("a memory that surfaces in recall is durably reinforced (resurfacing strengthens)", async () => {
+    const store = new MemoryStore(":memory:");
+    try {
+        // One memory; no embedder, so recall falls back to importance/recency and
+        // surfaces it every turn regardless of the message.
+        const m = store.save({ content: "the user prefers dark mode" });
+        const before = store.get(m.id)!;
+        assert.equal(before.strength, 1, "starts at the baseline");
+        assert.equal(before.lastSurfaced, undefined, "and has never surfaced");
+
+        const client = new FakeClient([textTurn("ok"), textTurn("ok"), textTurn("ok")]);
+        const session = new Session({ client, system: "S", store });
+
+        // Three turns: the memory surfaces in each, so each send reinforces it.
+        await send(session, "first");
+        const afterOne = store.get(m.id)!;
+        assert.ok(afterOne.strength > 1, "one resurfacing strengthened it");
+        assert.ok(afterOne.lastSurfaced !== undefined, "and stamped the surfacing time");
+
+        await send(session, "second");
+        await send(session, "third");
+        const afterThree = store.get(m.id)!;
+        assert.ok(
+            afterThree.strength > afterOne.strength,
+            "repeated resurfacing keeps strengthening it",
+        );
+    } finally {
+        store.close();
+    }
+});
+
 test("a store wires memory tools and the model can save", async () => {
     const store = new MemoryStore(":memory:");
     try {

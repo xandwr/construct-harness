@@ -599,6 +599,22 @@ export class Session {
                 limit: this.cfg.recallLimit,
             });
             if (recalled.text) text = `${text}\n\n${recalled.text}`;
+            // Reinforce every memory that surfaced this turn: this is the durable
+            // half of the warm-memory mechanism. The working mind keeps it warm
+            // *in-process* (below); reinforce() persists the resurfacing, so a
+            // memory that keeps proving relevant strengthens in the store and ranks
+            // up next time, while ones that stop surfacing decay on their own (see
+            // MemoryStore.reinforce). Best-effort: a strength write must never fail
+            // the turn the user is in the middle of.
+            for (const m of recalled.memories) {
+                try {
+                    this.cfg.store.reinforce(m.id);
+                } catch {
+                    // Strength is an earned ranking signal, not load-bearing for
+                    // the turn; a write failure (closed store, vanished row) is
+                    // swallowed exactly like provenance/logging failures are.
+                }
+            }
             // A memory that surfaced this turn is kept warm in the working mind
             // for a while after, so it doesn't blink out the instant the next
             // message stops matching it. Keyed by store id so the same memory
