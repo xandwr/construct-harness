@@ -376,6 +376,20 @@
 		}
 	}
 
+	// A one-line note for a tool as it starts. For the local shell (the one tool
+	// that reaches outside the harness) show the command it's about to run, so the
+	// human sees what's touching their machine rather than a bare tool name.
+	function toolNote(name: string, args: unknown): string {
+		if (name === 'use__user__shell' && args && typeof args === 'object') {
+			const cmd = (args as { command?: unknown }).command;
+			if (typeof cmd === 'string' && cmd.trim()) {
+				const short = cmd.length > 80 ? cmd.slice(0, 80) + '…' : cmd;
+				return `shell: ${short}`;
+			}
+		}
+		return name;
+	}
+
 	function onChatEvent(e: ChatEvent, idx: number) {
 		const reply = messages[idx];
 		switch (e.kind) {
@@ -393,7 +407,7 @@
 			case 'tool': {
 				// Note each tool as it starts; mark a failure on its end.
 				if (e.phase === 'start') {
-					const note = `${e.name}`;
+					const note = toolNote(e.name, e.args);
 					reply.tool = reply.tool ? `${reply.tool}, ${note}` : note;
 				} else if (e.isError) {
 					reply.tool = reply.tool ? `${reply.tool} (errored)` : `${e.name} (errored)`;

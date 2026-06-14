@@ -59,7 +59,7 @@ import type { LoopEvent } from "./bridge/loop.ts";
 import { NotesStore, Note, NoteError, type NoteFrontmatter } from "./notes.ts";
 import { NotesService } from "./notesService.ts";
 import { noteTools } from "./noteTools.ts";
-import { shellTools } from "./shellTools.ts";
+import { shellTools, resolveShellPolicy, type ShellPolicyMode } from "./shellTools.ts";
 import { BUILTIN_COMMANDS } from "./commands.ts";
 import { dreamLoop, DREAM_EVENT_KIND, type Dream } from "./dreaming.ts";
 
@@ -149,6 +149,10 @@ export interface StatusConfig {
     dreamsEnabled: boolean;
     transcriptRecall: boolean;
     workingMind: boolean;
+    /** How the local shell is governed: the policy mode and the cwd roots it's
+     *  confined to (if any), so the status page shows whether `use__user__shell`
+     *  is unrestricted, restricted, or read-only. */
+    shellPolicy: { mode: ShellPolicyMode; allowedCwdRoots: string[] };
 }
 
 /** Builds the shared {@link SessionConfig} every live conversation runs under,
@@ -329,10 +333,19 @@ function buildDeps(): ServerDeps {
     const notesStore = new NotesStore(dbPath);
     const notes = new NotesService({ store: notesStore, root: kbDir, embedder });
 
+    // The governance the local shell runs under, resolved from the environment.
+    // Unset is `unrestricted` (the historical behavior): the policy only tightens
+    // when an operator opts in via SHELL_POLICY / SHELL_ALLOWED_ROOTS / the caps.
+    const shellPolicy = resolveShellPolicy(process.env);
+
     // The local (harness-owned) tools every Session runs with: the KB note tools
-    // and the local shell. Built once so both the session config and the status
-    // snapshot name the same set — the status page reports exactly what's wired.
-    const localTools = [...noteTools(notes, notesStore, embedder), ...shellTools()];
+    // and the local shell (under the resolved policy). Built once so both the
+    // session config and the status snapshot name the same set — the status page
+    // reports exactly what's wired.
+    const localTools = [
+        ...noteTools(notes, notesStore, embedder),
+        ...shellTools({ policy: shellPolicy }),
+    ];
 
     // One wiring shared by every live conversation. Every Session in the pool —
     // the boot one and every resumed past conversation — runs under this exact
@@ -420,6 +433,10 @@ function buildDeps(): ServerDeps {
             dreamsEnabled: true,
             transcriptRecall: true,
             workingMind: true,
+            shellPolicy: {
+                mode: shellPolicy.mode ?? "unrestricted",
+                allowedCwdRoots: shellPolicy.allowedCwdRoots ?? [],
+            },
         },
         close() {
             // Stop the watcher first so no inbound event races the store closing.
@@ -1262,6 +1279,9 @@ function handleStatus(res: ServerResponse, deps: ServerDeps): void {
             transcriptRecall: s?.transcriptRecall ?? false,
             workingMind: s?.workingMind ?? false,
         },
+        // How the local shell is governed. Defaults to unrestricted (the
+        // historical behavior) when no snapshot is supplied.
+        shellPolicy: s?.shellPolicy ?? { mode: "unrestricted", allowedCwdRoots: [] },
         liveSessions,
     });
 }

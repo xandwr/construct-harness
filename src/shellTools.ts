@@ -33,7 +33,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { basename } from "node:path";
+import { basename, resolve as resolvePath } from "node:path";
 import { platform } from "node:os";
 import type { ToolDef } from "./types.ts";
 
@@ -81,6 +81,25 @@ export interface ShellResult {
      *  when `ran` is false. A non-zero exit is not an error here: it's a normal
      *  result with `ran: true` and the code, the way a shell reports it. */
     error?: string;
+    /** The policy decision for this call: always present so every shell result
+     *  carries an audit trail (the mode it ran under, and on a block, why). A
+     *  blocked call has `ran: false`, `blocked: true`, and `error` set to the
+     *  reason; an allowed one carries the mode it was permitted under. The loop
+     *  logs the whole result in the `tool_result` event's meta, so this is the
+     *  structured audit record of every local shell call. */
+    policy: ShellPolicyDecision;
+}
+
+/** The audit record attached to every {@link ShellResult}: what the policy
+ *  decided and under which mode. */
+export interface ShellPolicyDecision {
+    /** The effective policy mode the call ran (or was refused) under. */
+    mode: ShellPolicyMode;
+    /** True when the policy refused the command before it could run. */
+    blocked: boolean;
+    /** The human-readable reason a command was blocked (a denied pattern, a cwd
+     *  outside the allowed roots, read-only mode). Undefined when allowed. */
+    reason?: string;
 }
 
 /** Narrow an unknown args bag to a record without trusting its fields yet, the
@@ -93,10 +112,10 @@ function asRecord(args: unknown): Record<string, unknown> {
  *  marker when we dropped anything so the model never mistakes a tail for the
  *  whole output. The tail (not the head) is kept because a command's verdict
  *  (the failing assertion, the final summary line) lands at the end. */
-function capTail(text: string): string {
-    if (text.length <= SHELL_OUTPUT_CAP) return text;
-    const kept = text.slice(text.length - SHELL_OUTPUT_CAP);
-    const dropped = text.length - SHELL_OUTPUT_CAP;
+function capTail(text: string, cap = SHELL_OUTPUT_CAP): string {
+    if (text.length <= cap) return text;
+    const kept = text.slice(text.length - cap);
+    const dropped = text.length - cap;
     return `…[${dropped} earlier character${dropped === 1 ? "" : "s"} truncated]\n${kept}`;
 }
 
@@ -140,6 +159,287 @@ function shellEnvNote(): string {
     );
 }
 
+// ── Policy: make local shell power governable ─────────────────────────────────
+
+/**
+ * How permissive the local shell is. The default (`unrestricted`) is the
+ * harness's historical behavior — the Construct can do anything the user could at
+ * their own prompt. The other modes let a cautious operator dial that back without
+ * removing the tool:
+ *  - `unrestricted` — no policy gate beyond the deny patterns; the original power.
+ *  - `restricted`   — deny patterns plus cwd-root confinement and the caps; run
+ *                     real commands, but only within the allowed roots.
+ *  - `read-only`    — additionally refuse any command that isn't recognizably a
+ *                     read. The blunt-but-honest mode for "let it look, not touch".
+ */
+export type ShellPolicyMode = "unrestricted" | "restricted" | "read-only";
+
+/**
+ * The governance applied to every `use__user__shell` call before it spawns. All
+ * fields have safe defaults; an unconfigured policy is `unrestricted` with the
+ * built-in deny patterns and the standard caps. A blocked call never throws — it
+ * returns a structured {@link ShellResult} with `blocked: true` and a reason, so
+ * the model reads the refusal as data and the loop logs the audit record.
+ */
+export interface ShellPolicy {
+    /** The permissiveness mode. Defaults to `unrestricted`. */
+    mode?: ShellPolicyMode;
+    /** Regexes that, if any matches the command, block it outright (in *every*
+     *  mode, including unrestricted). Defaults to {@link DEFAULT_DENY_PATTERNS}: a
+     *  short list of unambiguously destructive shapes (rm -rf /, fork bombs, raw
+     *  disk writes). Pass your own to replace the defaults, or `[]` to disable. */
+    denyPatterns?: RegExp[];
+    /** Absolute directory roots a command's working directory must fall within
+     *  (in `restricted`/`read-only` mode). A `cwd` outside every root is blocked.
+     *  Empty/undefined means "no cwd confinement" (the default). */
+    allowedCwdRoots?: string[];
+    /** Hard ceiling on a call's timeout in ms: a per-call `timeout_ms` larger than
+     *  this is clamped down to it, so the policy can cap how long any one command
+     *  may wedge a turn. Undefined means no extra ceiling beyond the default. */
+    maxTimeoutMs?: number;
+    /** Override for the returned-output cap in characters. Undefined uses
+     *  {@link SHELL_OUTPUT_CAP}. Lets a policy tighten how much a command can pour
+     *  into the turn's context. */
+    outputCap?: number;
+}
+
+/** The destructive command shapes blocked by default, in every mode. Deliberately
+ *  conservative — a few unambiguous catastrophes (recursive root delete, fork
+ *  bomb, raw disk overwrite, mkfs), not a sprawling blocklist that would give a
+ *  false sense of safety while breaking legitimate commands. The real safety
+ *  control is `read-only`/`restricted` mode and the cwd roots; this is a backstop
+ *  against the worst typos and prompt-injections even when unrestricted. */
+export const DEFAULT_DENY_PATTERNS: RegExp[] = [
+    // rm -rf / (and /*), with flags in any order.
+    /\brm\s+(-[a-z]*\s+)*-?[a-z]*[rf][a-z]*\s+(-[a-z]*\s+)*\/(\s|\*|$)/i,
+    // A classic fork bomb.
+    /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/,
+    // Raw write over a whole disk device, or formatting one.
+    /\b(dd)\b[^\n]*\bof=\/dev\/(sd|nvme|hd|disk)/i,
+    /\bmkfs(\.\w+)?\s+\/dev\//i,
+    // Overwrite a block device from /dev/zero or /dev/urandom.
+    />\s*\/dev\/(sd|nvme|hd|disk)/i,
+];
+
+/** Heuristic allow-list of read-only command leaders for `read-only` mode. A
+ *  command whose first word (after any leading `sudo`/`env`) isn't one of these is
+ *  refused. Blunt by design: it's a denylist-of-everything-else, so it errs toward
+ *  refusing an unfamiliar command rather than guessing it's safe. The model can
+ *  still be told what's allowed and pick a read instead. */
+const READ_ONLY_COMMANDS = new Set([
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "grep",
+    "rg",
+    "find",
+    "fd",
+    "stat",
+    "file",
+    "wc",
+    "echo",
+    "pwd",
+    "which",
+    "type",
+    "env",
+    "printenv",
+    "date",
+    "whoami",
+    "id",
+    "ps",
+    "top",
+    "df",
+    "du",
+    "uname",
+    "hostname",
+    "uptime",
+    "git",
+    "diff",
+    "tree",
+    "sort",
+    "uniq",
+    "cut",
+    "awk",
+    "sed",
+    "jq",
+    "less",
+    "more",
+    "node",
+    "python",
+    "python3",
+    "npm",
+    "cargo",
+    "go",
+    "tsc",
+]);
+
+/** Git subcommands that mutate, so `read-only` mode can allow `git status`/`log`
+ *  but refuse `git push`/`commit`/`reset`. */
+const GIT_WRITE_SUBCOMMANDS = new Set([
+    "push",
+    "commit",
+    "merge",
+    "rebase",
+    "reset",
+    "clean",
+    "checkout",
+    "switch",
+    "restore",
+    "rm",
+    "mv",
+    "add",
+    "stash",
+    "tag",
+    "branch",
+    "fetch",
+    "pull",
+    "clone",
+    "apply",
+    "cherry-pick",
+    "revert",
+    "gc",
+    "prune",
+    "config",
+]);
+
+/**
+ * Decide whether a command is permitted under a policy, returning the audit
+ * decision. Pure and synchronous: no spawn, no I/O. The order is deny-first (a
+ * destructive pattern is refused in every mode), then mode-specific checks
+ * (read-only's read allow-list, restricted's cwd confinement).
+ */
+export function evaluateShellPolicy(
+    command: string,
+    cwd: string | undefined,
+    policy: ShellPolicy,
+): ShellPolicyDecision {
+    const mode = policy.mode ?? "unrestricted";
+    const block = (reason: string): ShellPolicyDecision => ({ mode, blocked: true, reason });
+
+    // 1. Deny patterns: the catastrophe backstop, enforced in every mode.
+    const denyPatterns = policy.denyPatterns ?? DEFAULT_DENY_PATTERNS;
+    for (const re of denyPatterns) {
+        if (re.test(command)) {
+            return block(`command matches a blocked pattern (${re.source})`);
+        }
+    }
+
+    // 2. cwd confinement (restricted / read-only): the resolved cwd must sit
+    //    within one of the allowed roots.
+    if (mode !== "unrestricted" && policy.allowedCwdRoots && policy.allowedCwdRoots.length) {
+        const target = resolvePath(cwd ?? process.cwd());
+        const ok = policy.allowedCwdRoots.some((root) => isWithin(target, resolvePath(root)));
+        if (!ok) {
+            return block(`working directory ${target} is outside the allowed roots`);
+        }
+    }
+
+    // 3. read-only: every command in the pipeline must read, not write.
+    if (mode === "read-only" && !isReadOnlyCommand(command)) {
+        return block("read-only mode: this command is not a recognized read");
+    }
+
+    return { mode, blocked: false };
+}
+
+/** True when `child` is the same as, or nested under, `root`. Both must already
+ *  be absolute. Guards the path-prefix check against a sibling that merely shares
+ *  a name prefix ("/srv/app" must not count "/srv/app-other" as within). */
+function isWithin(child: string, root: string): boolean {
+    if (child === root) return true;
+    const base = root.endsWith("/") ? root : root + "/";
+    return child.startsWith(base);
+}
+
+/**
+ * Whether a command line is recognizably read-only: every command segment (split
+ * on the shell operators that chain commands) leads with an allowed read. Blunt:
+ * it refuses anything it doesn't recognize, and refuses outright on a redirect
+ * that writes a file (`>`/`>>` to a path). Not a security boundary on its own (a
+ * determined `read` tool can still mutate), but an honest "look, don't touch"
+ * default that catches the obvious writes.
+ */
+export function isReadOnlyCommand(command: string): boolean {
+    // A write redirect to a file is a mutation regardless of the leader. (We allow
+    // `2>&1` and `>/dev/null` style fd/devnull redirects, which don't write files.)
+    if (/(^|[^0-9>])>>?\s*(?!\/dev\/null|&)/.test(command)) return false;
+
+    // Split into command segments on ; | && || and `and`/`or` (fish), then check
+    // each leads with a read.
+    const segments = command
+        .split(/;|\|\||\||&&|(?:^|\s)and\s|(?:^|\s)or\s|&/)
+        .map((s) => s.trim());
+    for (const seg of segments) {
+        if (!seg) continue;
+        const words = seg.split(/\s+/);
+        let i = 0;
+        // Skip a leading sudo/env/command wrapper and inline VAR=val assignments.
+        while (i < words.length && (/^[A-Za-z_]\w*=/.test(words[i]) || words[i] === "sudo")) i++;
+        const leader = basename(words[i] ?? "");
+        if (!READ_ONLY_COMMANDS.has(leader)) return false;
+        // git is read-only only for non-mutating subcommands.
+        if (leader === "git") {
+            const sub = words.slice(i + 1).find((w) => !w.startsWith("-"));
+            if (sub && GIT_WRITE_SUBCOMMANDS.has(sub)) return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Resolve a {@link ShellPolicy} from environment variables, for the server's
+ * default wiring. Unset means `unrestricted` (the historical behavior — a change
+ * here would silently break existing setups). Recognized vars:
+ *  - `SHELL_POLICY`        = unrestricted | restricted | read-only
+ *  - `SHELL_ALLOWED_ROOTS` = colon-separated absolute dirs (cwd confinement)
+ *  - `SHELL_MAX_TIMEOUT_MS`= number, clamps any per-call timeout
+ *  - `SHELL_OUTPUT_CAP`    = number, overrides the returned-output cap
+ * A bad mode value degrades to `unrestricted` with a warning rather than
+ * crashing, so a typo never takes the server down.
+ */
+export function resolveShellPolicy(env: NodeJS.ProcessEnv = process.env): ShellPolicy {
+    const raw = (env.SHELL_POLICY ?? "").trim().toLowerCase();
+    let mode: ShellPolicyMode = "unrestricted";
+    if (raw === "restricted" || raw === "read-only" || raw === "readonly") {
+        mode = raw === "readonly" ? "read-only" : (raw as ShellPolicyMode);
+    } else if (raw !== "" && raw !== "unrestricted") {
+        console.warn(`SHELL_POLICY: unknown mode "${raw}", defaulting to unrestricted`);
+    }
+    const roots = (env.SHELL_ALLOWED_ROOTS ?? "")
+        .split(":")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    const maxTimeout = Number(env.SHELL_MAX_TIMEOUT_MS);
+    const cap = Number(env.SHELL_OUTPUT_CAP);
+    return {
+        mode,
+        allowedCwdRoots: roots.length ? roots : undefined,
+        maxTimeoutMs: Number.isFinite(maxTimeout) && maxTimeout > 0 ? maxTimeout : undefined,
+        outputCap: Number.isFinite(cap) && cap > 0 ? cap : undefined,
+    };
+}
+
+/** A sentence for the tool description naming the active policy mode, so the model
+ *  doesn't waste a turn discovering the restriction by being refused. Empty in
+ *  unrestricted mode (the default), where there's nothing extra to say. */
+function policyNote(mode: ShellPolicyMode): string {
+    if (mode === "read-only") {
+        return (
+            " NOTE: this shell is in READ-ONLY mode — commands that write, delete, or " +
+            "otherwise mutate the machine are refused. Use it only to inspect."
+        );
+    }
+    if (mode === "restricted") {
+        return (
+            " NOTE: this shell runs under a restricted policy — commands must stay " +
+            "within the allowed working directories, and some destructive commands are " +
+            "blocked. A refused command comes back with the reason."
+        );
+    }
+    return "";
+}
+
 /** Options for {@link shellTools}. */
 export interface ShellToolsOptions {
     /** Default timeout in ms for a command that doesn't set its own. Defaults to
@@ -149,6 +449,9 @@ export interface ShellToolsOptions {
      *  to the harness process's cwd, so a command runs where the user launched the
      *  Construct: the same place their own shell would start. */
     defaultCwd?: string;
+    /** The governance applied before every command runs (see {@link ShellPolicy}).
+     *  Omit for the historical unrestricted behavior. */
+    policy?: ShellPolicy;
 }
 
 /**
@@ -167,6 +470,9 @@ export interface ShellToolsOptions {
 export function shellTools(options: ShellToolsOptions = {}): ToolDef[] {
     const defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_SHELL_TIMEOUT_MS;
     const defaultCwd = options.defaultCwd;
+    const policy = options.policy ?? {};
+    const mode = policy.mode ?? "unrestricted";
+    const outputCap = policy.outputCap ?? SHELL_OUTPUT_CAP;
 
     const shell: ToolDef = {
         name: USER_SHELL_TOOL,
@@ -180,7 +486,8 @@ export function shellTools(options: ShellToolsOptions = {}): ToolDef[] {
             "computation that doesn't need to touch this machine, prefer the sandboxed " +
             "code execution tool instead. A non-zero exit code is returned as data, " +
             "not an error: read it and react. " +
-            shellEnvNote(),
+            shellEnvNote() +
+            policyNote(mode),
         parameters: {
             type: "object",
             properties: {
@@ -211,25 +518,41 @@ export function shellTools(options: ShellToolsOptions = {}): ToolDef[] {
         async run(args) {
             const a = asRecord(args);
             const command = a.command;
+            const decision: ShellPolicyDecision = { mode, blocked: false };
             if (typeof command !== "string" || command.trim() === "") {
-                return shellError("command must be a non-empty string");
+                return shellError("command must be a non-empty string", decision);
             }
             const cwd = typeof a.cwd === "string" && a.cwd.trim() ? a.cwd : defaultCwd;
-            const timeoutMs =
+
+            // Govern the call before it can spawn. A blocked command never runs and
+            // never throws: it returns a structured result the model reads as a
+            // refusal, and the loop logs the whole result (decision included) as the
+            // tool_result event's audit metadata.
+            const verdict = evaluateShellPolicy(command, cwd, policy);
+            if (verdict.blocked) {
+                return shellError(verdict.reason ?? "blocked by shell policy", verdict);
+            }
+
+            // Clamp the per-call timeout down to the policy ceiling, if one is set.
+            let timeoutMs =
                 typeof a.timeout_ms === "number" &&
                 Number.isFinite(a.timeout_ms) &&
                 a.timeout_ms > 0
                     ? a.timeout_ms
                     : defaultTimeoutMs;
-            return runCommand(command, { cwd, timeoutMs });
+            if (policy.maxTimeoutMs !== undefined) {
+                timeoutMs = Math.min(timeoutMs, policy.maxTimeoutMs);
+            }
+            return runCommand(command, { cwd, timeoutMs, outputCap, decision: verdict });
         },
     };
 
     return [shell];
 }
 
-/** Build the spawn-failure result shape, the one path where `ran` is false. */
-function shellError(message: string): ShellResult {
+/** Build the spawn-failure (or policy-block) result shape: the paths where `ran`
+ *  is false. Carries the policy decision so even a refusal is auditable. */
+function shellError(message: string, policy: ShellPolicyDecision): ShellResult {
     return {
         ran: false,
         exitCode: null,
@@ -238,6 +561,7 @@ function shellError(message: string): ShellResult {
         stderr: "",
         timedOut: false,
         error: message,
+        policy,
     };
 }
 
@@ -253,7 +577,7 @@ function shellError(message: string): ShellResult {
  */
 function runCommand(
     command: string,
-    opts: { cwd?: string; timeoutMs: number },
+    opts: { cwd?: string; timeoutMs: number; outputCap: number; decision: ShellPolicyDecision },
 ): Promise<ShellResult> {
     return new Promise((resolve) => {
         // `-c` runs the command string through the shell, so the model's pipes,
@@ -300,7 +624,7 @@ function runCommand(
         // A spawn-level failure (shell binary missing, cwd doesn't exist) fires
         // `error` and never `close`; surface it as the one `ran: false` path.
         child.on("error", (err) => {
-            finish(shellError(err instanceof Error ? err.message : String(err)));
+            finish(shellError(err instanceof Error ? err.message : String(err), opts.decision));
         });
 
         child.on("close", (code, signal) => {
@@ -308,9 +632,10 @@ function runCommand(
                 ran: true,
                 exitCode: code,
                 signal: signal ?? null,
-                stdout: capTail(stdout),
-                stderr: capTail(stderr),
+                stdout: capTail(stdout, opts.outputCap),
+                stderr: capTail(stderr, opts.outputCap),
                 timedOut,
+                policy: opts.decision,
             });
         });
     });

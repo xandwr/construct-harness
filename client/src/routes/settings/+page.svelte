@@ -50,7 +50,16 @@
 			},
 			{
 				title: 'tools',
-				rows: [{ label: 'local tools', value: status.localTools.join(' · ') || 'none' }]
+				rows: [
+					{ label: 'local tools', value: status.localTools.join(' · ') || 'none' },
+					{ label: 'shell policy', value: status.shellPolicy.mode },
+					{
+						label: 'shell cwd roots',
+						value: status.shellPolicy.allowedCwdRoots.length
+							? status.shellPolicy.allowedCwdRoots.join(' · ')
+							: 'unconfined'
+					}
+				]
 			},
 			{
 				title: 'storage',

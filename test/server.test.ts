@@ -834,6 +834,7 @@ test("GET /api/status reports the static config snapshot when one is supplied", 
             dreamsEnabled: true,
             transcriptRecall: true,
             workingMind: true,
+            shellPolicy: { mode: "read-only" as const, allowedCwdRoots: ["/srv/app"] },
         },
     };
     const { status, json } = await call(deps, getReq("/api/status"));
@@ -848,6 +849,9 @@ test("GET /api/status reports the static config snapshot when one is supplied", 
     assert.equal(json.compactAt, 99_000);
     assert.equal(json.embeddingConfigured, true);
     assert.deepEqual(json.features, { dreams: true, transcriptRecall: true, workingMind: true });
+    // The shell policy is reported so the status page shows how the local shell
+    // is governed.
+    assert.deepEqual(json.shellPolicy, { mode: "read-only", allowedCwdRoots: ["/srv/app"] });
     deps.close();
 });
 
@@ -884,6 +888,9 @@ test("GET /api/status answers even with no static snapshot (no-key/no-embedder c
         transcriptRecall: false,
         workingMind: false,
     });
+    // With no snapshot, the shell policy defaults to unrestricted (the historical
+    // behavior), unconfined.
+    assert.deepEqual(json.shellPolicy, { mode: "unrestricted", allowedCwdRoots: [] });
     // No secrets ever appear in the body.
     assert.ok(!/api[_-]?key/i.test(captured(json)), "no key field leaks");
     deps.close();

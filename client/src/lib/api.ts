@@ -260,6 +260,12 @@ export interface WireStatus {
     compactAt: number | null;
     embeddingConfigured: boolean;
     features: { dreams: boolean; transcriptRecall: boolean; workingMind: boolean };
+    /** How the local shell is governed: the policy mode and any cwd roots it's
+     *  confined to. `unrestricted` is the historical full-access behavior. */
+    shellPolicy: {
+        mode: "unrestricted" | "restricted" | "read-only";
+        allowedCwdRoots: string[];
+    };
     liveSessions: string[];
 }
 

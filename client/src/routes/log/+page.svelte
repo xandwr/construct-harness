@@ -40,6 +40,34 @@
 		recall: 'text-muted',
 		dream: 'text-faint'
 	};
+
+	// The local shell is the one tool that reaches outside the harness, so call it
+	// out in the log. Reads the structured meta the loop logs: a tool_call's args
+	// (the command) and a tool_result's policy decision (mode, blocked + reason),
+	// so a governed-down or refused command is visible at a glance, not buried in
+	// the stringified result.
+	function shellAudit(e: WireEvent): { label: string; blocked: boolean } | null {
+		const meta = e.meta as
+			| {
+					name?: string;
+					args?: { command?: string };
+					result?: { policy?: { mode?: string; blocked?: boolean; reason?: string } };
+			  }
+			| null
+			| undefined;
+		if (!meta || meta.name !== 'use__user__shell') return null;
+		if (e.kind === 'tool_call') {
+			const cmd = meta.args?.command;
+			return cmd ? { label: `shell · ${cmd}`, blocked: false } : { label: 'shell', blocked: false };
+		}
+		if (e.kind === 'tool_result') {
+			const p = meta.result?.policy;
+			if (p?.blocked) return { label: `blocked · ${p.reason ?? 'policy'}`, blocked: true };
+			if (p?.mode && p.mode !== 'unrestricted') return { label: `shell · ${p.mode}`, blocked: false };
+			return { label: 'shell', blocked: false };
+		}
+		return null;
+	}
 </script>
 
 <AppHeader title={app.title} icon={app.icon}>
@@ -67,7 +95,18 @@
 					>
 					<span class="text-faint w-20 shrink-0">{e.kind}</span>
 					<span class="text-faint w-12 shrink-0">{e.role ?? ''}</span>
-					<span class="{kindColor[e.kind] ?? 'text-text'} min-w-0 wrap-break-word">{e.content}</span>
+					<span class="min-w-0 wrap-break-word">
+						{#if shellAudit(e)}
+							{@const a = shellAudit(e)}
+							<span
+								class="{a?.blocked ? 'text-glow' : 'text-muted'} font-mono"
+								title={a?.blocked ? 'refused by the shell policy' : 'local shell call'}
+								>{a?.label}</span
+							>
+						{:else}
+							<span class={kindColor[e.kind] ?? 'text-text'}>{e.content}</span>
+						{/if}
+					</span>
 				</a>
 			{:else}
 				<!-- No session to link to (e.g. a system event); render it inert. -->
@@ -78,7 +117,18 @@
 					>
 					<span class="text-faint w-20 shrink-0">{e.kind}</span>
 					<span class="text-faint w-12 shrink-0">{e.role ?? ''}</span>
-					<span class="{kindColor[e.kind] ?? 'text-text'} min-w-0 wrap-break-word">{e.content}</span>
+					<span class="min-w-0 wrap-break-word">
+						{#if shellAudit(e)}
+							{@const a = shellAudit(e)}
+							<span
+								class="{a?.blocked ? 'text-glow' : 'text-muted'} font-mono"
+								title={a?.blocked ? 'refused by the shell policy' : 'local shell call'}
+								>{a?.label}</span
+							>
+						{:else}
+							<span class={kindColor[e.kind] ?? 'text-text'}>{e.content}</span>
+						{/if}
+					</span>
 				</div>
 			{/if}
 		{/each}

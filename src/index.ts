@@ -5,7 +5,7 @@ import { MemoryStore } from "./memory.ts";
 import { GoalStore } from "./goals.ts";
 import { OpenAIEmbedder, EmbeddingError, type Embedder } from "./embeddings.ts";
 import { Session } from "./session.ts";
-import { shellTools } from "./shellTools.ts";
+import { shellTools, resolveShellPolicy } from "./shellTools.ts";
 import { runRepl } from "./repl.ts";
 
 const BASE_SYSTEM =
@@ -107,9 +107,10 @@ async function main() {
             goals,
             embedder,
             // Give the Construct the user's real shell, the local counterpart to
-            // the sandboxed code_execution server tool: full, unguarded access to
-            // run commands on this machine.
-            tools: shellTools(),
+            // the sandboxed code_execution server tool. Unguarded by default; an
+            // operator can govern it via SHELL_POLICY and friends (see
+            // resolveShellPolicy), the same env config the server honors.
+            tools: shellTools({ policy: resolveShellPolicy(process.env) }),
             compaction: { thresholdTokens: compactAt },
             providerOptions: { cacheSystem: true },
         });
