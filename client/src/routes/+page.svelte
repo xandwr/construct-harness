@@ -3,16 +3,20 @@
 	import { APPS } from '$lib/apps';
 	import { page } from '$app/state';
 	import { sendChat, getEvents, ApiError, type ChatEvent, type WireEvent } from '$lib/api';
+	import { clock, shortWhen } from '$lib/time';
 
 	const app = APPS.find((a) => a.id === 'chat')!;
 
 	// A rendered transcript line. `tool` carries a one-line note of tool activity
 	// shown under the agent's text; `pending` marks the reply still streaming.
+	// `ts` is the epoch-ms send time: the event log's `ts` when replaying, or a
+	// client clock reading when the line is created live.
 	interface Line {
 		role: 'user' | 'agent';
 		text: string;
 		tool?: string;
 		pending?: boolean;
+		ts?: number;
 	}
 
 	// When ?session=<id> is present the conversations applet linked here to replay
@@ -58,9 +62,9 @@
 		let pendingTool: string | undefined;
 		for (const e of events) {
 			if (e.kind === 'message' && e.role === 'user') {
-				lines.push({ role: 'user', text: e.content });
+				lines.push({ role: 'user', text: e.content, ts: e.ts });
 			} else if (e.kind === 'message' && e.role === 'agent') {
-				lines.push({ role: 'agent', text: e.content, tool: pendingTool });
+				lines.push({ role: 'agent', text: e.content, tool: pendingTool, ts: e.ts });
 				pendingTool = undefined;
 			} else if (e.kind === 'tool_call') {
 				// Stack multiple tool calls in one turn onto a single note.
@@ -79,26 +83,30 @@
 		error = null;
 		footer = null;
 		sending = true;
-		messages.push({ role: 'user', text });
+		messages.push({ role: 'user', text, ts: Date.now() });
 
-		// The agent line we stream into. Text deltas append to `.text`; tool
-		// activity accumulates onto `.tool`.
-		const reply: Line = { role: 'agent', text: '', pending: true };
-		messages.push(reply);
+		// The agent line we stream into, tracked by its index so every mutation
+		// goes through the reactive `messages` proxy (mutating a captured object
+		// reference instead would update state Svelte isn't watching, and the
+		// reply would never render — even though the turn completed).
+		const idx = messages.push({ role: 'agent', text: '', pending: true }) - 1;
 
 		try {
-			await sendChat(text, (e: ChatEvent) => onChatEvent(e, reply));
+			await sendChat(text, (e: ChatEvent) => onChatEvent(e, idx));
 		} catch (e) {
-			reply.pending = false;
+			messages[idx].pending = false;
 			error = e instanceof ApiError ? e.message : 'the request failed';
-			if (!reply.text) reply.text = `[${error}]`;
+			if (!messages[idx].text) messages[idx].text = `[${error}]`;
 		} finally {
-			reply.pending = false;
+			messages[idx].pending = false;
+			// Stamp the reply's completion time if no `done` event did (error/abort).
+			messages[idx].ts ??= Date.now();
 			sending = false;
 		}
 	}
 
-	function onChatEvent(e: ChatEvent, reply: Line) {
+	function onChatEvent(e: ChatEvent, idx: number) {
+		const reply = messages[idx];
 		switch (e.kind) {
 			case 'text':
 				reply.text += e.text;
@@ -118,6 +126,7 @@
 				break;
 			case 'done':
 				reply.pending = false;
+				reply.ts = Date.now();
 				footer =
 					`${e.modelTurns} turn(s) · ${e.usage.inputTokens} in / ${e.usage.outputTokens} out` +
 					(e.compactions ? ` · ${e.compactions} compaction(s)` : '') +
@@ -149,15 +158,27 @@
 
 <div class="flex min-h-0 flex-1 flex-col">
 	<!-- Transcript -->
-	<div class="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4">
+	<div class="min-h-0 flex-1 overflow-y-auto px-4 py-4">
 		{#if messages.length === 0 && !error}
 			<div class="text-faint text-xs lowercase">
 				{viewing ? 'no messages in this conversation' : 'say something to begin'}
 			</div>
 		{/if}
 		{#each messages as m, i (i)}
-			<div class="flex gap-2">
-				<span class="text-faint w-12 shrink-0 text-[10px] lowercase">{m.role}</span>
+			<!-- A hairline rule between messages (not above the first) keeps the
+			     author boundary legible at wide widths, where text runs far from
+			     the left accent bar. The bar marks who; the rule marks where. -->
+			<div
+				class="flex gap-2 border-l-2 py-3 pl-2 {m.role === 'user'
+					? 'border-glow'
+					: 'border-border'} {i > 0 ? 'border-t border-t-border' : ''}"
+			>
+				<span class="flex w-12 shrink-0 flex-col text-[10px] leading-tight lowercase">
+					<span class="text-faint">{m.role}</span>
+					{#if m.ts}
+						<span class="text-faint/70 tabular-nums" title={shortWhen(m.ts)}>{clock(m.ts)}</span>
+					{/if}
+				</span>
 				<div class="min-w-0 flex-1">
 					<span class="text-text text-xs leading-relaxed whitespace-pre-wrap"
 						>{m.text}{#if m.pending}<span class="text-glow">▍</span>{/if}</span

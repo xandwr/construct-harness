@@ -22,3 +22,10 @@ export function shortWhen(ms: number): string {
     if (sameDay) return `today ${time}`;
     return `${MONTHS[d.getMonth()]} ${d.getDate()} ${time}`;
 }
+
+/** Just the clock, "14:02". For inline use where the date is implied (a single
+ *  conversation's messages); pair with {@link shortWhen} as a hover title. */
+export function clock(ms: number): string {
+    const d = new Date(ms);
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
