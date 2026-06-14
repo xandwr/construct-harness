@@ -59,11 +59,14 @@ function dim(out: ReplOutput, text: string): string {
  *     half-formatted character at a time.
  *
  *  2. **Segments must not run together.** A turn interleaves prose and tool
- *     blocks; without care they form one unspaced wall. This closure owns every
- *     boundary: entering a tool/compaction block first flushes and closes the
- *     current prose line, and resuming prose after a block emits a blank line so
- *     each segment reads as its own paragraph. {@link RenderState.finish} drains
- *     the buffer and leaves the cursor on a fresh line for the footer.
+ *     blocks; without care they form one unspaced wall. Entering a tool or
+ *     compaction block first flushes and closes the current prose line so the
+ *     dim status line starts clean. The reverse boundary, prose resuming after a
+ *     block, is handled upstream: {@link runLoopStream} injects a "\n\n" text
+ *     delta when text resumes across a turn, so every consumer (this REPL, the
+ *     web client) gets the paragraph break without re-deriving it, and here it
+ *     simply flows through the line buffer. {@link RenderState.finish} drains the
+ *     buffer and leaves the cursor on a fresh line for the footer.
  */
 interface RenderState {
     render(event: LoopEvent): void;
@@ -79,9 +82,12 @@ function makeRenderer(out: ReplOutput): RenderState {
     // True while we have emitted prose with no trailing newline since the last
     // boundary, i.e. either `pending` is non-empty or a rendered line is open.
     let inText = false;
-    // True once any text has been seen this turn, so the separating blank line
-    // goes *between* paragraphs, not before the first one.
-    let sawText = false;
+    // True right after a tool/compaction status block, until prose resumes. The
+    // block's dim lines already provide the visual paragraph break, so the
+    // separator runLoopStream injects when text resumes (a leading "\n\n" on the
+    // next text delta) would stack a second blank line. We trim that leading
+    // whitespace once, here, so the REPL shows exactly one gap.
+    let afterBlock = false;
 
     /** Render and emit a single completed source line (its `\n` is added). */
     function emitLine(src: string): void {
@@ -115,25 +121,40 @@ function makeRenderer(out: ReplOutput): RenderState {
     return {
         render(event: LoopEvent): void {
             switch (event.kind) {
-                case "text":
-                    // Resuming prose after a tool/compaction block: separate it
-                    // from the block above with a blank line.
-                    if (!inText && pending.length === 0 && sawText) out.write("\n");
-                    sawText = true;
-                    pending += event.text;
+                case "text": {
+                    // Prose that resumes across a turn boundary already carries
+                    // its own paragraph break: runLoopStream injects a "\n\n"
+                    // text delta when text resumes after a tool turn, so the
+                    // separation flows through `pending` like any other newline.
+                    // Right after a status block the block's own trailing newline
+                    // already starts a fresh line, so the injected "\n\n" would
+                    // stack two blank lines. Collapse the leading newline run to a
+                    // single one there: exactly one blank line of separation.
+                    let text = event.text;
+                    if (afterBlock) {
+                        text = text.replace(/^\n+/, "\n");
+                        // Still inside the run of injected/leading newlines until a
+                        // non-newline character arrives; only then is the gap set.
+                        if (/[^\n]/.test(text)) afterBlock = false;
+                    }
+                    pending += text;
                     flushCompleteLines();
                     break;
+                }
                 case "tool_start":
                     endText();
                     out.write(dim(out, `\n  ↳ ${event.name}(${compactArgs(event.args)})\n`));
+                    afterBlock = true;
                     break;
                 case "tool_end":
                     endText();
                     out.write(dim(out, `  ↳ ${event.name} ${event.isError ? "errored" : "ok"}\n`));
+                    afterBlock = true;
                     break;
                 case "compacted":
                     endText();
                     out.write(dim(out, `\n  [compacted history]\n`));
+                    afterBlock = true;
                     break;
                 // thinking, tool_call_start/args, turn_start, loop_done: not
                 // surfaced in the basic REPL view.

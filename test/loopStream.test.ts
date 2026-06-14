@@ -62,6 +62,74 @@ test("streams text deltas and ends with loop_done", async () => {
     assert.equal(done.result.final.stopReason, "end_turn");
 });
 
+test("separates prose that resumes across a tool turn with a blank line", async () => {
+    // The model says something, calls a tool, then says more on the next turn.
+    // Without a boundary the two prose runs concatenate into one unspaced wall;
+    // the loop injects a "\n\n" text delta so any consumer that joins `text`
+    // deltas (the web client, the session's assistantText) gets paragraphs.
+    const tool = spyTool();
+    // Text and a tool call in one assistant turn (like a real reply that says
+    // something then acts), followed by a turn of more prose.
+    const client = new FakeClient([
+        {
+            content: [
+                { kind: "text", text: "Looking now." },
+                { kind: "tool_call", id: "c1", name: "echo", args: {} },
+            ],
+            stopReason: "tool_use",
+        },
+        textTurn("Here's what I found."),
+    ]);
+    const { events } = await drain(
+        runLoopStream(client, { messages: [user("go")], tools: [tool] }),
+    );
+
+    const joined = events
+        .filter((e): e is Extract<LoopEvent, { kind: "text" }> => e.kind === "text")
+        .map((e) => e.text)
+        .join("");
+    assert.equal(
+        joined,
+        "Looking now.\n\nHere's what I found.",
+        "resumed prose must be separated from the earlier prose by a blank line",
+    );
+});
+
+test("does not insert a break before the very first prose of a run", async () => {
+    // A single text-only turn: no earlier prose exists, so no separator.
+    const client = new FakeClient([textTurn("hello world")]);
+    const { events } = await drain(runLoopStream(client, { messages: [user("hi")] }));
+    const firstText = events.find((e) => e.kind === "text");
+    assert.ok(firstText && firstText.kind === "text");
+    assert.equal(firstText.text, "hello world", "first prose must not be prefixed with a break");
+});
+
+test("a tool-only turn between prose does not stack extra breaks", async () => {
+    // Turn 1 prose, turn 2 is a pure tool call (no text), turn 3 prose. Only one
+    // boundary separates the two prose runs: the break is keyed on text
+    // resuming, not on every turn, so an intervening text-less turn adds nothing.
+    const tool = spyTool();
+    const client = new FakeClient([
+        {
+            content: [
+                { kind: "text", text: "First." },
+                { kind: "tool_call", id: "c1", name: "echo", args: {} },
+            ],
+            stopReason: "tool_use",
+        },
+        callTurn("c2", "echo", {}),
+        textTurn("Second."),
+    ]);
+    const { events } = await drain(
+        runLoopStream(client, { messages: [user("go")], tools: [tool] }),
+    );
+    const joined = events
+        .filter((e): e is Extract<LoopEvent, { kind: "text" }> => e.kind === "text")
+        .map((e) => e.text)
+        .join("");
+    assert.equal(joined, "First.\n\nSecond.");
+});
+
 test("runs a tool and emits tool_start/tool_end around it", async () => {
     const tool = spyTool();
     const client = new FakeClient([callTurn("c1", "echo", { x: 1 }), textTurn("done")]);

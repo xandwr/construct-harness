@@ -61,6 +61,10 @@ export * from "./session.ts";
 export * from "./orchestrate.ts";
 export * from "./critics.ts";
 
+// Measuring the critic panel: does its verdict stay invariant to nuisance
+// variables (roster order, the stakes dealt) the way an unbiased jury's would?
+export * from "./biasHarness.ts";
+
 // Dreaming: generating disposable Constructs during downtime.
 export * from "./dreaming.ts";
 

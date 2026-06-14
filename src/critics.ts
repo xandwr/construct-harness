@@ -72,7 +72,8 @@ export interface Stake {
      *    cost of a needless rejection.
      *
      * A roster wants both, so the panel adjudicates a real tension instead of
-     * averaging a monoculture. See {@link STAKE_POOL} and {@link dealStakes}.
+     * averaging a monoculture. {@link dealRoster} guarantees both appear on a
+     * panel of ≥ 2; see also {@link STAKE_POOL}.
      */
     valence: "falsePass" | "falseFail";
 }
@@ -121,10 +122,11 @@ export interface Personality {
     /** What depends on this critic getting it right: the consequences they
      *  carry into the room. The mechanism that gives a persona spine without
      *  ordering it to be blunt: spine falls out of having something to protect.
-     *  Often dealt at random per run (see {@link dealStakes}) so a persona
-     *  protects different things across invocations, which decorrelates the
-     *  panel's errors between runs: the property {@link majorityRule} needs to
-     *  be trustworthy. Empty or absent means a critic with nothing on the line. */
+     *  Often dealt at random per run (see {@link dealRoster} for a panel, or
+     *  {@link dealStakes} for one persona) so a persona protects different things
+     *  across invocations, which decorrelates the panel's errors between runs:
+     *  the property {@link majorityRule} needs to be trustworthy. Empty or absent
+     *  means a critic with nothing on the line. */
     stakes?: Stake[];
     /** Verbatim extra system guidance, appended after the rendered persona. An
      *  escape hatch for instructions that don't fit the structured fields:
@@ -174,7 +176,7 @@ function tailSegments(p: Personality): string[] {
 
 /**
  * Render a {@link Personality} into *who they are*: identity, traits, the stakes
- * scene, and any `extra` — but **not** the verdict framing. This is the persona
+ * scene, and any `extra`, but **not** the verdict framing. This is the persona
  * as a person, not as a reviewer.
  *
  * Pure and exported so a caller can drop a persona into a task that isn't a
@@ -238,11 +240,12 @@ export function renderStakes(stakes: Stake[] | undefined): string {
  * A pool of stakes to draw from, split across both valences.
  *
  * Hand-written rather than generated so the consequences are concrete and
- * legible: a reader can see exactly what pressure a panel is under. The split
- * is deliberate and roughly even: {@link dealStakes} draws across the whole
- * pool, so over a panel the dealt stakes pull in both directions and the
- * consensus rule adjudicates a real tension instead of a stampede. Extend it
- * freely; keep both valences populated or the panel's bias goes one-way.
+ * legible: a reader can see exactly what pressure a panel is under. The split is
+ * deliberate and roughly even: {@link dealRoster} strata a panel across the two
+ * valences, drawing each member's stake from its assigned side, so the dealt
+ * stakes pull in both directions and the consensus rule adjudicates a real
+ * tension instead of a stampede. Extend it freely; keep both valences populated
+ * or a stratified deal has nothing to put on one side.
  */
 export const STAKE_POOL: readonly Stake[] = [
     // falsePass: dread of waving something broken through.
@@ -300,6 +303,24 @@ export interface DealOptions {
 }
 
 /**
+ * Draw `count` distinct items from `pool` without replacement, via a partial
+ * Fisher–Yates: settle only the first `count` slots and stop, rather than
+ * shuffling the whole pool. Returns a fresh array; `pool` is untouched. The
+ * shared draw under {@link dealStakes} and {@link dealRoster}.
+ */
+function drawWithoutReplacement<T>(pool: readonly T[], count: number, random: Random): T[] {
+    const deck = [...pool];
+    const n = Math.min(count, deck.length);
+    for (let i = 0; i < n; i++) {
+        const j = i + Math.floor(random() * (deck.length - i));
+        const tmp = deck[i]!;
+        deck[i] = deck[j]!;
+        deck[j] = tmp;
+    }
+    return deck.slice(0, n);
+}
+
+/**
  * Hand a persona a random set of stakes: the "just *handed* something to
  * protect" move.
  *
@@ -307,14 +328,21 @@ export interface DealOptions {
  * without replacement, so a critic that already carried stakes is replaced, not
  * appended to (a fresh deal each run is the point). The draw is uniform over the
  * pool across both valences, so which way a given critic is biased this run is
- * itself luck of the draw: that's the feature. Fixed stakes would give a panel
- * a fixed set of reflexes, and {@link majorityRule} over correlated reflexes is
- * false confidence; dealing fresh each run keeps the members' errors independent
- * *between* runs, which is the property the vote actually relies on.
+ * itself luck of the draw.
  *
- * Deal a whole roster by mapping this over it; each persona gets its own draw,
- * so a three-person panel naturally ends up with a mix of valences most of the
- * time. Pure but for `random`, which is injectable for tests.
+ * This deals *one persona*, and that is its limit: mapping it over a roster
+ * gives each member an independent valence coin-flip, so a three-person panel
+ * comes out fully one-sided (all three biased the same way) a quarter of the
+ * time, the very monoculture the stakes mechanism exists to prevent, and
+ * {@link majorityRule} over a one-sided panel is the false confidence
+ * {@link Stake} warns about. The counterposed-bias property is a property of the
+ * *panel*, not the individual, so the correct seam to enforce it is the roster:
+ * use {@link dealRoster} to deal a whole panel and guarantee both valences are
+ * represented. Reach for `dealStakes` when you genuinely want one persona's
+ * stakes in isolation (the dream loop's single dreamer, say), not to build a
+ * panel.
+ *
+ * Pure but for `random`, which is injectable for tests.
  *
  * @throws RangeError if `count` is negative.
  */
@@ -325,19 +353,87 @@ export function dealStakes(personality: Personality, options: DealOptions = {}):
     if (requested < 0) {
         throw new RangeError(`dealStakes: count must be ≥ 0, got ${requested}`);
     }
-    const count = Math.min(requested, pool.length);
+    return { ...personality, stakes: drawWithoutReplacement(pool, requested, random) };
+}
 
-    // Partial Fisher–Yates: draw `count` distinct stakes without replacement.
-    // We only need the first `count` slots settled, so we stop early rather than
-    // shuffling the whole pool.
-    const deck = [...pool];
-    for (let i = 0; i < count; i++) {
-        const j = i + Math.floor(random() * (deck.length - i));
-        const tmp = deck[i]!;
-        deck[i] = deck[j]!;
-        deck[j] = tmp;
+/**
+ * Deal a whole roster at once, guaranteeing both valences are represented
+ * whenever the panel has ≥ 2 members: the stratified deal.
+ *
+ * {@link dealStakes} deals each persona an independent valence, so the
+ * counterposed-bias the panel sells is only true *in expectation*: a three-person
+ * panel still comes out fully one-sided ~25% of the time (every member pulling
+ * the same way), and per-run is the only run that ships. This is the fix. The
+ * pool is split by valence, the roster's members are partitioned across the two
+ * valences as evenly as the split allows (⌈n/2⌉ vs ⌊n/2⌋), and *which* members
+ * land on which side is shuffled, so the guarantee is structural (both valences
+ * always present for n ≥ 2) while the per-run randomness the vote relies on
+ * survives *within* each valence: which persona is biased which way, and which
+ * concrete stake it draws, are still luck of the draw.
+ *
+ * Returns a fresh roster of copies in the original order (so a caller's panel
+ * order is preserved); the inputs are untouched. A single-persona roster falls
+ * back to one uniform {@link dealStakes} draw: there is no tension to enforce
+ * with one member. An empty roster returns empty. If `count` is 0 every persona
+ * is dealt nothing, exactly as {@link dealStakes} would.
+ *
+ * Within a valence, stakes are drawn without replacement, but the draw is
+ * *independent per persona*, so two members on the same side can share a stake
+ * when that side's sub-pool is smaller than the members assigned to it. The
+ * load-bearing guarantee is valence coverage, not stake uniqueness across the
+ * panel.
+ *
+ * Pure but for `random`, which is injectable for tests.
+ *
+ * @throws RangeError if `count` is negative.
+ */
+export function dealRoster(roster: Personality[], options: DealOptions = {}): Personality[] {
+    const pool = options.pool ?? STAKE_POOL;
+    const random = options.random ?? Math.random;
+    const count = options.count ?? 1;
+    if (count < 0) {
+        throw new RangeError(`dealRoster: count must be ≥ 0, got ${count}`);
     }
-    return { ...personality, stakes: deck.slice(0, count) };
+
+    // One member (or none): no panel-level tension to enforce, so a plain
+    // per-persona draw is exactly right. Routing through dealStakes keeps the
+    // single-persona path identical to dealing it alone.
+    if (roster.length <= 1) {
+        return roster.map((p) => dealStakes(p, { count, pool, random }));
+    }
+
+    const byValence: Record<Stake["valence"], readonly Stake[]> = {
+        falsePass: pool.filter((s) => s.valence === "falsePass"),
+        falseFail: pool.filter((s) => s.valence === "falseFail"),
+    };
+
+    // Assign valences to seats, half and half, then shuffle so *which* persona
+    // gets which side isn't positional. Both valences appear for n ≥ 2 because
+    // ⌈n/2⌉ ≥ 1 and ⌊n/2⌋ ≥ 1 there: the structural guarantee. A side whose
+    // sub-pool is empty contributes no stakes for its seats (a critic with
+    // nothing on the line) rather than silently borrowing the other valence.
+    const half = Math.ceil(roster.length / 2);
+    const valences: Stake["valence"][] = roster.map((_, i) =>
+        i < half ? "falsePass" : "falseFail",
+    );
+    shuffleInPlace(valences, random);
+
+    return roster.map((persona, i) => {
+        const sub = byValence[valences[i]!];
+        return { ...persona, stakes: drawWithoutReplacement(sub, count, random) };
+    });
+}
+
+/** Full Fisher–Yates shuffle of `arr` in place, using `random` for the draws.
+ *  Used by {@link dealRoster} to randomise the valence-to-seat assignment so the
+ *  stratification isn't positional. */
+function shuffleInPlace<T>(arr: T[], random: Random): void {
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(random() * (i + 1));
+        const tmp = arr[i]!;
+        arr[i] = arr[j]!;
+        arr[j] = tmp;
+    }
 }
 
 // ── The critic ───────────────────────────────────────────────────────────────

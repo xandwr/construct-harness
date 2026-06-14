@@ -39,7 +39,7 @@ provider-hosted web search / fetch / code execution it can run server-side
 counterpart to that sandboxed code execution, a `use__user__shell` tool that runs
 commands on the user's _real_ machine, with the harness process's own privileges,
 so it can run the project's tests, read or edit actual files, and drive the user's
-CLIs ([`src/shellTools.ts`](src/shellTools.ts)) — and because those commands go
+CLIs ([`src/shellTools.ts`](src/shellTools.ts)), and because those commands go
 through the user's actual login shell, the tool tells the Construct which shell
 (and OS) it's on, so it writes fish, zsh, or bash syntax rather than assuming
 bash. Its reasoning trace streams
@@ -55,19 +55,42 @@ judges in character, and each critic is dealt a **stake**: a scene where being
 wrong has a cost. Stakes come in two directions. A `falsePass` stake dreads
 waving something broken through, so it pulls toward rejection. A `falseFail`
 stake dreads blocking good work, so it pulls toward approval. Deal both across a
-panel and you get a jury that argues a real tension instead of a monoculture
-nodding along. See [`src/critics.ts`](src/critics.ts).
+panel with `dealRoster` and you get a jury that argues a real tension instead of
+a monoculture nodding along. See [`src/critics.ts`](src/critics.ts).
+
+`dealRoster` is doing real work in that sentence. The naive way to deal stakes is
+per persona (each critic draws independently from the pool), and that only gives
+you both valences _in expectation_. Per run it fails loudly: with a balanced pool,
+a three-critic panel comes out fully one-sided (every member biased the same way)
+**a quarter of the time**, which is exactly the stampede the mechanism exists to
+prevent, and `majorityRule` over a stampede is false confidence. `dealRoster`
+fixes that structurally: it stratifies the deal across the roster so both valences
+are guaranteed present for any panel of two or more, while keeping the per-run
+randomness (which persona is biased which way, and which concrete stake it draws)
+alive within each valence. (`dealStakes` still deals one persona in isolation,
+for callers like the dream loop that genuinely want a single biased Construct.)
 
 Two honest notes on that panel. First, the idea that a panel of diverse,
 oppositely-biased judges beats one judge, and is cheaper and less self-biased,
 is well supported: see _Replacing Judges with Juries_
-([arXiv:2404.18796](https://arxiv.org/abs/2404.18796)). Second, the specific
-claim that randomly dealing stakes _decorrelates_ the panel's errors run to run
-is the design intent, not something measured yet. LLM judges are known to carry
-order and position biases (_Judging the Judges_,
-[arXiv:2406.07791](https://arxiv.org/abs/2406.07791)), and a bias-invariance
-test for this panel is on the roadmap. Treat the decorrelation as a hypothesis
-the design is built to test, not a result.
+([arXiv:2404.18796](https://arxiv.org/abs/2404.18796)). Second, the claim that
+the panel's verdict is _invariant_ to the things it shouldn't depend on (the
+order the personas sit in, and which stakes they happen to be dealt) is now
+measurable, not just asserted. The logically prior half is settled: a single
+run's panel coming out one-sided is ruled out by `dealRoster`'s stratification,
+with a test asserting both valences always appear. The harder, between-run half
+has a harness: [`src/biasHarness.ts`](src/biasHarness.ts) runs the live panel
+over a candidate many times, re-seating and re-dealing between trials, and
+reports how stable _and_ how correct the verdict was (`npm run bias`, gated on
+`ANTHROPIC_API_KEY`). An early run is sobering and worth stating plainly: on a
+candidate carrying the cardinal flaw (`Math.random()` for a reset token) the
+panel failed it every trial (rock-solid), but on genuinely sound code its
+verdict _wobbled_ with the seating and the deal. LLM judges are known to carry
+exactly this kind of order and position bias (_Judging the Judges_,
+[arXiv:2406.07791](https://arxiv.org/abs/2406.07791)); the panel mitigates it but
+does not erase it, and the harness is how you see that rather than hope it away.
+Treat the invariance as a property the design is built toward and the harness
+measures, not one it already achieves.
 
 ## Requirements
 
@@ -147,12 +170,12 @@ The panel is the same primitive whether you use it to grade one answer or as the
 verifier inside a larger run.
 
 ```ts
-import { AnthropicClient, panel, dealStakes, majorityRule } from "construct-harness";
+import { AnthropicClient, panel, dealRoster, majorityRule } from "construct-harness";
 import type { Personality } from "construct-harness";
 
 const client = new AnthropicClient();
 
-const roster: Personality[] = [
+const roster: Personality[] = dealRoster([
     {
         name: "Mara",
         role: "staff security engineer",
@@ -164,7 +187,8 @@ const roster: Personality[] = [
         disposition: "protects momentum; rejects perfectionism that is not load-bearing",
     },
     { name: "Sam", role: "the on-call engineer who gets paged at 3am" },
-].map((p) => dealStakes(p)); // hand each critic something to protect, drawn at random
+]); // deal the whole panel at once: stakes drawn at random, but both valences
+// guaranteed present so the jury argues a tension rather than stampeding one way
 
 const verdict = await panel(roster, { client }, candidateText, { consensus: majorityRule });
 console.log(verdict.ok); // the jury's call
@@ -238,8 +262,12 @@ project is trying not to be.
   wired (the server always does) every turn is appended to durable SQLite, so it
   outlives the process and the Construct can search it with `transcript_recall`.
   Saved memories and goals persist the same way.
-- **The decorrelation claim is unmeasured.** See the note under the critic panel
-  above.
+- **The panel's between-run invariance is measured, and imperfect.** The
+  within-run stampede is ruled out structurally (`dealRoster`), but an early run
+  of the bias harness (`npm run bias`) shows the verdict on genuinely-sound code
+  still wobbles with the seating and the deal, even as the cardinal-flaw case is
+  caught every time. See the note under the critic panel above. Mitigated, not
+  erased.
 
 ## License
 

@@ -24,6 +24,7 @@ import {
     majorityRule,
     unanimousRule,
     dealStakes,
+    dealRoster,
     STAKE_POOL,
     type Personality,
     type CriticVerdict,
@@ -224,6 +225,130 @@ test("dealStakes draws from a custom pool when given one", () => {
     const pool: Stake[] = [{ riding: "only this", valence: "falseFail" }];
     const dealt = dealStakes({ name: "Lee" }, { count: 1, pool, random: pinned(0) });
     assert.equal(dealt.stakes![0]!.riding, "only this");
+});
+
+// ── dealRoster: stratify a panel so both valences are always present ──────────
+
+/** The set of valences a dealt persona carries (a critic with no stakes → empty). */
+function valencesOf(p: Personality): Set<Stake["valence"]> {
+    return new Set((p.stakes ?? []).map((s) => s.valence));
+}
+
+/** True iff the dealt roster shows both valences across its members: the panel
+ *  argues a tension rather than stampeding one way. */
+function bothValencesPresent(roster: Personality[]): boolean {
+    const seen = new Set<Stake["valence"]>();
+    for (const p of roster) for (const v of valencesOf(p)) seen.add(v);
+    return seen.has("falsePass") && seen.has("falseFail");
+}
+
+const PANEL3: Personality[] = [{ name: "A" }, { name: "B" }, { name: "C" }];
+
+test("dealRoster guarantees both valences on a panel of >= 2, for every seed", () => {
+    // The structural guarantee, checked against the real RNG over many deals: a
+    // mapped dealStakes would land fully one-sided ~25% of the time on a 3-panel.
+    // dealRoster must never do so. We assert zero one-sided deals across a large
+    // sample (and across panel sizes 2..6), so a regression to per-persona dealing
+    // would fail loudly instead of "usually passing".
+    for (let size = 2; size <= 6; size++) {
+        const roster = Array.from({ length: size }, (_, i) => ({ name: `p${i}` }));
+        for (let trial = 0; trial < 5000; trial++) {
+            assert.ok(
+                bothValencesPresent(dealRoster(roster)),
+                `size ${size}, trial ${trial}: deal came out one-sided`,
+            );
+        }
+    }
+});
+
+test("dealRoster splits the seats as evenly as the valence allows", () => {
+    // 3 seats -> one valence gets 2 seats, the other 1 (ceil/floor of n/2). With
+    // count 1, exactly one valence appears twice and the other once.
+    const dealt = dealRoster(PANEL3);
+    const counts = { falsePass: 0, falseFail: 0 };
+    for (const p of dealt) for (const v of valencesOf(p)) counts[v]++;
+    assert.equal(counts.falsePass + counts.falseFail, 3, "every seat got a valence");
+    assert.deepEqual(
+        [counts.falsePass, counts.falseFail].sort(),
+        [1, 2],
+        "a 3-panel splits 2-1 across the two valences",
+    );
+});
+
+test("dealRoster preserves roster order and returns copies, not mutations", () => {
+    const roster: Personality[] = [{ name: "A" }, { name: "B" }, { name: "C" }];
+    const dealt = dealRoster(roster, { random: pinned(0.5) });
+    assert.deepEqual(
+        dealt.map((p) => p.name),
+        ["A", "B", "C"],
+        "order is preserved",
+    );
+    // The inputs are untouched: no stakes leaked back onto the originals.
+    for (const p of roster) assert.equal(p.stakes, undefined);
+    // And the results are distinct objects from the inputs.
+    for (let i = 0; i < roster.length; i++) assert.notEqual(dealt[i], roster[i]);
+});
+
+test("dealRoster on a single persona falls back to one uniform draw", () => {
+    // No panel-level tension to enforce with one member, so it's just dealStakes.
+    const solo = dealRoster([{ name: "Solo" }], { count: 1, random: pinned(0) });
+    assert.equal(solo.length, 1);
+    assert.equal(solo[0]!.stakes!.length, 1);
+    // Matches dealing that persona alone with the same RNG.
+    const alone = dealStakes({ name: "Solo" }, { count: 1, random: pinned(0) });
+    assert.deepEqual(solo[0]!.stakes, alone.stakes);
+});
+
+test("dealRoster on an empty roster returns empty", () => {
+    assert.deepEqual(dealRoster([]), []);
+});
+
+test("dealRoster with count 0 hands every member nothing", () => {
+    const dealt = dealRoster(PANEL3, { count: 0 });
+    for (const p of dealt) assert.deepEqual(p.stakes, []);
+});
+
+test("dealRoster honours count per persona", () => {
+    // Two stakes each, both from the member's assigned valence's sub-pool.
+    const dealt = dealRoster(PANEL3, { count: 2 });
+    for (const p of dealt) {
+        assert.equal(p.stakes!.length, 2);
+        // Both of a member's stakes share one valence: it's drawn from one side.
+        assert.equal(valencesOf(p).size, 1, "a member's stakes are all one valence");
+        for (const s of p.stakes!) assert.ok(STAKE_POOL.some((q) => q.riding === s.riding));
+    }
+    // ...and across the panel both sides are still represented.
+    assert.ok(bothValencesPresent(dealt));
+});
+
+test("dealRoster is deterministic under a pinned RNG", () => {
+    const a = dealRoster(PANEL3, { count: 1, random: pinned(0.1, 0.7, 0.3, 0.9) });
+    const b = dealRoster(PANEL3, { count: 1, random: pinned(0.1, 0.7, 0.3, 0.9) });
+    assert.deepEqual(
+        a.map((p) => p.stakes),
+        b.map((p) => p.stakes),
+    );
+});
+
+test("dealRoster rejects a negative count", () => {
+    assert.throws(() => dealRoster(PANEL3, { count: -1 }), /count must be ≥ 0/);
+});
+
+test("dealRoster gives a seat nothing when its assigned valence sub-pool is empty", () => {
+    // A pool with only falsePass stakes: the falseFail seats have nothing to draw,
+    // so they come out with no stakes rather than borrowing the other valence.
+    const pool: Stake[] = [
+        { riding: "fp one", valence: "falsePass" },
+        { riding: "fp two", valence: "falsePass" },
+    ];
+    const dealt = dealRoster(PANEL3, { count: 1, pool });
+    // Some seats carry a falsePass stake; the falseFail-assigned seats carry none.
+    const empties = dealt.filter((p) => (p.stakes ?? []).length === 0).length;
+    const fps = dealt.filter((p) => valencesOf(p).has("falsePass")).length;
+    assert.ok(fps >= 1, "the populated valence still got dealt");
+    assert.ok(empties >= 1, "the empty-valence seats got nothing, not a borrowed stake");
+    // Nobody got a falseFail stake (there were none to give).
+    for (const p of dealt) assert.ok(!valencesOf(p).has("falseFail"));
 });
 
 test("critic builds a Session whose system prompt is the rendered persona", () => {

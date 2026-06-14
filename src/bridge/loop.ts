@@ -324,6 +324,21 @@ export async function* runLoopStream(
     let stoppedAtMaxTurns = false;
     let compactions = 0;
 
+    // Track text across turns so we can separate it. A multi-turn run emits the
+    // model's prose in pieces: the model says something, calls a tool, then on
+    // the next turn says more. The model's own newlines live *inside* a turn's
+    // text; nothing sits between one turn's last text delta and the next turn's
+    // first. A consumer that simply concatenates `text` deltas (the web client's
+    // `reply.text +=`, the session's `assistantText`) would glue those pieces
+    // into one unspaced wall. We own the turn boundary here: when text resumes in
+    // a later turn, prepend a paragraph break to its first delta so every
+    // consumer sees the segments as distinct paragraphs without re-deriving the
+    // boundary itself. `sawText` is true once any turn has emitted text;
+    // `turnHadText` resets each turn and gates "this is the first text since the
+    // boundary".
+    let sawText = false;
+    let turnHadText = false;
+
     while (turns < maxTurns) {
         const gated = await compactGate(client, messages, params, usage);
         messages = gated.messages;
@@ -339,9 +354,21 @@ export async function* runLoopStream(
         // Consume the model stream, passing its deltas straight through and
         // capturing the terminal `done` as this turn's result.
         let result: GenerateResult | undefined;
+        turnHadText = false;
         for await (const delta of client.stream({ ...params, messages: outgoing })) {
             if (delta.kind === "done") {
                 result = delta.result;
+            } else if (delta.kind === "text") {
+                // First non-empty text of a turn that follows an earlier turn's
+                // text: insert the paragraph break that the cross-turn boundary
+                // otherwise lacks. Guard on `delta.text` so an empty delta never
+                // triggers (or absorbs) the separator.
+                if (delta.text.length > 0 && !turnHadText) {
+                    turnHadText = true;
+                    if (sawText) yield { kind: "text", text: "\n\n" };
+                    sawText = true;
+                }
+                yield delta;
             } else {
                 yield delta;
             }
