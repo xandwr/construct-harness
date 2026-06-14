@@ -148,6 +148,13 @@ function toAnthropicContent(parts: ContentPart[]): Anthropic.ContentBlockParam[]
         switch (part.kind) {
             case "text":
                 return { type: "text", text: part.text };
+            case "image":
+                // The SDK takes a base64 source block directly; this is the layer
+                // that actually puts the pixels in front of the model.
+                return {
+                    type: "image",
+                    source: { type: "base64", media_type: part.mediaType, data: part.data },
+                };
             case "tool_call":
                 return {
                     type: "tool_use",

@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import { EventStore, EventError } from "../src/events.ts";
+import { EventStore, EventError, MAX_ATTACHMENT_BYTES } from "../src/events.ts";
 import { Memory, MemoryStore, SCHEMA_VERSION, MAX_CONTENT_LENGTH } from "../src/memory.ts";
 
 function withTempDir(fn: (dir: string) => void): void {
@@ -671,5 +671,132 @@ test("events persist across reopen and checkpoint is repeatable", () => {
         assert.equal(b.count(), 20);
         assert.equal(b.recent({ limit: 1 })[0]?.content, "e19");
         b.close();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Image attachments (selective side table)
+// ---------------------------------------------------------------------------
+
+test("appendAttachment round-trips bytes; attachmentsFor lists metadata only", () => {
+    const store = freshStore();
+    const ev = store.append({ kind: "message", role: "user", content: "look [image: a.png]" });
+    const bytes = Uint8Array.from([1, 2, 3, 4, 5]);
+    const id = store.appendAttachment(ev.id, {
+        mediaType: "image/png",
+        data: bytes,
+        filename: "a.png",
+    });
+
+    // The list read carries metadata, never the bytes.
+    const metas = store.attachmentsFor(ev.id);
+    assert.equal(metas.length, 1);
+    assert.equal(metas[0].id, id);
+    assert.equal(metas[0].eventId, ev.id);
+    assert.equal(metas[0].mediaType, "image/png");
+    assert.equal(metas[0].filename, "a.png");
+    assert.equal("data" in metas[0], false);
+
+    // The bytes-bearing read returns the exact bytes back.
+    const full = store.getAttachment(id);
+    assert.ok(full);
+    assert.deepEqual(Array.from(full!.data), [1, 2, 3, 4, 5]);
+    assert.equal(full!.mediaType, "image/png");
+
+    store.close();
+});
+
+test("attachmentsFor orders oldest-first and is empty for an event with none", () => {
+    const store = freshStore();
+    const ev = store.append({ kind: "message", role: "user", content: "two pics" });
+    const first = store.appendAttachment(ev.id, {
+        mediaType: "image/png",
+        data: Uint8Array.from([1]),
+    });
+    const second = store.appendAttachment(ev.id, {
+        mediaType: "image/jpeg",
+        data: Uint8Array.from([2]),
+    });
+    assert.deepEqual(
+        store.attachmentsFor(ev.id).map((a) => a.id),
+        [first, second],
+    );
+    // An unrelated event has no attachments.
+    const other = store.append({ kind: "message", role: "agent", content: "reply" });
+    assert.deepEqual(store.attachmentsFor(other.id), []);
+    store.close();
+});
+
+test("getAttachment returns undefined for an unknown id", () => {
+    const store = freshStore();
+    assert.equal(store.getAttachment(999), undefined);
+    store.close();
+});
+
+test("appendAttachment rejects an unknown event id (no orphans)", () => {
+    const store = freshStore();
+    assert.throws(
+        () => store.appendAttachment(404, { mediaType: "image/png", data: Uint8Array.from([1]) }),
+        EventError,
+    );
+    store.close();
+});
+
+test("appendAttachment validates media type, empty data, and the byte cap", () => {
+    const store = freshStore();
+    const ev = store.append({ kind: "message", role: "user", content: "x" });
+    assert.throws(
+        () =>
+            store.appendAttachment(ev.id, {
+                // a type the provider/bridge doesn't accept
+                mediaType: "image/gif" as never,
+                data: Uint8Array.from([1]),
+            }),
+        EventError,
+    );
+    assert.throws(
+        () => store.appendAttachment(ev.id, { mediaType: "image/png", data: new Uint8Array(0) }),
+        EventError,
+    );
+    assert.throws(
+        () =>
+            store.appendAttachment(ev.id, {
+                mediaType: "image/png",
+                data: new Uint8Array(MAX_ATTACHMENT_BYTES + 1),
+            }),
+        EventError,
+    );
+    store.close();
+});
+
+test("attachments persist across reopen and cascade-delete with their event", () => {
+    withTempDir((dir) => {
+        const path = join(dir, "attach.sqlite");
+        const a = new EventStore(path);
+        const ev = a.append({ kind: "message", role: "user", content: "pic [image: p.png]" });
+        const id = a.appendAttachment(ev.id, {
+            mediaType: "image/png",
+            data: Uint8Array.from([9, 8, 7]),
+            filename: "p.png",
+        });
+        a.close();
+
+        // Survives a reopen with bytes intact.
+        const b = new EventStore(path);
+        const got = b.getAttachment(id);
+        assert.ok(got);
+        assert.deepEqual(Array.from(got!.data), [9, 8, 7]);
+
+        // Deleting the parent event cascades the attachment away (events are
+        // append-only at the API; this exercises the FK cascade directly).
+        b.close();
+        const raw = new DatabaseSync(path);
+        raw.exec("PRAGMA foreign_keys = ON");
+        raw.prepare("DELETE FROM events WHERE id = ?").run(ev.id);
+        const remaining = raw
+            .prepare("SELECT COUNT(*) AS n FROM event_attachments WHERE id = ?")
+            .get(id) as { n: number };
+        assert.equal(remaining.n, 0);
+        raw.close();
     });
 });

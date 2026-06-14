@@ -82,12 +82,19 @@ const PER_MESSAGE_TOKENS = 4;
 /** Extra overhead a tool-call/tool-result part carries (id, name, JSON
  *  framing) beyond its serialized text. Approximate. */
 const PER_TOOL_PART_TOKENS = 8;
+/** Flat token estimate for one image block. Anthropic bills an image by its
+ *  pixel area (≈ (w·h)/750), which we can't know here without decoding the
+ *  base64; this is a deliberately generous fixed stand-in so a turn with images
+ *  reads as non-trivial rather than free. Approximate. */
+const PER_IMAGE_TOKENS = 1600;
 
 /** Estimate the token cost of a single content part. */
 function estimatePart(part: ContentPart): number {
     switch (part.kind) {
         case "text":
             return Math.ceil(part.text.length / CHARS_PER_TOKEN);
+        case "image":
+            return PER_IMAGE_TOKENS;
         case "tool_call":
             return (
                 PER_TOOL_PART_TOKENS +

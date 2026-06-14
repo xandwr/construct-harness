@@ -13,7 +13,7 @@
  */
 
 import { RoleType } from "./types.ts";
-import type { Message, ToolDef } from "./types.ts";
+import type { ContentPart, ImagePart, Message, ToolDef } from "./types.ts";
 import { runLoopStream } from "./bridge/loop.ts";
 import type { CompactionConfig, LoopEvent } from "./bridge/loop.ts";
 import type { ModelClient, ProviderOptions } from "./bridge/types.ts";
@@ -30,7 +30,19 @@ import { goalTools, goalContext } from "./goalTools.ts";
 import { GoalStore } from "./goals.ts";
 import type { Embedder } from "./embeddings.ts";
 import { EventStore } from "./events.ts";
-import type { Event, EventInput } from "./events.ts";
+import type { AttachmentMediaType, Event, EventInput } from "./events.ts";
+
+/**
+ * One image accompanying a user turn. `data` is the raw bytes; the session
+ * shows them to the model (base64-encoded into an {@link ImagePart}) and
+ * persists them to the event log's attachment side table so reopening the
+ * conversation can render them back. `filename` is for display/labeling only.
+ */
+export interface ImageInput {
+    mediaType: AttachmentMediaType;
+    data: Uint8Array;
+    filename?: string;
+}
 
 /** Configuration for a {@link Session}. */
 export interface SessionConfig {
@@ -502,7 +514,28 @@ export class Session {
     async rehydrate(maxMessages?: number): Promise<number> {
         if (!this.events) return 0;
         const events = this.readFullTranscript();
-        const rebuilt = messagesFromEvents(events);
+        const store = this.events;
+        // Re-hydrate a user turn's images from the attachment side table so the
+        // model sees them again on resume. Best-effort: a read failure yields no
+        // images (the placeholder text still carries the turn) rather than throwing.
+        const rebuilt = messagesFromEvents(events, (eventId) => {
+            try {
+                return store
+                    .attachmentsFor(eventId)
+                    .map((meta) => store.getAttachment(meta.id))
+                    .filter((a): a is NonNullable<typeof a> => a != null)
+                    .filter((a) => a.mediaType === "image/jpeg" || a.mediaType === "image/png")
+                    .map(
+                        (a): ImagePart => ({
+                            kind: "image",
+                            mediaType: a.mediaType as AttachmentMediaType,
+                            data: bytesToBase64(a.data),
+                        }),
+                    );
+            } catch {
+                return [];
+            }
+        });
         this.conversation =
             maxMessages !== undefined && rebuilt.length > maxMessages
                 ? rebuilt.slice(rebuilt.length - maxMessages)
@@ -545,11 +578,23 @@ export class Session {
      * Yields each {@link LoopEvent}; the generator's return value is the
      * {@link TurnResult}.
      */
-    async *send(text: string): AsyncGenerator<LoopEvent, TurnResult, void> {
+    async *send(
+        text: string,
+        images: ImageInput[] = [],
+    ): AsyncGenerator<LoopEvent, TurnResult, void> {
+        // What the model sees this turn: the text (when non-empty) followed by one
+        // image block per attachment. An image-only turn has no text part. The
+        // bytes are base64-encoded here only to cross the wire to the provider; the
+        // durable copy in the log is the raw bytes (see below).
+        const content: ContentPart[] = [];
+        if (text) content.push({ kind: "text", text });
+        for (const img of images) {
+            content.push(imageInputToPart(img));
+        }
         const userTurn: Message = {
             sender: { role: RoleType.User },
             timestamp: Date.now(),
-            content: [{ kind: "text", text }],
+            content,
         };
 
         // The user's message is the first thing that happened this turn: log it
@@ -558,7 +603,33 @@ export class Session {
         // reply) is appended as the stream surfaces it below. We keep its id so a
         // memory the model saves this turn can be linked back to the message that
         // prompted it (provenance: curation over the log).
-        const userEvent = this.logEvent({ kind: "message", role: "user", content: text });
+        //
+        // The logged `content` is text only: the typed words plus a `[image: name]`
+        // placeholder per attachment. Image bytes never go in the event's content
+        // (it's FTS-indexed and capped) or meta (parsed on every read) — they're
+        // persisted to the attachment side table under this event's id, below. The
+        // placeholder also keeps an image-only turn's content non-empty (the store
+        // rejects empty content), and gives FTS/recall something to match on.
+        const logContent = buildLogContent(text, images);
+        const userEvent = this.logEvent({ kind: "message", role: "user", content: logContent });
+        // Persist each image's bytes against the just-logged event, so reopening
+        // the conversation can render them back. No-op without a log; a single
+        // attachment failure is swallowed (the transcript is a side-record, like
+        // logEvent) so it never fails the turn.
+        if (userEvent && images.length) {
+            for (const img of images) {
+                try {
+                    this.events?.appendAttachment(userEvent.id, {
+                        mediaType: img.mediaType,
+                        data: img.data,
+                        filename: img.filename,
+                    });
+                } catch {
+                    // Best-effort: a rejected attachment leaves a placeholder with
+                    // no bytes rather than failing the turn.
+                }
+            }
+        }
         // Embed it (off the hot path) so semantic transcript_recall covers this
         // turn, not just lexical FTS. No-op without an embedder or a log.
         this.embedMessage(userEvent);
@@ -858,6 +929,28 @@ function freshSessionId(): string {
     return `s_${stamp}_${rand}`;
 }
 
+/** Base64-encode raw bytes for an image block / wire transfer. Buffer is always
+ *  available in this Node runtime; this is the one place bytes become base64. */
+function bytesToBase64(data: Uint8Array): string {
+    return Buffer.from(data).toString("base64");
+}
+
+/** Turn one {@link ImageInput} into the {@link ImagePart} the model sees: its
+ *  bytes base64-encoded into the provider's expected source shape. */
+function imageInputToPart(img: ImageInput): ImagePart {
+    return { kind: "image", mediaType: img.mediaType, data: bytesToBase64(img.data) };
+}
+
+/** Build the text we persist as a user event's `content`: the typed words plus a
+ *  `[image: name]` placeholder per attachment. Image bytes live in the attachment
+ *  side table, never here. The placeholder keeps an image-only turn's content
+ *  non-empty (the store rejects empty content) and gives FTS/recall a handle. */
+function buildLogContent(text: string, images: ImageInput[]): string {
+    if (!images.length) return text;
+    const placeholders = images.map((img, i) => `[image: ${img.filename ?? `image-${i + 1}`}]`);
+    return text ? `${text}\n${placeholders.join("\n")}` : placeholders.join("\n");
+}
+
 /**
  * Rebuild the durable conversation ({@link Message}[], oldest first) from a
  * Session's logged events, the inverse of the append `send` does as it runs. Used
@@ -875,7 +968,10 @@ function freshSessionId(): string {
  * Exported so a caller reconstructing a conversation outside a Session (a viewer,
  * a migration) can reuse the exact same mapping.
  */
-export function messagesFromEvents(events: readonly Event[]): Message[] {
+export function messagesFromEvents(
+    events: readonly Event[],
+    resolveImages?: (eventId: number) => ImagePart[],
+): Message[] {
     const messages: Message[] = [];
     for (const e of events) {
         if (e.kind === "message") {
@@ -884,10 +980,16 @@ export function messagesFromEvents(events: readonly Event[]): Message[] {
             const text = e.content;
             if (!text) continue;
             const role = e.role === "user" ? RoleType.User : RoleType.Agent;
+            // Re-attach any images this user turn carried, so a resumed
+            // conversation shows the model the pictures, not just their
+            // `[image: name]` placeholders. The resolver is injected (this
+            // function stays pure over its inputs); without it, or for an agent
+            // turn, the message is text only as before.
+            const images = role === RoleType.User ? (resolveImages?.(e.id) ?? []) : [];
             messages.push({
                 sender: { role },
                 timestamp: e.ts,
-                content: [{ kind: "text", text }],
+                content: [{ kind: "text", text } as ContentPart, ...images],
             });
         } else if (e.kind === "tool_call") {
             // The call id (correlation) is what threads this to its result; without

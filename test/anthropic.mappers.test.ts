@@ -113,6 +113,25 @@ test("maps a string tool_result without re-stringifying it", () => {
     assert.equal(block.is_error, true);
 });
 
+test("maps an image part to an Anthropic base64 image block", () => {
+    const { messages } = toAnthropicMessages([
+        {
+            sender: { role: RoleType.User },
+            timestamp: 0,
+            content: [
+                { kind: "text", text: "what's this?" },
+                { kind: "image", mediaType: "image/png", data: "QUJD" },
+            ],
+        },
+    ]);
+    const blocks = messages[0]!.content as any[];
+    assert.equal(blocks[0].type, "text");
+    assert.deepEqual(blocks[1], {
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: "QUJD" },
+    });
+});
+
 // ── Core → Anthropic: tools ─────────────────────────────────────────────────
 
 test("toAnthropicTools maps name/description/schema and drops run", () => {

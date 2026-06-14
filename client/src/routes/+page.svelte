@@ -10,8 +10,10 @@
 		sendChat,
 		getEvents,
 		getCommands,
+		attachmentUrl,
 		ApiError,
 		type ChatEvent,
+		type ChatImage,
 		type WireEvent,
 		type WireCommand
 	} from '$lib/api';
@@ -30,9 +32,37 @@
 	// `coveredIds` also lists the ids of events folded into this line (the line's
 	// own message plus any tool_call events stacked onto it), so the event log can
 	// deep-link to a tool event and land on the agent message it belongs to.
+	// One image rendered in a transcript line. `src` is what an <img> points at:
+	// for a replayed message it's the attachment's served URL; for a just-sent
+	// live message it's an object URL of the local file, so the picture shows
+	// immediately without a round-trip. `alt` is the filename when known.
+	interface LineImage {
+		src: string;
+		alt: string;
+	}
+
+	// An image staged in the composer before send. `data` is the base64 the wire
+	// carries; `url` is an object URL backing the thumbnail (and reused as the
+	// sent message's live <img src>, so we hand ownership to the line on submit
+	// rather than revoking it). `name`/`mediaType` label and type it.
+	interface PendingImage {
+		data: string;
+		mediaType: 'image/jpeg' | 'image/png';
+		name: string;
+		url: string;
+	}
+
+	// What the composer accepts. The harness/provider takes only these two.
+	const ACCEPTED_IMAGE_TYPES = ['image/png', 'image/jpeg'];
+	// Mirror of the server's per-image byte cap (MAX_ATTACHMENT_BYTES), so an
+	// oversized file is rejected in the browser with a clear message instead of
+	// failing the whole turn at the door.
+	const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+
 	interface Line {
 		role: 'user' | 'agent';
 		text: string;
+		images?: LineImage[];
 		tool?: string;
 		// The agent's streamed reasoning trace for this line, accumulated from
 		// `thinking` events. Rendered as a collapsible block above the reply;
@@ -55,6 +85,12 @@
 
 	let messages = $state<Line[]>([]);
 	let draft = $state('');
+	// Images staged in the composer, not yet sent. Each carries the base64 the
+	// wire wants plus an object URL for its thumbnail (revoked when removed/sent).
+	// A turn sends with whatever is staged here; it's cleared on submit.
+	let pendingImages = $state<PendingImage[]>([]);
+	// The hidden file picker, clicked by the attach button.
+	let fileInput = $state<HTMLInputElement | null>(null);
 	let sending = $state(false);
 	let loadingReplay = $state(false);
 	let error = $state<string | null>(null);
@@ -221,7 +257,20 @@
 		let pendingIds: number[] = [];
 		for (const e of events) {
 			if (e.kind === 'message' && e.role === 'user') {
-				lines.push({ role: 'user', text: e.content, ts: e.ts, eventId: e.id, coveredIds: [e.id] });
+				// Re-attach any images this turn carried, pointing each <img> at the
+				// served-bytes URL for its attachment id (the bytes aren't in the event).
+				const images = (e.attachments ?? []).map((a) => ({
+					src: attachmentUrl(a.id),
+					alt: a.filename ?? 'image'
+				}));
+				lines.push({
+					role: 'user',
+					text: e.content,
+					ts: e.ts,
+					eventId: e.id,
+					coveredIds: [e.id],
+					images: images.length ? images : undefined
+				});
 			} else if (e.kind === 'message' && e.role === 'agent') {
 				lines.push({
 					role: 'agent',
@@ -370,6 +419,90 @@
 		}
 	}
 
+	// Read one image File into a staged PendingImage: validate its type/size,
+	// base64-encode it for the wire, and mint an object URL for its thumbnail.
+	// Returns null (with a notice) for anything we won't accept, so a mixed drop
+	// of files keeps the good ones. Async because FileReader is.
+	async function intakeImage(file: File): Promise<PendingImage | null> {
+		const type = file.type === 'image/jpg' ? 'image/jpeg' : file.type;
+		if (!ACCEPTED_IMAGE_TYPES.includes(type)) {
+			notice = `${file.name || 'that file'} isn't a PNG or JPEG`;
+			return null;
+		}
+		if (file.size > MAX_IMAGE_BYTES) {
+			notice = `${file.name || 'image'} is too large (max ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)} MB)`;
+			return null;
+		}
+		// Read as a data URL, then strip the `data:...;base64,` prefix to the raw
+		// base64 the server decodes. A read failure drops just this file.
+		const data = await new Promise<string | null>((resolve) => {
+			const reader = new FileReader();
+			reader.onload = () => {
+				const result = typeof reader.result === 'string' ? reader.result : '';
+				const comma = result.indexOf(',');
+				resolve(comma === -1 ? null : result.slice(comma + 1));
+			};
+			reader.onerror = () => resolve(null);
+			reader.readAsDataURL(file);
+		});
+		if (!data) {
+			notice = `couldn't read ${file.name || 'that image'}`;
+			return null;
+		}
+		return {
+			data,
+			mediaType: type as 'image/jpeg' | 'image/png',
+			name: file.name || 'image',
+			url: URL.createObjectURL(file)
+		};
+	}
+
+	// Stage a batch of files (from the picker, paste, or a future drop), keeping
+	// the ones we accept. Clears any prior command notice first so a stale line
+	// doesn't read as a result of this attach.
+	async function addImages(files: Iterable<File>) {
+		notice = null;
+		for (const file of files) {
+			const img = await intakeImage(file);
+			if (img) pendingImages.push(img);
+		}
+	}
+
+	// The attach button opens the hidden picker; its change handler stages the
+	// chosen files, then resets the input so re-picking the same file fires again.
+	function onPickFiles(event: Event) {
+		const input = event.currentTarget as HTMLInputElement;
+		if (input.files) addImages(input.files);
+		input.value = '';
+	}
+
+	// Paste handler on the composer: pull any image files off the clipboard (a
+	// screenshot or a copied image lands here as a `file` item) and stage them,
+	// the same intake path as the picker. Non-image paste falls through to the
+	// textarea's default (text) untouched.
+	function onPaste(event: ClipboardEvent) {
+		const items = event.clipboardData?.items;
+		if (!items) return;
+		const files: File[] = [];
+		for (const item of items) {
+			if (item.kind === 'file' && item.type.startsWith('image/')) {
+				const file = item.getAsFile();
+				if (file) files.push(file);
+			}
+		}
+		if (files.length === 0) return;
+		// We're handling these as attachments, not pasted text.
+		event.preventDefault();
+		addImages(files);
+	}
+
+	// Drop one staged image (the × on its chip), freeing its object URL: it was
+	// only ever backing the thumbnail, and this image won't be sent.
+	function removePendingImage(index: number) {
+		const [removed] = pendingImages.splice(index, 1);
+		if (removed) URL.revokeObjectURL(removed.url);
+	}
+
 	async function submit(event: SubmitEvent) {
 		event.preventDefault();
 		const text = draft.trim();
@@ -391,17 +524,30 @@
 			}
 		}
 
-		// Block on an in-flight turn or a replay still loading (sending before the
-		// transcript is in context would resume from an incomplete history), but not
-		// on viewing a past conversation — that's the resume path.
-		if (!text || sending || loadingReplay) return;
+		// A turn needs text or at least one image. Also block on an in-flight turn
+		// or a replay still loading (sending before the transcript is in context
+		// would resume from an incomplete history), but not on viewing a past
+		// conversation — that's the resume path.
+		if ((!text && pendingImages.length === 0) || sending || loadingReplay) return;
+
+		// Take the staged images for this turn and clear the composer's staging.
+		// The wire payload carries the base64; the live user line reuses each
+		// object URL as its thumbnail src (so the picture shows without a
+		// round-trip) and thereby takes ownership of revoking it later.
+		const staged = pendingImages;
+		pendingImages = [];
 
 		draft = '';
 		error = null;
 		footer = null;
 		notice = null;
 		sending = true;
-		messages.push({ role: 'user', text, ts: Date.now() });
+		messages.push({
+			role: 'user',
+			text,
+			ts: Date.now(),
+			images: staged.map((img) => ({ src: img.url, alt: img.name }))
+		});
 
 		// The agent line we stream into, tracked by its index so every mutation
 		// goes through the reactive `messages` proxy (mutating a captured object
@@ -409,10 +555,19 @@
 		// reply would never render — even though the turn completed).
 		const idx = messages.push({ role: 'agent', text: '', pending: true }) - 1;
 
+		const images: ChatImage[] = staged.map((img) => ({
+			mediaType: img.mediaType,
+			data: img.data,
+			filename: img.name
+		}));
+
 		try {
 			// Send into the active conversation: the viewed session resumes it; a
 			// fresh one (activeSession undefined) gets a new id back via `open`.
-			await sendChat(text, (e: ChatEvent) => onChatEvent(e, idx), { session: activeSession });
+			await sendChat(text, (e: ChatEvent) => onChatEvent(e, idx), {
+				session: activeSession,
+				images
+			});
 		} catch (e) {
 			messages[idx].pending = false;
 			error = e instanceof ApiError ? e.message : 'the request failed';
@@ -571,7 +726,26 @@
 								>{/if}
 						</div>
 					{:else}
-						<span class="text-text text-xs leading-relaxed whitespace-pre-wrap">{m.text}</span>
+						{#if m.text}
+							<span class="text-text text-xs leading-relaxed whitespace-pre-wrap">{m.text}</span>
+						{/if}
+						{#if m.images && m.images.length}
+							<!-- Thumbnails the user attached, rendered explicitly (user messages
+							     are literal text, not markdown, so an <img> never comes through
+							     @html here). Each opens its full image in a new tab. -->
+							<div class="mt-1 flex flex-wrap gap-2" class:mt-0={!m.text}>
+								{#each m.images as img (img.src)}
+									<a href={img.src} target="_blank" rel="noopener noreferrer">
+										<img
+											src={img.src}
+											alt={img.alt}
+											title={img.alt}
+											class="max-h-40 max-w-48 border border-border object-contain"
+										/>
+									</a>
+								{/each}
+							</div>
+						{/if}
 					{/if}
 					{#if m.tool}
 						<div class="text-faint mt-1 text-[10px]">{m.tool}</div>
@@ -613,7 +787,54 @@
 		{#if notice}
 			<div class="text-faint mb-2 text-[10px]">{notice}</div>
 		{/if}
+		<!-- Staged image chips: thumbnails of attachments not yet sent, each with a
+		     × to drop it. Sits above the input so it reads as "going out with this
+		     message". Only shown while something is staged. -->
+		{#if pendingImages.length}
+			<div class="mb-2 flex flex-wrap gap-2">
+				{#each pendingImages as img, idx (img.url)}
+					<div class="relative border border-border">
+						<img
+							src={img.url}
+							alt={img.name}
+							title={img.name}
+							class="h-14 w-14 object-cover"
+						/>
+						<button
+							type="button"
+							onclick={() => removePendingImage(idx)}
+							title="remove"
+							aria-label="remove image"
+							class="bg-surface text-muted hover:text-text absolute -top-2 -right-2 flex size-4 items-center justify-center border border-border text-[10px] leading-none"
+						>
+							×
+						</button>
+					</div>
+				{/each}
+			</div>
+		{/if}
+		<!-- Hidden picker, opened by the attach button. Accepts PNG/JPEG, multiple. -->
+		<input
+			bind:this={fileInput}
+			type="file"
+			accept="image/png,image/jpeg"
+			multiple
+			onchange={onPickFiles}
+			class="hidden"
+		/>
 		<div class="flex items-stretch gap-2">
+			<!-- Attach: opens the hidden picker. Disabled mid-turn / during replay
+			     load, matching the input and send button. -->
+			<button
+				type="button"
+				onclick={() => fileInput?.click()}
+				disabled={sending || loadingReplay}
+				title="attach an image"
+				aria-label="attach an image"
+				class="text-muted hover:text-text border border-border bg-surface px-3 py-2 text-xs lowercase disabled:opacity-50"
+			>
+				+ img
+			</button>
 			<!-- The relative wrapper anchors the floating menu to the input column, so
 			     it spans the input's width and sits just above it. -->
 			<div class="relative flex-1">
@@ -630,19 +851,20 @@
 					bind:value={draft}
 					oninput={onInput}
 					onkeydown={onKeydown}
+					onpaste={onPaste}
 					disabled={sending || loadingReplay}
 					rows="1"
 					placeholder={loadingReplay
 						? 'loading…'
 						: viewing
 							? 'resume this conversation'
-							: 'say something, or / for commands'}
+							: 'say something, paste an image, or / for commands'}
 					class="placeholder:text-faint block w-full resize-none border border-border bg-surface px-3 py-2 text-xs leading-5 text-text outline-none focus:border-glow disabled:opacity-50"
 				></textarea>
 			</div>
 			<button
 				type="submit"
-				disabled={sending || loadingReplay || draft.trim() === ''}
+				disabled={sending || loadingReplay || (draft.trim() === '' && pendingImages.length === 0)}
 				class="border border-border bg-surface px-4 py-2 text-xs lowercase text-muted disabled:opacity-50"
 			>
 				{sending ? '…' : 'send'}

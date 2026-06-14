@@ -58,7 +58,7 @@ import {
 } from "./runtimeConfig.ts";
 import type { ToolDef } from "./types.ts";
 import { MemoryStore, Memory, MemoryError } from "./memory.ts";
-import { EventStore, type Event } from "./events.ts";
+import { EventStore, MAX_ATTACHMENT_BYTES, type Event, type AttachmentMeta } from "./events.ts";
 import { backfillEventEmbeddings } from "./eventTools.ts";
 import {
     GoalStore,
@@ -69,7 +69,7 @@ import {
     type GoalChange,
 } from "./goals.ts";
 import { OpenAIEmbedder, EmbeddingError, type Embedder } from "./embeddings.ts";
-import { Session, type SessionConfig } from "./session.ts";
+import { Session, type SessionConfig, type ImageInput } from "./session.ts";
 import type { LoopEvent } from "./bridge/loop.ts";
 import { NotesStore, Note, NoteError, type NoteFrontmatter } from "./notes.ts";
 import { NotesService } from "./notesService.ts";
@@ -565,6 +565,60 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
     res.end(text);
 }
 
+/** Body-size ceiling for the chat endpoint. A single photo's base64 dwarfs the
+ *  default 256 KB; this bounds a whole multi-image turn while {@link
+ *  MAX_ATTACHMENT_BYTES} still caps each image. base64 inflates bytes ~1.37×, so
+ *  this leaves headroom for a few images plus the text and JSON framing. */
+const CHAT_BODY_LIMIT = 32 * 1024 * 1024;
+
+/** Thrown when an inbound image fails validation (bad type, oversized, or
+ *  undecodable base64). Distinguished from a generic malformed-body error so the
+ *  /api/chat handler can return a specific 400 message. */
+class ImageParseError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "ImageParseError";
+    }
+}
+
+/** Parse and validate the `images` field of a chat body into {@link ImageInput}s.
+ *  Each wire image is `{ mediaType, data (base64), filename? }`; the base64 is
+ *  decoded to raw bytes here (the store keeps bytes, not base64). Throws {@link
+ *  ImageParseError} on anything malformed. `undefined`/absent means no images. */
+function parseImages(raw: unknown): ImageInput[] {
+    if (raw === undefined || raw === null) return [];
+    if (!Array.isArray(raw)) throw new ImageParseError("images must be an array");
+    const out: ImageInput[] = [];
+    for (const item of raw) {
+        if (item === null || typeof item !== "object") {
+            throw new ImageParseError("each image must be an object");
+        }
+        const { mediaType, data, filename } = item as Record<string, unknown>;
+        if (mediaType !== "image/jpeg" && mediaType !== "image/png") {
+            throw new ImageParseError("image mediaType must be 'image/jpeg' or 'image/png'");
+        }
+        if (typeof data !== "string" || data === "") {
+            throw new ImageParseError("image data must be a non-empty base64 string");
+        }
+        // Buffer.from is lenient (it skips invalid chars), so reject anything that
+        // isn't well-formed base64 up front rather than silently storing garbage.
+        if (!/^[A-Za-z0-9+/]+={0,2}$/.test(data)) {
+            throw new ImageParseError("image data must be valid base64");
+        }
+        const bytes = Buffer.from(data, "base64");
+        if (bytes.length === 0) throw new ImageParseError("image data decoded to empty");
+        if (bytes.length > MAX_ATTACHMENT_BYTES) {
+            throw new ImageParseError(`image exceeds ${MAX_ATTACHMENT_BYTES} bytes`);
+        }
+        out.push({
+            mediaType,
+            data: bytes,
+            filename: typeof filename === "string" && filename ? filename : undefined,
+        });
+    }
+    return out;
+}
+
 /** Read a request body to a string, bounded so a runaway upload can't exhaust
  *  memory. Rejects past the cap rather than truncating silently. */
 function readBody(req: IncomingMessage, limit = 256 * 1024): Promise<string> {
@@ -588,8 +642,12 @@ function readBody(req: IncomingMessage, limit = 256 * 1024): Promise<string> {
 // ── Read views over the log ─────────────────────────────────────────────────
 
 /** Serialize an event for the wire: a stable JSON shape the client renders. The
- *  store's `Event` is already plain data; this just fixes the field set. */
-function eventToJson(e: Event) {
+ *  store's `Event` is already plain data; this just fixes the field set.
+ *
+ *  `attachments` (when given) is the list of image refs the event carries —
+ *  metadata only, each a `{ id, mediaType, filename }` the client turns into a
+ *  `/api/attachments/<id>` URL. The bytes never ride in this JSON. */
+function eventToJson(e: Event, attachments: AttachmentMeta[] = []) {
     return {
         id: e.id,
         ts: e.ts,
@@ -599,6 +657,11 @@ function eventToJson(e: Event) {
         meta: e.meta ?? null,
         session: e.session ?? null,
         correlation: e.correlation ?? null,
+        attachments: attachments.map((a) => ({
+            id: a.id,
+            mediaType: a.mediaType,
+            filename: a.filename ?? null,
+        })),
     };
 }
 
@@ -843,7 +906,12 @@ function sse(res: ServerResponse, event: string, data: unknown): void {
  * turn persists the whole exchange (the user message, every tool call/result,
  * the reply) to disk as a side effect. Nothing here writes to the log directly.
  */
-async function streamChat(session: Session, text: string, res: ServerResponse): Promise<void> {
+async function streamChat(
+    session: Session,
+    text: string,
+    res: ServerResponse,
+    images: ImageInput[] = [],
+): Promise<void> {
     res.writeHead(200, {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache, no-transform",
@@ -854,7 +922,7 @@ async function streamChat(session: Session, text: string, res: ServerResponse): 
     sse(res, "open", { session: session.id });
 
     try {
-        const turn = session.send(text);
+        const turn = session.send(text, images);
         let next = await turn.next();
         while (!next.done) {
             const event: LoopEvent = next.value;
@@ -1801,8 +1869,13 @@ export function createHandler(deps: ServerDeps) {
                     return;
                 }
                 const limit = clampPage(url.searchParams.get("limit"), DEFAULT_PAGE, 1000);
-                // Oldest first: natural reading order for a transcript.
-                const rows = deps.events.recent({ session, limit }).reverse().map(eventToJson);
+                // Oldest first: natural reading order for a transcript. Enrich each
+                // event with its image attachment refs (cheap metadata-only reads;
+                // only user messages ever carry any) so a replay can render them.
+                const rows = deps.events
+                    .recent({ session, limit })
+                    .reverse()
+                    .map((e) => eventToJson(e, deps.events.attachmentsFor(e.id)));
                 sendJson(res, 200, {
                     session,
                     live: deps.sessions.has(session),
@@ -1821,7 +1894,9 @@ export function createHandler(deps: ServerDeps) {
             if (req.method === "GET" && path === "/api/log") {
                 const limit = clampPage(url.searchParams.get("limit"), DEFAULT_PAGE, 1000);
                 const kind = url.searchParams.get("kind") ?? undefined;
-                const rows = deps.events.recent({ limit, kind }).map(eventToJson);
+                const rows = deps.events
+                    .recent({ limit, kind })
+                    .map((e) => eventToJson(e, deps.events.attachmentsFor(e.id)));
                 sendJson(res, 200, { events: rows, total: deps.events.count() });
                 return;
             }
@@ -1863,24 +1938,38 @@ export function createHandler(deps: ServerDeps) {
             if (req.method === "POST" && path === "/api/chat") {
                 let text: string;
                 let wantSession: string | undefined;
+                let images: ImageInput[] = [];
                 try {
-                    const body = await readBody(req);
+                    // Raised well past the default 256 KB: a single photo's base64
+                    // dwarfs it. The per-image byte cap (MAX_ATTACHMENT_BYTES) still
+                    // bounds each image; this bounds the whole multi-image payload.
+                    const body = await readBody(req, CHAT_BODY_LIMIT);
                     const parsed = JSON.parse(body || "{}") as {
                         message?: unknown;
                         session?: unknown;
+                        images?: unknown;
                     };
-                    if (typeof parsed.message !== "string" || parsed.message.trim() === "") {
-                        sendJson(res, 400, { error: "message must be a non-empty string" });
+                    // A turn must carry *something*: text or at least one image.
+                    const hasText =
+                        typeof parsed.message === "string" && parsed.message.trim() !== "";
+                    images = parseImages(parsed.images);
+                    if (!hasText && images.length === 0) {
+                        sendJson(res, 400, {
+                            error: "message must be a non-empty string or include images",
+                        });
                         return;
                     }
-                    text = parsed.message;
+                    text = typeof parsed.message === "string" ? parsed.message : "";
                     // An optional session id resumes (or continues) that
                     // conversation; omitted, the turn lands on the default live one.
                     if (typeof parsed.session === "string" && parsed.session !== "") {
                         wantSession = parsed.session;
                     }
-                } catch {
-                    sendJson(res, 400, { error: "invalid JSON body" });
+                } catch (err) {
+                    // A bad image (wrong type, too big, undecodable base64) is a
+                    // client error worth naming; everything else is a malformed body.
+                    const msg = err instanceof ImageParseError ? err.message : "invalid JSON body";
+                    sendJson(res, 400, { error: msg });
                     return;
                 }
                 // Resolve the conversation before streaming: resuming reads the log
@@ -1888,7 +1977,32 @@ export function createHandler(deps: ServerDeps) {
                 // here where we can still send a real error status. Once streamChat
                 // writes the SSE head we can only report errors in-band.
                 const session = await deps.sessions.resolve(wantSession);
-                await streamChat(session, text, res);
+                await streamChat(session, text, res, images);
+                return;
+            }
+
+            // Serve one image attachment's bytes by id, so a replayed conversation
+            // can render the pictures a past user turn carried. The bytes live in
+            // the event log's attachment side table; this is the only read that
+            // pulls them. Content-Type is the stored MIME; cache hard since an
+            // attachment is immutable once written.
+            if (req.method === "GET" && path.startsWith("/api/attachments/")) {
+                const id = Number(path.slice("/api/attachments/".length));
+                if (!Number.isInteger(id) || id <= 0) {
+                    sendJson(res, 400, { error: "attachment id must be a positive integer" });
+                    return;
+                }
+                const att = deps.events.getAttachment(id);
+                if (!att) {
+                    sendJson(res, 404, { error: `no attachment ${id}` });
+                    return;
+                }
+                res.writeHead(200, {
+                    "Content-Type": att.mediaType,
+                    "Content-Length": String(att.data.length),
+                    "Cache-Control": "public, max-age=31536000, immutable",
+                });
+                res.end(Buffer.from(att.data));
                 return;
             }
 

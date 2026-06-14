@@ -12,8 +12,18 @@
  * server's frames, which mirror the harness's own {@link LoopEvent} kinds.
  */
 
+/** An image attached to an event, as it rides on a {@link WireEvent}: metadata
+ *  only (no bytes). Fetch the bytes from `/api/attachments/<id>` (see
+ *  {@link attachmentUrl}). */
+export interface WireAttachment {
+    id: number;
+    mediaType: string;
+    filename: string | null;
+}
+
 /** A single logged event, as `/api/events` and `/api/log` return it. Mirrors the
- *  harness `Event`, with nullable fields explicit for the wire. */
+ *  harness `Event`, with nullable fields explicit for the wire. `attachments`
+ *  lists any images the event carries (only user messages ever do). */
 export interface WireEvent {
     id: number;
     ts: number;
@@ -23,6 +33,20 @@ export interface WireEvent {
     meta: unknown;
     session: string | null;
     correlation: string | null;
+    attachments: WireAttachment[];
+}
+
+/** An image the composer sends with a chat turn. `data` is base64 (no data-URL
+ *  prefix); the server decodes it and stores the raw bytes. */
+export interface ChatImage {
+    mediaType: "image/jpeg" | "image/png";
+    data: string;
+    filename?: string;
+}
+
+/** The URL serving one attachment's bytes, for an `<img src>`. */
+export function attachmentUrl(id: number): string {
+    return `/api/attachments/${id}`;
 }
 
 /** One conversation in the `/api/sessions` list. `live` marks a conversation the
@@ -563,13 +587,23 @@ export type ChatEvent =
 export async function sendChat(
     message: string,
     onEvent: (event: ChatEvent) => void,
-    opts: { session?: string; signal?: AbortSignal; fetchFn?: typeof fetch } = {},
+    opts: {
+        session?: string;
+        images?: ChatImage[];
+        signal?: AbortSignal;
+        fetchFn?: typeof fetch;
+    } = {},
 ): Promise<void> {
     const fetchFn = opts.fetchFn ?? fetch;
+    // Send only the fields that carry something, so the wire stays minimal: omit
+    // `session` for a fresh conversation and `images` when there are none.
+    const body: { message: string; session?: string; images?: ChatImage[] } = { message };
+    if (opts.session) body.session = opts.session;
+    if (opts.images && opts.images.length) body.images = opts.images;
     const res = await fetchFn("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(opts.session ? { message, session: opts.session } : { message }),
+        body: JSON.stringify(body),
         signal: opts.signal,
     });
 

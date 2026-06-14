@@ -363,6 +363,94 @@ test("a plain text turn appends a user message and an agent reply to the log", a
     }
 });
 
+test("send with an image shows the model the image and persists its bytes", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        const client = new FakeClient([textTurn("i see a cat")]);
+        const session = new Session({ client, system: "S", events });
+
+        const gen = session.send("what's this?", [
+            { mediaType: "image/png", data: Uint8Array.from([10, 20, 30]), filename: "cat.png" },
+        ]);
+        // Drain the turn.
+        for (let n = await gen.next(); !n.done; n = await gen.next());
+
+        // The model saw a text part and an image block carrying the base64.
+        const sent = client.calls[0]!.messages.flatMap((m) => m.content);
+        const image = sent.find((p) => p.kind === "image");
+        assert.ok(image, "an image part must reach the model");
+        assert.equal(image!.kind === "image" && image!.mediaType, "image/png");
+        // base64 of [10,20,30] is "ChQe".
+        assert.equal(image!.kind === "image" && image!.data, "ChQe");
+
+        // The logged user event keeps a text placeholder (not the bytes), and the
+        // bytes live in the attachment side table under that event.
+        const log = events.recent({ session: session.id }).reverse();
+        const userEvent = log.find((e) => e.role === "user")!;
+        assert.match(userEvent.content, /\[image: cat\.png\]/);
+        assert.match(userEvent.content, /what's this\?/);
+        const attachments = events.attachmentsFor(userEvent.id);
+        assert.equal(attachments.length, 1);
+        const bytes = events.getAttachment(attachments[0].id)!;
+        assert.deepEqual(Array.from(bytes.data), [10, 20, 30]);
+    } finally {
+        events.close();
+    }
+});
+
+test("an image-only turn (no text) is allowed and logged with a placeholder", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        const client = new FakeClient([textTurn("ok")]);
+        const session = new Session({ client, system: "S", events });
+
+        const gen = session.send("", [{ mediaType: "image/jpeg", data: Uint8Array.from([1, 2]) }]);
+        for (let n = await gen.next(); !n.done; n = await gen.next());
+
+        // The model's content for the user turn is the image alone (no empty text
+        // part). Find the user turn explicitly: the run also appends a per-turn
+        // system contribution, so it isn't simply the last message.
+        const userTurn = client.calls[0]!.messages.find((m) => m.sender.role === RoleType.User)!;
+        assert.deepEqual(
+            userTurn.content.map((p) => p.kind),
+            ["image"],
+        );
+        // The log can't store empty content; the placeholder fills it.
+        const userEvent = events
+            .recent({ session: session.id })
+            .reverse()
+            .find((e) => e.role === "user")!;
+        assert.equal(userEvent.content.length > 0, true);
+        assert.match(userEvent.content, /\[image:/);
+    } finally {
+        events.close();
+    }
+});
+
+test("rehydrate re-attaches a prior turn's images so the model sees them again", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        const client = new FakeClient([textTurn("a cat")]);
+        const first = new Session({ client, system: "S", events });
+        const gen = first.send("look", [
+            { mediaType: "image/png", data: Uint8Array.from([7, 7, 7]), filename: "c.png" },
+        ]);
+        for (let n = await gen.next(); !n.done; n = await gen.next());
+        const id = first.id;
+
+        // Resume and rehydrate: the rebuilt user turn carries the image again.
+        const client2 = new FakeClient([textTurn("still a cat")]);
+        const resumed = new Session({ client: client2, system: "S", events, sessionId: id });
+        await resumed.rehydrate();
+        const userTurn = resumed.history().find((m) => m.sender.role === RoleType.User)!;
+        const image = userTurn.content.find((p) => p.kind === "image");
+        assert.ok(image, "rehydrated user turn must re-carry its image");
+        assert.equal(image!.kind === "image" && image!.data, "BwcH"); // base64 of [7,7,7]
+    } finally {
+        events.close();
+    }
+});
+
 test("a tool turn logs the call and its result, correlated by id", async () => {
     const events = new EventStore(":memory:");
     try {

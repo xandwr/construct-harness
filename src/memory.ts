@@ -592,6 +592,36 @@ const MIGRATIONS: ReadonlyArray<{ name: string; up: (db: DatabaseSync) => void }
             `);
         },
     },
+    {
+        // Image attachments on an event: the raw bytes a user-message event refers
+        // to with an `[image: name]` placeholder in its `content`. This is a
+        // selective side table keyed by event id, the same shape as `event_vec`:
+        // the log proper stays small and text-only, so FTS, the embedding scan,
+        // recall, and replay never drag megabytes of base64 around; the bytes are
+        // fetched only when a renderer explicitly asks for them by id.
+        //
+        //  - `data` is a BLOB of the raw image bytes (not base64): half the size on
+        //    disk, and the server base64-encodes only at the wire boundary.
+        //  - `event_id` CASCADEs on delete (events are append-only in practice, so
+        //    this is belt-and-braces, mirroring event_vec). The index serves the
+        //    one hot query: "every attachment for this event, in order".
+        //  - No FTS/vector index: an image isn't lexically or semantically searched;
+        //    its event's text placeholder already carries it into both indexes.
+        name: "create event_attachments table for inline image bytes",
+        up(db) {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS event_attachments (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id   INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                    media_type TEXT NOT NULL,
+                    filename   TEXT,
+                    data       BLOB NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_event_attachments_event
+                    ON event_attachments (event_id, id);
+            `);
+        },
+    },
 ];
 
 /** The schema version this build of the code expects. */

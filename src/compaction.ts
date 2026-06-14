@@ -123,6 +123,8 @@ function renderPart(part: ContentPart): string {
     switch (part.kind) {
         case "text":
             return part.text;
+        case "image":
+            return "[image]";
         case "tool_call":
             return `[called ${part.name}(${safeJson(part.args)})]`;
         case "tool_result":

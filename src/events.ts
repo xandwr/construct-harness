@@ -129,6 +129,33 @@ export interface EventSemanticHit {
     score: number;
 }
 
+/** Allowed image MIME types for an attachment, kept in lockstep with the core
+ *  {@link ImagePart} union and what the Anthropic bridge will accept. */
+export type AttachmentMediaType = "image/jpeg" | "image/png";
+
+/** What a caller supplies to attach one image to an event. `data` is the raw
+ *  bytes (the store keeps them as a BLOB, not base64). */
+export interface AttachmentInput {
+    mediaType: AttachmentMediaType;
+    data: Uint8Array;
+    filename?: string;
+}
+
+/** An attachment's metadata, without its bytes: enough to list and label an
+ *  event's images (and form the URL to fetch each) without loading megabytes.
+ *  See {@link EventStore.attachmentsFor}. */
+export interface AttachmentMeta {
+    id: number;
+    eventId: number;
+    mediaType: string;
+    filename?: string;
+}
+
+/** An attachment with its bytes, as {@link EventStore.getAttachment} returns. */
+export interface Attachment extends AttachmentMeta {
+    data: Uint8Array;
+}
+
 /**
  * The canonical, validated shape we persist. `ts` is resolved (never undefined),
  * `meta` is the JSON text (or null), the rest are trimmed-or-null.
@@ -215,6 +242,42 @@ function optionalString(value: unknown, field: string): string | null {
     return value;
 }
 
+/** The image MIME types an attachment may carry. Narrow on purpose: only what
+ *  the provider bridge accepts (mirrors the core {@link ImagePart}). */
+const ATTACHMENT_MEDIA_TYPES: ReadonlySet<string> = new Set(["image/jpeg", "image/png"]);
+
+/** Hard ceiling on one attachment's byte length, so a runaway upload can't bloat
+ *  the database. Generous enough for a phone photo, well under what the wire
+ *  caps allow once base64-expanded. */
+export const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+
+/** Validate an attachment before it reaches the database. Throws {@link
+ *  EventError} on anything we refuse to store (mirrors normalizeEventInput's
+ *  loud-on-bad-data posture). Returns the bytes as a Buffer node:sqlite accepts. */
+function normalizeAttachmentInput(input: AttachmentInput): {
+    mediaType: string;
+    filename: string | null;
+    data: Uint8Array;
+} {
+    if (input === null || typeof input !== "object") {
+        throw new EventError("attachment input must be an object");
+    }
+    if (typeof input.mediaType !== "string" || !ATTACHMENT_MEDIA_TYPES.has(input.mediaType)) {
+        throw new EventError("attachment mediaType must be 'image/jpeg' or 'image/png'");
+    }
+    if (!(input.data instanceof Uint8Array)) {
+        throw new EventError("attachment data must be a Uint8Array");
+    }
+    if (input.data.length === 0) {
+        throw new EventError("attachment data must not be empty");
+    }
+    if (input.data.length > MAX_ATTACHMENT_BYTES) {
+        throw new EventError(`attachment exceeds ${MAX_ATTACHMENT_BYTES} bytes`);
+    }
+    const filename = optionalString(input.filename, "filename");
+    return { mediaType: input.mediaType, filename, data: input.data };
+}
+
 interface EventRow {
     id: number;
     ts: number;
@@ -224,6 +287,14 @@ interface EventRow {
     meta: string | null;
     session: string | null;
     correlation: string | null;
+}
+
+interface AttachmentRow {
+    id: number;
+    event_id: number;
+    media_type: string;
+    filename: string | null;
+    data: Uint8Array;
 }
 
 /**
@@ -277,6 +348,9 @@ export class EventStore {
     private readonly deleteVecStmt;
     private readonly getVecStmt;
     private readonly missingVecStmt;
+    private readonly insertAttachmentStmt;
+    private readonly attachmentsForStmt;
+    private readonly getAttachmentStmt;
     private closed = false;
 
     constructor(options: string | StoreOptions = "db.sqlite") {
@@ -334,6 +408,18 @@ export class EventStore {
              ORDER BY e.ts DESC, e.id DESC
              LIMIT ?`,
         );
+
+        this.insertAttachmentStmt = this.db.prepare(
+            `INSERT INTO event_attachments (event_id, media_type, filename, data)
+             VALUES (?, ?, ?, ?)`,
+        );
+        // Metadata only (no `data`): listing an event's images mustn't pull their
+        // bytes. Oldest-first by id so they render in the order they were attached.
+        this.attachmentsForStmt = this.db.prepare(
+            `SELECT id, event_id, media_type, filename FROM event_attachments
+             WHERE event_id = ? ORDER BY id ASC`,
+        );
+        this.getAttachmentStmt = this.db.prepare(`SELECT * FROM event_attachments WHERE id = ?`);
     }
 
     private assertOpen() {
@@ -558,6 +644,67 @@ export class EventStore {
         this.assertOpen();
         const rows = this.missingVecStmt.all(clampLimit(limit)) as Array<{ id: number }>;
         return rows.map((r) => r.id);
+    }
+
+    // ── Attachments (selective) ───────────────────────────────────────────────
+    //
+    // Image bytes live in a side table, not in `content` (which is text, FTS-
+    // indexed, and capped at MAX_CONTENT_LENGTH) and not in `meta` (which is
+    // parsed on every read). An attaching event keeps a `[image: name]`
+    // placeholder in its text; the bytes are fetched only by an explicit call.
+
+    /**
+     * Attach one image to an existing event, returning its assigned id. Throws
+     * {@link EventError} if the event doesn't exist (no orphan attachments) or the
+     * input fails validation. The bytes are stored as a BLOB (raw, not base64).
+     */
+    appendAttachment(eventId: number, input: AttachmentInput): number {
+        this.assertOpen();
+        if (!this.getStmt.get(eventId)) {
+            throw new EventError(`cannot attach to unknown event ${eventId}`);
+        }
+        const norm = normalizeAttachmentInput(input);
+        const result = this.insertAttachmentStmt.run(
+            eventId,
+            norm.mediaType,
+            norm.filename,
+            // node:sqlite binds a Buffer/Uint8Array straight to a BLOB param.
+            norm.data,
+        );
+        return Number(result.lastInsertRowid);
+    }
+
+    /** List an event's attachments as metadata only (no bytes), oldest first. The
+     *  cheap read a replay uses to know which images to request and how to label
+     *  them; the actual bytes come from {@link getAttachment} per id. */
+    attachmentsFor(eventId: number): AttachmentMeta[] {
+        this.assertOpen();
+        const rows = this.attachmentsForStmt.all(eventId) as unknown as Omit<
+            AttachmentRow,
+            "data"
+        >[];
+        return rows.map((r) => ({
+            id: r.id,
+            eventId: r.event_id,
+            mediaType: r.media_type,
+            filename: r.filename ?? undefined,
+        }));
+    }
+
+    /** Fetch one attachment with its bytes, or undefined if no such attachment
+     *  exists. The bytes-bearing read, served on demand at the wire boundary. */
+    getAttachment(id: number): Attachment | undefined {
+        this.assertOpen();
+        const row = this.getAttachmentStmt.get(id) as AttachmentRow | undefined;
+        if (!row) return undefined;
+        return {
+            id: row.id,
+            eventId: row.event_id,
+            mediaType: row.media_type,
+            filename: row.filename ?? undefined,
+            // node:sqlite hands back a Uint8Array for a BLOB column.
+            data: row.data,
+        };
     }
 
     /** Total number of events, or the count matching the given filters. */

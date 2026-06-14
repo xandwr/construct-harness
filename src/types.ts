@@ -17,6 +17,15 @@ export interface TextPart {
     text: string;
 }
 
+/** An inline image the model can see. `data` is the raw bytes base64-encoded
+ *  (no data-URL prefix), `mediaType` the wire MIME the provider expects. Kept
+ *  deliberately narrow: only the two formats every provider accepts. */
+export interface ImagePart {
+    kind: "image";
+    mediaType: "image/jpeg" | "image/png";
+    data: string; // base64-encoded bytes
+}
+
 export interface ToolDef {
     name: string;
     description: string;
@@ -38,7 +47,7 @@ export interface ToolResultPart {
     isError?: boolean;
 }
 
-export type ContentPart = TextPart | ToolCallPart | ToolResultPart;
+export type ContentPart = TextPart | ImagePart | ToolCallPart | ToolResultPart;
 
 export interface Message {
     sender: Sender;
