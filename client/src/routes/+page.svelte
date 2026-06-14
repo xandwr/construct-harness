@@ -82,8 +82,8 @@
 	// draft changes, so Escape closes it without the next keystroke reopening it.
 	let dismissed = $state(false);
 	// The composer input element, so a Tab/click completion can keep focus there
-	// (a menu-button click would otherwise blur the input).
-	let commandInput = $state<HTMLInputElement | null>(null);
+	// (a menu-button click would otherwise blur the input) and auto-grow can size it.
+	let commandInput = $state<HTMLTextAreaElement | null>(null);
 
 	// The text after `/` when the draft is opening a command (single token, no
 	// space), else null — see commandPrefix. Drives whether the menu shows at all.
@@ -247,14 +247,63 @@
 	function onInput() {
 		dismissed = false;
 		notice = null;
+		autosize();
 	}
 
+	// Grow the composer to fit its content, from one row up to a five-row cap, then
+	// let it scroll vertically. A textarea won't shrink on its own (its scrollHeight
+	// only ever reports the taller of content vs current height), so reset to auto
+	// first to remeasure, then clamp. Called on every edit and reactively whenever
+	// `draft` is set programmatically (a completion, or clearing it after submit).
+	function autosize() {
+		const el = commandInput;
+		if (!el) return;
+		// Reset so scrollHeight reflects content alone, not a previously grown box.
+		el.style.height = 'auto';
+		// scrollHeight includes the vertical padding, so fold that into the cap too,
+		// otherwise the fifth row is clipped by the px-/py-2 padding (border-box).
+		const cs = getComputedStyle(el);
+		const padding = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
+		const max = lineHeightPx * 5 + padding;
+		el.style.height = `${Math.min(el.scrollHeight, max)}px`;
+		el.style.overflowY = el.scrollHeight > max ? 'auto' : 'hidden';
+	}
+
+	// One text row in pixels. Defaults to the textarea's CSS line-height (leading-5 =
+	// 20px) and is re-read from the rendered element on mount so the five-row cap
+	// tracks the actual font/line-height rather than drifting if that class changes.
+	let lineHeightPx = $state(20);
+
+	// Keep the height in sync when `draft` changes by any path other than typing:
+	// Tab/menu completion sets it, and submit clears it to ''. Re-running autosize
+	// here collapses the box back to one row after a send. The bind also gives us the
+	// element on mount, so measure the real line-height once it exists, then size.
+	$effect(() => {
+		void draft;
+		if (commandInput) {
+			const lh = parseFloat(getComputedStyle(commandInput).lineHeight);
+			if (!Number.isNaN(lh)) lineHeightPx = lh;
+		}
+		autosize();
+	});
+
 	// Drive the menu from the composer's own keystrokes, so the input keeps focus
-	// and one cursor serves both mouse and keyboard. Only acts while the menu is
-	// open; otherwise the input behaves normally. Tab completes the highlighted
-	// command into the draft — it never executes; Enter is left alone so it submits
-	// the form, where the line is parsed inline (see submit).
+	// and one cursor serves both mouse and keyboard. Tab completes the highlighted
+	// command; the arrows/Escape navigate the menu when it's open.
+	//
+	// The composer is a textarea (so it wraps instead of overflowing), which means
+	// Enter inserts a newline by default. We override that so bare Enter submits the
+	// form, where the line is parsed inline (see submit), and Shift+Enter keeps its
+	// native behavior of adding a newline for a multi-line message.
 	function onKeydown(event: KeyboardEvent) {
+		// Bare Enter submits (matching the old <input>); Shift+Enter adds a newline.
+		// This holds whether or not the menu is open. Submit parses the line inline,
+		// so a typed/Tab-completed command runs on Enter just as it did before.
+		if (event.key === 'Enter' && !event.shiftKey) {
+			event.preventDefault();
+			commandInput?.form?.requestSubmit();
+			return;
+		}
 		if (!menuOpen) return;
 		switch (event.key) {
 			case 'ArrowDown':
@@ -576,19 +625,20 @@
 						onhover={(i) => (active = i)}
 					/>
 				{/if}
-				<input
+				<textarea
 					bind:this={commandInput}
 					bind:value={draft}
 					oninput={onInput}
 					onkeydown={onKeydown}
 					disabled={sending || loadingReplay}
+					rows="1"
 					placeholder={loadingReplay
 						? 'loading…'
 						: viewing
 							? 'resume this conversation'
 							: 'say something, or / for commands'}
-					class="placeholder:text-faint w-full border border-border bg-surface px-3 py-2 text-xs text-text outline-none focus:border-glow disabled:opacity-50"
-				/>
+					class="placeholder:text-faint block w-full resize-none border border-border bg-surface px-3 py-2 text-xs leading-5 text-text outline-none focus:border-glow disabled:opacity-50"
+				></textarea>
 			</div>
 			<button
 				type="submit"
