@@ -1,133 +1,160 @@
 # construct-harness
 
-A small, provider-neutral harness for long-lived agents. Each agent is a
-**Construct**: a thing you can talk to that remembers across conversations,
-streams its replies, calls tools, and keeps itself under the context window
-without you babysitting it.
+A harness for long-lived agents. Each agent is a **Construct**: something you
+talk to that remembers across conversations, streams its replies, calls tools,
+and keeps itself under the context window without supervision.
 
-The whole project leans on a few opinions:
+The project is two halves you can use separately:
 
-- **One runtime dependency.** Only the Anthropic SDK, and it is quarantined to a
-  single file. Everything else is the Node standard library, including
-  `node:sqlite` for storage. No vector database, no framework, no build step.
-- **A provider-neutral core.** Nothing outside `src/bridge/anthropic.ts` knows
-  what model you are talking to. The core speaks plain message types; a thin
-  bridge maps them to a provider. Swapping or adding a provider touches one file.
-- **Tests that run without a network.** The mappers are pure, the loop runs
-  against a scripted fake client, and the memory store runs in `:memory:`. The
-  suite is roughly the size of the source.
+- **The core library** (`src/`), provider-neutral and dependency-light. It is
+  what you import.
+- **A web client** (`client/`), a SvelteKit app for talking to a Construct and
+  inspecting what it knows. It is optional.
+
+## The opinions
+
+- **The core has one runtime dependency:** the Anthropic SDK, quarantined to a
+  single file. Everything else is the Node standard library, `node:sqlite`
+  included. No vector database, no build step. (The web client is a normal
+  SvelteKit app with its own dependencies; the "one dependency" claim is about
+  the library you import, not the whole repo.)
+- **The model lives behind a bridge.** Nothing outside
+  [`src/bridge/anthropic.ts`](src/bridge/anthropic.ts) knows which model you are
+  talking to. The core speaks plain message types; the bridge maps them to a
+  provider. Adding or swapping one touches a single file.
+- **Tests run without a network.** The mappers are pure, the loop runs against a
+  scripted fake client, and the stores run in `:memory:`. The suite is about the
+  size of the source.
 
 ## What is interesting here
 
-**Hybrid memory that degrades gracefully.** Memories live in SQLite with three
-ways in: importance and recency, an FTS5 full-text index (porter-stemmed, so
-"deploys" finds "deploy"), and per-row float32 embeddings for semantic recall.
-A single recall walks a ladder: semantic match first, then lexical, then
-substring, then importance order. If the embedding service is down, recall
-quietly falls back to lexical instead of failing a turn. See
-[`src/memory.ts`](src/memory.ts) and [`src/memoryTools.ts`](src/memoryTools.ts).
+**Memory that degrades gracefully.** Facts live in SQLite with three ways in:
+importance and recency, an FTS5 full-text index (porter-stemmed, so "deploys"
+finds "deploy"), and per-row float32 embeddings for semantic recall. One recall
+walks a ladder, semantic first, then lexical, then substring, then importance.
+If the embedding service is down, recall falls back to lexical instead of failing
+the turn. Memories also carry a **strength** that rises when they keep
+resurfacing and decays when they go untouched, so the store learns which facts
+keep proving relevant. See [`src/memory.ts`](src/memory.ts) and
+[`src/memoryTools.ts`](src/memoryTools.ts).
 
-**A Construct that knows where it is.** Beyond memory, a waking Construct gets a
-working sense of its situation: the current time _and_ how long since the last
-turn and how long the session has run ([`src/context.ts`](src/context.ts)); a
-`transcript_recall` tool to search its own durable event log, not just the
-in-context window ([`src/eventTools.ts`](src/eventTools.ts)); goals it sets and
-holds across turns, injected into every prompt so it doesn't drift from the task
-([`src/goals.ts`](src/goals.ts), [`src/goalTools.ts`](src/goalTools.ts));
-provider-hosted web search / fetch / code execution it can run server-side
-([`src/bridge/anthropic.ts`](src/bridge/anthropic.ts)); and, the unguarded local
-counterpart to that sandboxed code execution, a `use__user__shell` tool that runs
-commands on the user's _real_ machine, with the harness process's own privileges,
-so it can run the project's tests, read or edit actual files, and drive the user's
-CLIs ([`src/shellTools.ts`](src/shellTools.ts)), and because those commands go
-through the user's actual login shell, the tool tells the Construct which shell
-(and OS) it's on, so it writes fish, zsh, or bash syntax rather than assuming
-bash. Its reasoning trace streams
-through to the UI as a collapsible block. None of this is auto-magic: each is a
-tool or a passive context provider you opt into when wiring the `Session`.
+**A Construct that doesn't wake up cold.** Recall is pull-based: a memory only
+surfaces if the current message embed-matches it. The **working mind**
+([`src/workingMind.ts`](src/workingMind.ts)) adds push: a small, evolving set of
+the Construct's own recent thoughts and recently-surfaced memories rides every
+turn, kept warm a while instead of vanishing the instant the next message
+doesn't match. The harness promotes and decays these; it never authors them, so
+the held state stays the Construct's own.
 
-**An adversarial critic panel with stakes.** This is the part with no shipped
-equivalent we have found, and the reason the project exists. A reviewer agent
-that has been told to "be blunt" still drifts toward the average, agreeable
-voice. So instead of ordering a critic to be harsh, you give it something to
-_protect_. A `Personality` is rendered into a verifier's system prompt so it
-judges in character, and each critic is dealt a **stake**: a scene where being
-wrong has a cost. Stakes come in two directions. A `falsePass` stake dreads
-waving something broken through, so it pulls toward rejection. A `falseFail`
-stake dreads blocking good work, so it pulls toward approval. Deal both across a
-panel with `dealRoster` and you get a jury that argues a real tension instead of
-a monoculture nodding along. See [`src/critics.ts`](src/critics.ts).
+**A sense of where it is.** A waking Construct also gets the current time and how
+long since the last turn ([`src/context.ts`](src/context.ts)); a
+`transcript_recall` tool to search its durable event log, not just the in-context
+window ([`src/eventTools.ts`](src/eventTools.ts)); goals it sets and holds across
+turns ([`src/goals.ts`](src/goals.ts)); provider-hosted web search, fetch, and
+code execution it runs server-side ([`src/bridge/anthropic.ts`](src/bridge/anthropic.ts));
+and a `use__user__shell` tool that runs commands on your real machine with the
+harness's own privileges, so it can run the tests, edit files, and drive your
+CLIs ([`src/shellTools.ts`](src/shellTools.ts)). That shell tool tells the
+Construct which shell and OS it is on, so it writes fish, zsh, or bash rather than
+guessing. Each of these is opt-in when you wire the `Session`.
 
-`dealRoster` is doing real work in that sentence. The naive way to deal stakes is
-per persona (each critic draws independently from the pool), and that only gives
-you both valences _in expectation_. Per run it fails loudly: with a balanced pool,
-a three-critic panel comes out fully one-sided (every member biased the same way)
-**a quarter of the time**, which is exactly the stampede the mechanism exists to
-prevent, and `majorityRule` over a stampede is false confidence. `dealRoster`
-fixes that structurally: it stratifies the deal across the roster so both valences
-are guaranteed present for any panel of two or more, while keeping the per-run
-randomness (which persona is biased which way, and which concrete stake it draws)
-alive within each valence. (`dealStakes` still deals one persona in isolation,
-for callers like the dream loop that genuinely want a single biased Construct.)
+**A knowledge base alongside the memory.** Memory holds short, agent-curated
+facts auto-injected every turn. **Notes** ([`src/notes.ts`](src/notes.ts)) hold
+longer documentation the agent chooses to read, and sync two ways with a folder
+of markdown files: each note keeps a stable uuid in its frontmatter, so a row
+survives a rename or move on disk in either direction. Same database, separate
+corpus, so human docs and memory chatter never bleed together.
 
-Two honest notes on that panel. First, the idea that a panel of diverse,
-oppositely-biased judges beats one judge, and is cheaper and less self-biased,
-is well supported: see _Replacing Judges with Juries_
-([arXiv:2404.18796](https://arxiv.org/abs/2404.18796)). Second, the claim that
-the panel's verdict is _invariant_ to the things it shouldn't depend on (the
-order the personas sit in, and which stakes they happen to be dealt) is now
-measurable, not just asserted. The logically prior half is settled: a single
-run's panel coming out one-sided is ruled out by `dealRoster`'s stratification,
-with a test asserting both valences always appear. The harder, between-run half
-has a harness: [`src/biasHarness.ts`](src/biasHarness.ts) runs the live panel
-over a candidate many times, re-seating and re-dealing between trials, and
-reports how stable _and_ how correct the verdict was (`npm run bias`, gated on
-`ANTHROPIC_API_KEY`). An early run is sobering and worth stating plainly: on a
-candidate carrying the cardinal flaw (`Math.random()` for a reset token) the
-panel failed it every trial (rock-solid), but on genuinely sound code its
-verdict _wobbled_ with the seating and the deal. LLM judges are known to carry
-exactly this kind of order and position bias (_Judging the Judges_,
-[arXiv:2406.07791](https://arxiv.org/abs/2406.07791)); the panel mitigates it but
-does not erase it, and the harness is how you see that rather than hope it away.
-Treat the invariance as a property the design is built toward and the harness
-measures, not one it already achieves.
+**Dreaming.** During downtime a Construct can invent a throwaway `Personality`,
+drop it into a scenario abstracted from its own memory corpus, and record what
+that persona chooses ([`src/dreaming.ts`](src/dreaming.ts)). The point is not to
+remember you better but to explore the decision-space you inhabit with synthetic
+agents that cost nothing to discard. Dreams feed back through a `dream_recall`
+tool and a last-dream nudge in the system prompt ([`src/dreamTools.ts`](src/dreamTools.ts)).
+
+**An adversarial critic panel with stakes.** This is the reason the project
+exists. A reviewer told to "be blunt" still drifts toward the agreeable centroid.
+So instead of ordering a critic to be harsh, you give it something to *protect*.
+A `Personality` is rendered into a verifier's system prompt so it judges in
+character, and each critic is dealt a **stake**, a scene where being wrong has a
+cost. A `falsePass` stake dreads waving something broken through and pulls toward
+rejection; a `falseFail` stake dreads blocking good work and pulls toward
+approval. Deal both across a panel with `dealRoster` and you get a jury arguing a
+real tension instead of a monoculture nodding along. See
+[`src/critics.ts`](src/critics.ts).
+
+`dealRoster` earns its place. Dealing stakes per persona (each critic draws
+independently) only balances the valences *in expectation*. Per run it fails
+loudly: with a balanced pool a three-critic panel comes out fully one-sided a
+quarter of the time, exactly the stampede the mechanism exists to prevent.
+`dealRoster` stratifies the deal so both valences are guaranteed present for any
+panel of two or more, while keeping which persona is biased which way random
+within each panel.
+
+Two honest notes on that panel:
+
+1. That a jury of diverse, oppositely-biased judges beats one judge, and is
+   cheaper and less self-biased, is well supported: see *Replacing Judges with
+   Juries* ([arXiv:2404.18796](https://arxiv.org/abs/2404.18796)).
+2. The claim that the verdict is *invariant* to things it shouldn't depend on
+   (seating order, which stakes get dealt) is measured, not just asserted. The
+   within-run stampede is ruled out structurally by `dealRoster`. The harder
+   between-run half has a harness ([`src/biasHarness.ts`](src/biasHarness.ts),
+   run with `npm run bias`) that runs the live panel over a candidate many times,
+   re-seating and re-dealing between trials, and reports how stable and how
+   correct the verdict was. An early run is sobering: on code carrying a cardinal
+   flaw (`Math.random()` for a reset token) the panel failed it every trial, but
+   on genuinely sound code the verdict *wobbled* with the seating and the deal.
+   LLM judges are known to carry exactly this order and position bias (*Judging
+   the Judges*, [arXiv:2406.07791](https://arxiv.org/abs/2406.07791)). The panel
+   mitigates it; it does not erase it. Treat invariance as a property the design
+   is built toward and the harness measures, not one it already achieves.
 
 ## Requirements
 
 Node 23.6 or newer. The harness runs TypeScript directly using Node's native
-type stripping, so there is nothing to compile. It is developed on Node 26.
+type stripping, so there is nothing to compile. Developed on Node 26.
 
 ## Quick start (the REPL)
 
 ```sh
 export ANTHROPIC_API_KEY=sk-...
-# optional, turns on semantic recall; without it recall is lexical
+# optional: turns on semantic recall. Without it, recall is lexical.
 export OPENAI_API_KEY=sk-...
 
 npm start            # or: node --env-file-if-exists=.env src/index.ts
 ```
 
 You get a streaming prompt. The Construct saves durable facts on its own and
-recalls them on later turns. Slash commands handle the session-level actions a
-transcript can't: `/reset`, `/history`, `/help`, `/exit`. They come from one
-catalogue ([`src/commands.ts`](src/commands.ts)) the REPL prints under `/help`
-and the web client lists in a menu when you open the composer with a `/`; adding
-a command in that one file lights it up on both surfaces.
+recalls them later. Slash commands handle the session-level actions a transcript
+can't (`/reset`, `/history`, `/help`, `/exit`); they live in one catalogue
+([`src/commands.ts`](src/commands.ts)) that both the REPL and the web client read,
+so adding one lights it up on both surfaces.
 
-## HTTP server and client
+## The web client
 
-Run the local HTTP surface with:
+The client is a SvelteKit app that talks to a small HTTP backend. The two run as
+separate processes; `just dev` starts both:
 
 ```sh
-npm run serve
+just dev     # API server (node, :8787) + client (vite, :5173)
 ```
 
-It exposes the single-user `/api/*` backend used by the SvelteKit client. By
-default CORS is permissive (`CORS_ORIGIN=*`) for local development and separately
-served static builds. Set `CORS_ORIGIN=http://localhost:5173` or another exact
-origin if you expose the server outside that local setup.
+Or run them by hand:
 
-The HTTP helpers are exported separately from the core package:
+```sh
+npm run serve                  # API backend on :8787
+cd client && npm run dev       # client on :5173, proxies /api to the server
+```
+
+The backend runs on Node, not Bun, because the stores use `node:sqlite`. Beyond
+chat, the client gives you a window into what the Construct knows: pages for its
+memories, the event log, dreams, goals, the knowledge base, a read-only context
+inspector (what the Construct actually sees each turn), and settings. CORS is
+permissive (`CORS_ORIGIN=*`) for local development; set an exact origin if you
+expose the server.
+
+The HTTP helpers are exported separately from the core:
 
 ```ts
 import { createHandler } from "construct-harness/server";
@@ -166,7 +193,7 @@ console.log("\nused", next.value.usage.outputTokens, "output tokens");
 
 ### A critic panel
 
-The panel is the same primitive whether you use it to grade one answer or as the
+The panel is the same primitive whether you grade one answer or wire it as the
 verifier inside a larger run.
 
 ```ts
@@ -187,17 +214,16 @@ const roster: Personality[] = dealRoster([
         disposition: "protects momentum; rejects perfectionism that is not load-bearing",
     },
     { name: "Sam", role: "the on-call engineer who gets paged at 3am" },
-]); // deal the whole panel at once: stakes drawn at random, but both valences
-// guaranteed present so the jury argues a tension rather than stampeding one way
+]); // both valences guaranteed present, but which persona gets which is random
 
 const verdict = await panel(roster, { client }, candidateText, { consensus: majorityRule });
 console.log(verdict.ok); // the jury's call
 for (const v of verdict.verdicts) console.log(v.critic.name, v.verdict?.ok, v.verdict?.rationale);
 ```
 
-`orchestrate()` ties this together end to end: fan a set of tasks out to fresh
-Constructs, verify each result (a single skeptic, or a whole panel via
-`panelVerify`), and keep the survivors. See [`src/orchestrate.ts`](src/orchestrate.ts).
+`orchestrate()` ties this together end to end: fan tasks out to fresh Constructs,
+verify each result (one skeptic, or a whole panel via `panelVerify`), and keep the
+survivors. See [`src/orchestrate.ts`](src/orchestrate.ts).
 
 ## How it fits together
 
@@ -207,22 +233,21 @@ arrows only ever point inward.
 - [`src/types.ts`](src/types.ts): the core message types. No provider here.
 - [`src/bridge/`](src/bridge/): the contract (`ModelClient`), a neutral error
   taxonomy and retry policy, the agentic loop, and `anthropic.ts`, the one file
-  allowed to import an SDK. Adding a second provider means a second file like it.
-- [`src/memory.ts`](src/memory.ts), [`src/embeddings.ts`](src/embeddings.ts),
-  [`src/memoryTools.ts`](src/memoryTools.ts): storage, vectors, and the tools and
-  passive recall that bridge memory into a run. The same SQLite file, one
-  migration runner, also holds the append-only event log
-  ([`src/events.ts`](src/events.ts), [`src/eventTools.ts`](src/eventTools.ts)) and
-  the goal store ([`src/goals.ts`](src/goals.ts),
-  [`src/goalTools.ts`](src/goalTools.ts)).
-- [`src/context.ts`](src/context.ts), [`src/compaction.ts`](src/compaction.ts),
-  [`src/usage.ts`](src/usage.ts): per-turn passive context (the time, elapsed and
-  session duration, active goals), summarizing old turns to stay under the window,
-  and token accounting. A context provider may be async, so it can read a store to
-  decide what to inject.
+  allowed to import an SDK.
+- [`src/memory.ts`](src/memory.ts), [`src/notes.ts`](src/notes.ts),
+  [`src/events.ts`](src/events.ts), [`src/goals.ts`](src/goals.ts): the stores,
+  all on one SQLite file behind one migration runner, plus the tools and passive
+  recall that bridge them into a run.
+- [`src/context.ts`](src/context.ts),
+  [`src/workingMind.ts`](src/workingMind.ts),
+  [`src/compaction.ts`](src/compaction.ts), [`src/usage.ts`](src/usage.ts):
+  per-turn passive context, pushed working memory, summarizing old turns to stay
+  under the window, and token accounting.
 - [`src/session.ts`](src/session.ts): the stateful thing a person talks to.
-- [`src/orchestrate.ts`](src/orchestrate.ts), [`src/critics.ts`](src/critics.ts):
-  driving Constructs without a human in the seat, and judging their work.
+- [`src/orchestrate.ts`](src/orchestrate.ts),
+  [`src/critics.ts`](src/critics.ts),
+  [`src/dreaming.ts`](src/dreaming.ts): driving Constructs without a human in the
+  seat, judging their work, and dreaming between turns.
 
 ## Testing and dry runs
 
@@ -231,9 +256,9 @@ npm test         # node --test, no network, no spend
 npm run typecheck
 ```
 
-The scripted client used throughout the suite is exported for your own
-zero-spend dry runs. Hand it a queue of turns and drive a real `Session` or loop
-against it with no key and no network:
+The scripted client used throughout the suite is exported for your own zero-spend
+dry runs. Hand it a queue of turns and drive a real `Session` against it with no
+key and no network:
 
 ```ts
 import { Session } from "construct-harness";
@@ -252,22 +277,20 @@ project is trying not to be.
   others, but "provider-neutral" is validated by a single implementation today.
 - **Semantic recall scans linearly.** `semanticSearch` compares against every
   stored vector in JavaScript. That is microseconds for a personal store of a few
-  thousand memories. A large corpus wants an approximate index, which is a future
+  thousand memories; a large corpus wants an approximate index, which is a future
   migration, not a rewrite.
 - **Argument validation is shallow.** The loop checks a tool call's top-level
-  shape (object-ness and required keys), not a full JSON Schema. The tool stays
-  the final authority on its own input.
-- **The live conversation is in memory; the transcript is not.** A Session's
-  in-process history lives for the life of the process, but when an event log is
-  wired (the server always does) every turn is appended to durable SQLite, so it
+  shape, not a full JSON Schema. The tool stays the final authority on its input.
+- **The live conversation is in memory; the durable record is in SQLite.** A
+  Session's in-process history lives for the life of the process. When an event
+  log is wired (the server always does) every turn is appended to SQLite, so it
   outlives the process and the Construct can search it with `transcript_recall`.
-  Saved memories and goals persist the same way.
+  Saved memories, notes, and goals persist the same way; the working mind does
+  not, by design.
 - **The panel's between-run invariance is measured, and imperfect.** The
-  within-run stampede is ruled out structurally (`dealRoster`), but an early run
-  of the bias harness (`npm run bias`) shows the verdict on genuinely-sound code
-  still wobbles with the seating and the deal, even as the cardinal-flaw case is
-  caught every time. See the note under the critic panel above. Mitigated, not
-  erased.
+  within-run stampede is ruled out structurally; the bias harness (`npm run bias`)
+  shows the verdict on sound code still wobbles with seating and deal even as the
+  cardinal-flaw case is caught every time. Mitigated, not erased.
 
 ## License
 
