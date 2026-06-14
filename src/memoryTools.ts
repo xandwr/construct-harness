@@ -14,11 +14,23 @@
  */
 
 import type { ToolDef } from "./types.ts";
-import { Memory, MemoryError, MemoryStore } from "./memory.ts";
+import { Memory, MemoryError, MemoryStore, MAX_LIMIT } from "./memory.ts";
 import { embedOne, EmbeddingError, type Embedder } from "./embeddings.ts";
 
 /** How many memories auto-recall injects by default. */
 export const DEFAULT_RECALL_LIMIT = 10;
+
+/**
+ * Cosine-similarity threshold at or above which a new memory is treated as a
+ * near-duplicate of an existing one and the save is skipped (see
+ * {@link findDuplicate}). Set deliberately high: 0.95 catches reworded restatements
+ * of the same fact ("user likes dark mode" / "the user prefers dark mode") while
+ * leaving genuinely distinct-but-related facts ("user likes dark mode" / "user
+ * dislikes bright screens") as separate rows. Tunable per-tool-set via
+ * {@link MemoryToolOptions.dedupeThreshold}; pass 1 to require an effectively
+ * exact vector match, or a value > 1 to disable semantic dedup entirely.
+ */
+export const DEFAULT_DEDUPE_THRESHOLD = 0.95;
 
 /** The serializable view of a memory we hand back to the model. */
 export interface MemoryView {
@@ -44,6 +56,13 @@ function toView(m: Memory): MemoryView {
 /** Narrow an unknown args bag to a record without trusting its fields yet. */
 function asRecord(args: unknown): Record<string, unknown> {
     return typeof args === "object" && args !== null ? (args as Record<string, unknown>) : {};
+}
+
+/** Distinguish a bare {@link Embedder} (the old second arg) from a
+ *  {@link MemoryToolOptions} bag, so `memoryTools` stays back-compatible. An
+ *  Embedder is identified by its `embed` method. */
+function isEmbedder(value: Embedder | MemoryToolOptions | undefined): value is Embedder {
+    return typeof (value as Embedder | undefined)?.embed === "function";
 }
 
 /** Coerce an unknown to a string[] of tags, ignoring non-string entries. */
@@ -115,6 +134,81 @@ async function recallMemories(
     return store.all(opts);
 }
 
+/** An existing memory a save was found to duplicate, with the score that decided
+ *  it (the cosine similarity, or 1 for an exact-content match on the no-embedder
+ *  path). */
+interface DuplicateHit {
+    memory: Memory;
+    similarity: number;
+}
+
+/**
+ * Find an existing memory the given content duplicates, so a save can skip
+ * re-storing the same fact. Two paths, preferring the stronger signal:
+ *
+ *  1. Semantic: when an embedder is configured and the content embeds, the
+ *     nearest stored memory by cosine similarity. If that score is at or above
+ *     `threshold`, it's a duplicate. This catches a reworded restatement of the
+ *     same fact, which an exact-string check never would.
+ *  2. Exact-content fallback: with no embedder (or when embedding fails), a
+ *     case-and-whitespace-insensitive exact match on the trimmed content. We
+ *     deliberately do NOT treat a mere lexical (FTS) overlap as a duplicate here:
+ *     shared words are far too weak a signal to silently drop a save on.
+ *
+ * Returns the duplicate (with its score) or undefined when the content is novel.
+ * Best-effort throughout: an embedding outage degrades to the exact-content
+ * check, never failing the save.
+ */
+async function findDuplicate(
+    store: MemoryStore,
+    embedder: Embedder | undefined,
+    content: string,
+    threshold: number,
+): Promise<DuplicateHit | undefined> {
+    const trimmed = content.trim();
+    if (!trimmed) return undefined;
+
+    if (embedder) {
+        try {
+            const vec = await embedOne(embedder, trimmed);
+            const [top] = store.semanticSearch(vec, { limit: 1 });
+            if (top && top.score >= threshold) {
+                return { memory: top.memory, similarity: top.score };
+            }
+            // A confident semantic *non*-match still falls through to the exact
+            // check below: a brand-new memory that happens to be byte-identical to
+            // an un-embedded older one should still dedupe.
+        } catch (err) {
+            if (!(err instanceof EmbeddingError)) throw err;
+            // Embedding outage: fall through to the exact-content check.
+        }
+    }
+
+    // Exact-content match (case- and surrounding-whitespace-insensitive), the
+    // floor that works with no embedder and as the semantic path's backstop.
+    const folded = trimmed.toLowerCase();
+    for (const m of store.search(trimmed, { limit: MAX_LIMIT })) {
+        if (m.content.trim().toLowerCase() === folded) {
+            return { memory: m, similarity: 1 };
+        }
+    }
+    return undefined;
+}
+
+/** Tuning knobs for {@link memoryTools}. */
+export interface MemoryToolOptions {
+    /** Embedder for semantic recall and semantic save-time dedup. Omit to keep
+     *  recall lexical and dedup exact-content only. */
+    embedder?: Embedder;
+    /**
+     * Cosine threshold above which `memory_save` treats a new memory as a
+     * near-duplicate of an existing one and skips the insert. Defaults to
+     * {@link DEFAULT_DEDUPE_THRESHOLD}. Pass a value > 1 to disable semantic dedup
+     * (exact-content dedup still applies).
+     */
+    dedupeThreshold?: number;
+}
+
 /**
  * Build the memory tool set over a given store. The loop's own arg validation
  * (`validateArgs`) enforces `required`; these handlers defend the rest and
@@ -127,13 +221,34 @@ async function recallMemories(
  * the save still succeeds and recall transparently falls back to lexical (FTS)
  * then importance order, so the harness never loses a memory or a turn to an
  * embedding outage.
+ *
+ * `memory_save` also dedupes: a save whose content closely matches an existing
+ * memory (semantically when embeddings are on, else exact-content) is skipped and
+ * the existing memory returned, so the same fact saved across sessions doesn't
+ * accumulate near-identical rows. `memory_update` revises a memory in place,
+ * keeping its id (and therefore its provenance and any links pointing at it),
+ * which forget-then-re-save would lose.
+ *
+ * Back-compat: the second argument may still be a bare {@link Embedder} (the
+ * original signature) or the new {@link MemoryToolOptions} bag.
  */
-export function memoryTools(store: MemoryStore, embedder?: Embedder): ToolDef[] {
+export function memoryTools(
+    store: MemoryStore,
+    embedderOrOptions?: Embedder | MemoryToolOptions,
+): ToolDef[] {
+    const options: MemoryToolOptions = isEmbedder(embedderOrOptions)
+        ? { embedder: embedderOrOptions }
+        : (embedderOrOptions ?? {});
+    const embedder = options.embedder;
+    const dedupeThreshold = options.dedupeThreshold ?? DEFAULT_DEDUPE_THRESHOLD;
     const save: ToolDef = {
         name: "memory_save",
         description:
             "Save a durable memory for future conversations. Use for stable facts, " +
-            "preferences, and decisions worth remembering: not transient chatter.",
+            "preferences, and decisions worth remembering: not transient chatter. " +
+            "A save that closely matches an existing memory is skipped and the " +
+            "existing one returned (deduped); pass force:true to save it anyway, or " +
+            "use memory_update to revise the existing memory in place.",
         parameters: {
             type: "object",
             properties: {
@@ -147,14 +262,35 @@ export function memoryTools(store: MemoryStore, embedder?: Embedder): ToolDef[] 
                     type: "number",
                     description: "Optional relevance score from 0 (low) to 1 (high).",
                 },
+                force: {
+                    type: "boolean",
+                    description:
+                        "Save even if a near-duplicate already exists (skips dedup). " +
+                        "Default false.",
+                },
             },
             required: ["content"],
         },
         async run(args) {
             const a = asRecord(args);
             try {
+                const content = a.content as string;
+                // Dedup before inserting: a near-identical fact is skipped and the
+                // existing memory returned, so the same fact saved across sessions
+                // doesn't pile up near-duplicate rows. `force` opts out.
+                if (a.force !== true && typeof content === "string") {
+                    const dup = await findDuplicate(store, embedder, content, dedupeThreshold);
+                    if (dup) {
+                        return {
+                            saved: false,
+                            deduped: true,
+                            similarity: dup.similarity,
+                            memory: toView(dup.memory),
+                        };
+                    }
+                }
                 const memory = new Memory({
-                    content: a.content as string,
+                    content,
                     tags: asTags(a.tags),
                     importance: typeof a.importance === "number" ? a.importance : undefined,
                 });
@@ -166,6 +302,67 @@ export function memoryTools(store: MemoryStore, embedder?: Embedder): ToolDef[] 
                 return { saved: true, memory: toView(memory) };
             } catch (err) {
                 if (err instanceof MemoryError) return { saved: false, error: err.message };
+                throw err;
+            }
+        },
+    };
+
+    const update: ToolDef = {
+        name: "memory_update",
+        description:
+            "Revise an existing memory in place by its id, keeping the same id (and " +
+            "so its provenance and any links pointing at it), which forgetting and " +
+            "re-saving would lose. Only the fields you pass change; omit the rest. " +
+            "Pass tags:[] to clear all tags. Editing `content` re-embeds the memory.",
+        parameters: {
+            type: "object",
+            properties: {
+                id: { type: "number", description: "The id of the memory to revise." },
+                content: { type: "string", description: "New fact text." },
+                tags: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Replacement tag list (pass [] to clear).",
+                },
+                importance: {
+                    type: "number",
+                    description: "New relevance score from 0 (low) to 1 (high).",
+                },
+            },
+            required: ["id"],
+        },
+        async run(args) {
+            const a = asRecord(args);
+            if (typeof a.id !== "number" || !Number.isFinite(a.id)) {
+                return { updated: false, error: "id must be a finite number" };
+            }
+            const tags = asTags(a.tags);
+            const hasImportance = typeof a.importance === "number";
+            if (a.content === undefined && tags === undefined && !hasImportance) {
+                return {
+                    updated: false,
+                    error: "provide content, tags, and/or importance to update",
+                };
+            }
+            try {
+                const patch: Parameters<MemoryStore["update"]>[1] = {};
+                if (typeof a.content === "string") patch.content = a.content;
+                if (tags !== undefined) patch.tags = tags;
+                if (hasImportance) patch.importance = a.importance as number;
+
+                const before = store.get(a.id);
+                const updated = store.update(a.id, patch);
+                if (!updated) return { updated: false, error: `no memory with id ${a.id}` };
+
+                // Editing content invalidates the old vector (the store's trigger
+                // drops it); re-embed best-effort so the memory stays semantically
+                // searchable. A metadata-only edit keeps its vector, so skip it.
+                if (before && updated.content !== before.content) {
+                    await embedIfPossible(store, embedder, updated);
+                }
+                return { updated: true, memory: toView(updated) };
+            } catch (err) {
+                if (err instanceof MemoryError) return { updated: false, error: err.message };
                 throw err;
             }
         },
@@ -220,7 +417,7 @@ export function memoryTools(store: MemoryStore, embedder?: Embedder): ToolDef[] 
         },
     };
 
-    return [save, recall, forget];
+    return [save, update, recall, forget];
 }
 
 /** Options controlling which memories auto-recall surfaces. */

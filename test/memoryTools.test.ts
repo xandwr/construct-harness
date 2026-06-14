@@ -9,8 +9,12 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { MemoryStore, Memory } from "../src/memory.ts";
+import { EventStore } from "../src/events.ts";
 import { memoryTools, recallContext, DEFAULT_RECALL_LIMIT } from "../src/memoryTools.ts";
 import { EmbeddingError, type Embedder } from "../src/embeddings.ts";
 import { runLoop } from "../src/bridge/loop.ts";
@@ -171,6 +175,194 @@ test("memory_forget rejects a non-numeric id", async () => {
     const res = (await forget.run({ id: "nope" })) as { forgotten: boolean; error?: string };
     assert.equal(res.forgotten, false);
     assert.match(res.error ?? "", /finite number/);
+    store.close();
+});
+
+// ---------------------------------------------------------------------------
+// memory_update
+// ---------------------------------------------------------------------------
+
+test("memory_update revises content in place, keeping the same id", async () => {
+    const store = freshStore();
+    const saved = store.save(new Memory({ content: "user uses light mode", tags: ["pref"] }));
+    const update = tool(memoryTools(store), "memory_update");
+
+    const res = (await update.run({ id: saved.id, content: "user uses dark mode" })) as {
+        updated: boolean;
+        memory: { id: number; content: string; tags: string[] };
+    };
+    assert.equal(res.updated, true);
+    assert.equal(res.memory.id, saved.id); // same id: provenance and links survive
+    assert.equal(res.memory.content, "user uses dark mode");
+    assert.deepEqual(res.memory.tags, ["pref"]); // untouched fields are preserved
+    assert.equal(store.count(), 1); // revised in place, not a second row
+    store.close();
+});
+
+test("memory_update can clear tags and change importance without touching content", async () => {
+    const store = freshStore();
+    const saved = store.save(new Memory({ content: "keep me", tags: ["a", "b"], importance: 0.2 }));
+    const update = tool(memoryTools(store), "memory_update");
+
+    const res = (await update.run({ id: saved.id, tags: [], importance: 0.9 })) as {
+        updated: boolean;
+        memory: { content: string; tags: string[]; importance?: number };
+    };
+    assert.equal(res.updated, true);
+    assert.equal(res.memory.content, "keep me");
+    assert.deepEqual(res.memory.tags, []);
+    assert.equal(res.memory.importance, 0.9);
+    store.close();
+});
+
+test("memory_update reports a missing id and an empty patch", async () => {
+    const store = freshStore();
+    const saved = store.save(new Memory({ content: "x" }));
+    const update = tool(memoryTools(store), "memory_update");
+
+    const missing = (await update.run({ id: saved.id + 99, content: "y" })) as {
+        updated: boolean;
+        error?: string;
+    };
+    assert.equal(missing.updated, false);
+    assert.match(missing.error ?? "", /no memory/);
+
+    const empty = (await update.run({ id: saved.id })) as { updated: boolean; error?: string };
+    assert.equal(empty.updated, false);
+    assert.match(empty.error ?? "", /provide content/);
+    store.close();
+});
+
+test("memory_update keeps provenance attached across an edit", async () => {
+    // The whole point of update-in-place over forget+re-save: the id (and so its
+    // provenance overlay row) survives. Prove it end to end against a real event
+    // on a shared db file: forget+re-save would mint a new id and orphan this
+    // provenance; update keeps the same id, so the overlay still resolves.
+    const dir = mkdtempSync(join(tmpdir(), "memupd-"));
+    const dbPath = join(dir, "db.sqlite");
+    const store = new MemoryStore(dbPath);
+    const events = new EventStore(dbPath);
+    try {
+        const evt = events.append({ kind: "message", role: "user", content: "I moved to Berlin" });
+        const saved = store.save(new Memory({ content: "user lives in Munich" }));
+        assert.equal(store.setProvenance(saved.id, evt.id), true);
+        assert.equal(store.provenanceOf(saved.id), evt.id);
+
+        const update = tool(memoryTools(store), "memory_update");
+        const res = (await update.run({ id: saved.id, content: "user lives in Berlin" })) as {
+            updated: boolean;
+            memory: { id: number };
+        };
+        assert.equal(res.updated, true);
+        assert.equal(res.memory.id, saved.id);
+        // The edit kept the id, so the provenance link is intact.
+        assert.equal(store.provenanceOf(saved.id), evt.id);
+    } finally {
+        events.close();
+        store.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("memory_update re-embeds when content changes, keeps the vector otherwise", async () => {
+    const store = freshStore();
+    const embedder = fakeEmbedder({ "first fact": [1, 0], "second fact": [0, 1] });
+    const tools = memoryTools(store, embedder);
+    const save = tool(tools, "memory_save");
+    const update = tool(tools, "memory_update");
+
+    const saved = (await save.run({ content: "first fact" })) as { memory: { id: number } };
+    assert.equal(store.hasEmbedding(saved.memory.id), true);
+
+    // A content edit drops the old vector (trigger) and re-embeds (tool).
+    await update.run({ id: saved.memory.id, content: "second fact" });
+    assert.equal(store.hasEmbedding(saved.memory.id), true);
+    assert.equal(store.get(saved.memory.id)?.content, "second fact");
+    store.close();
+});
+
+// ---------------------------------------------------------------------------
+// memory_save dedup
+// ---------------------------------------------------------------------------
+
+test("memory_save dedupes an exact-content repeat (no embedder)", async () => {
+    const store = freshStore();
+    const save = tool(memoryTools(store), "memory_save");
+
+    const first = (await save.run({ content: "user lives in Berlin" })) as { saved: boolean };
+    assert.equal(first.saved, true);
+
+    // Same fact, different surrounding whitespace/case: deduped, not re-saved.
+    const dup = (await save.run({ content: "  User lives in Berlin  " })) as {
+        saved: boolean;
+        deduped: boolean;
+        similarity: number;
+        memory: { content: string };
+    };
+    assert.equal(dup.saved, false);
+    assert.equal(dup.deduped, true);
+    assert.equal(dup.similarity, 1);
+    assert.equal(dup.memory.content, "user lives in Berlin"); // the existing row
+    assert.equal(store.count(), 1); // no second row
+    store.close();
+});
+
+test("memory_save dedupes a semantic near-duplicate when an embedder is configured", async () => {
+    const store = freshStore();
+    // The reworded restatement embeds to the same direction as the original.
+    const embedder = fakeEmbedder({
+        "user prefers dark mode": [1, 0],
+        "the user likes dark mode": [1, 0],
+        "user dislikes loud music": [0, 1],
+    });
+    const save = tool(memoryTools(store, embedder), "memory_save");
+
+    await save.run({ content: "user prefers dark mode" });
+    const dup = (await save.run({ content: "the user likes dark mode" })) as {
+        saved: boolean;
+        deduped: boolean;
+        similarity: number;
+    };
+    assert.equal(dup.saved, false);
+    assert.equal(dup.deduped, true);
+    assert.ok(dup.similarity >= 0.95);
+    assert.equal(store.count(), 1);
+
+    // A genuinely different fact is NOT deduped, even sharing the embedder.
+    const distinct = (await save.run({ content: "user dislikes loud music" })) as {
+        saved: boolean;
+    };
+    assert.equal(distinct.saved, true);
+    assert.equal(store.count(), 2);
+    store.close();
+});
+
+test("memory_save force:true overrides dedup", async () => {
+    const store = freshStore();
+    const save = tool(memoryTools(store), "memory_save");
+    await save.run({ content: "repeated fact" });
+    const forced = (await save.run({ content: "repeated fact", force: true })) as {
+        saved: boolean;
+    };
+    assert.equal(forced.saved, true);
+    assert.equal(store.count(), 2); // forced through the dedup guard
+    store.close();
+});
+
+test("memory_save dedup degrades to exact-content when embedding fails", async () => {
+    const store = freshStore();
+    const embedder = fakeEmbedder({}, { fail: true });
+    const save = tool(memoryTools(store, embedder), "memory_save");
+    await save.run({ content: "the deploy runs on fridays" });
+    // Embedder throws, so the semantic path can't run; the exact-content backstop
+    // still catches the byte-identical repeat.
+    const dup = (await save.run({ content: "the deploy runs on fridays" })) as {
+        saved: boolean;
+        deduped: boolean;
+    };
+    assert.equal(dup.saved, false);
+    assert.equal(dup.deduped, true);
+    assert.equal(store.count(), 1);
     store.close();
 });
 

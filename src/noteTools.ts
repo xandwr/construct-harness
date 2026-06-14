@@ -19,7 +19,7 @@
  */
 
 import type { ToolDef } from "./types.ts";
-import { Note, NoteError, NotesStore } from "./notes.ts";
+import { Note, NoteError, NotesStore, type NoteLink } from "./notes.ts";
 import { NotesService } from "./notesService.ts";
 import { embedOne, EmbeddingError, type Embedder } from "./embeddings.ts";
 
@@ -224,6 +224,96 @@ export function noteTools(
         },
     };
 
+    const forget: ToolDef = {
+        name: "note_forget",
+        description:
+            "Delete a knowledge-base note by its uuid: removes the row, its " +
+            "embedding, any links touching it, and the markdown file on disk. " +
+            "Symmetric with memory_forget. Returns whether a note was removed.",
+        parameters: {
+            type: "object",
+            properties: {
+                uuid: { type: "string", description: "The uuid of the note to delete." },
+            },
+            required: ["uuid"],
+        },
+        async run(args) {
+            const a = asRecord(args);
+            if (typeof a.uuid !== "string") {
+                return { forgotten: false, error: "uuid must be a string" };
+            }
+            const existing = store.getByUuid(a.uuid);
+            if (!existing) return { forgotten: false, error: "no note with that uuid" };
+            try {
+                // Go through the service so the file is deleted alongside the row
+                // (the store's cascade drops the vector and links; the file lives
+                // outside the DB and only the service knows the KB root).
+                const removed = await service.remove(existing.id);
+                return { forgotten: removed };
+            } catch (err) {
+                if (err instanceof NoteError) return { forgotten: false, error: err.message };
+                throw err;
+            }
+        },
+    };
+
+    const links: ToolDef = {
+        name: "note_links",
+        description:
+            "Read a note's links so the graph is traversable, not write-only. By " +
+            "default returns the note's outgoing links (what it references); pass " +
+            "direction:'in' for the reverse (other notes that reference this one). " +
+            "Each link reports its id (for note_unlink), kind, and target.",
+        parameters: {
+            type: "object",
+            properties: {
+                uuid: { type: "string", description: "The uuid of the note to inspect." },
+                direction: {
+                    type: "string",
+                    enum: ["out", "in"],
+                    description:
+                        "'out' (default): links this note makes. 'in': links pointing " +
+                        "at this note from other notes.",
+                },
+            },
+            required: ["uuid"],
+        },
+        async run(args) {
+            const a = asRecord(args);
+            if (typeof a.uuid !== "string") {
+                return { error: "uuid must be a string" };
+            }
+            const note = store.getByUuid(a.uuid);
+            if (!note) return { error: "no note with that uuid" };
+            const direction = a.direction === "in" ? "in" : "out";
+            const raw = direction === "in" ? store.linksToNote(note.id) : store.linksFrom(note.id);
+            const links = raw.map((l) => toLinkView(store, l));
+            return { count: links.length, direction, links };
+        },
+    };
+
+    const unlink: ToolDef = {
+        name: "note_unlink",
+        description:
+            "Remove a single link by its id (get ids from note_links). Returns " +
+            "whether a link was removed. Deletes only the edge, never the notes or " +
+            "memory it connected.",
+        parameters: {
+            type: "object",
+            properties: {
+                id: { type: "number", description: "The id of the link to remove." },
+            },
+            required: ["id"],
+        },
+        async run(args) {
+            const a = asRecord(args);
+            if (typeof a.id !== "number" || !Number.isFinite(a.id)) {
+                return { unlinked: false, error: "id must be a finite number" };
+            }
+            return { unlinked: store.unlink(a.id) };
+        },
+    };
+
     const link: ToolDef = {
         name: "note_link",
         description:
@@ -272,9 +362,22 @@ export function noteTools(
         },
     };
 
-    return [save, update, recall, link];
+    return [save, update, recall, link, forget, links, unlink];
 }
 
 function asKind(v: unknown): string | undefined {
     return typeof v === "string" && v.trim() ? v : undefined;
+}
+
+/** The serializable view of a link handed back to the model. We resolve the
+ *  target into the same handles the agent uses elsewhere: a note target as its
+ *  uuid (its stable id), a memory target as its numeric id. A null `toUuid`/
+ *  `toMemory` means the target was forgotten (a memory link survives its target's
+ *  deletion via SET NULL); we surface that rather than hiding the dangling edge. */
+function toLinkView(store: NotesStore, link: NoteLink) {
+    const target =
+        link.toNote !== null
+            ? { kind: "note" as const, toUuid: store.get(link.toNote)?.uuid ?? null }
+            : { kind: "memory" as const, toMemory: link.toMemory };
+    return { id: link.id, relation: link.kind, ...target };
 }

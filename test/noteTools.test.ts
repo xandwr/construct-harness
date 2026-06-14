@@ -219,12 +219,124 @@ test("note_link requires exactly one target", async () => {
     });
 });
 
+test("note_forget deletes the row, its links, and the file on disk", async () => {
+    await withTools(async ({ kb, store, tools }) => {
+        const a = (await tool(tools, "note_save").run({ title: "A", content: "x" })) as any;
+        const b = (await tool(tools, "note_save").run({ title: "B", content: "y" })) as any;
+        await tool(tools, "note_link").run({ from: a.note.uuid, toNote: b.note.uuid });
+        assert.ok(existsSync(join(kb, a.note.path)));
+        assert.equal(store.linksFrom(a.note.id).length, 1);
+
+        const res = (await tool(tools, "note_forget").run({ uuid: a.note.uuid })) as any;
+        assert.equal(res.forgotten, true);
+        assert.equal(store.getByUuid(a.note.uuid), undefined); // row gone
+        assert.ok(!existsSync(join(kb, a.note.path))); // file gone
+        // The link cascaded with the source note (from_note ON DELETE CASCADE).
+        assert.equal(store.linksToNote(b.note.id).length, 0);
+    });
+});
+
+test("note_forget on a missing uuid reports cleanly", async () => {
+    await withTools(async ({ tools }) => {
+        const res = (await tool(tools, "note_forget").run({ uuid: "nope" })) as any;
+        assert.equal(res.forgotten, false);
+        assert.match(res.error, /no note/);
+    });
+});
+
+test("note_links reads outgoing links with ids and targets", async () => {
+    await withTools(async ({ memStore, tools }) => {
+        const m = memStore.save(new Memory({ content: "a fact" }));
+        const a = (await tool(tools, "note_save").run({ title: "A", content: "x" })) as any;
+        const b = (await tool(tools, "note_save").run({ title: "B", content: "y" })) as any;
+        await tool(tools, "note_link").run({
+            from: a.note.uuid,
+            toNote: b.note.uuid,
+            kind: "references",
+        });
+        await tool(tools, "note_link").run({
+            from: a.note.uuid,
+            toMemory: m.id,
+            kind: "derived_from",
+        });
+
+        const res = (await tool(tools, "note_links").run({ uuid: a.note.uuid })) as any;
+        assert.equal(res.direction, "out");
+        assert.equal(res.count, 2);
+        const noteLink = res.links.find((l: any) => l.kind === "note");
+        assert.equal(noteLink.relation, "references");
+        assert.equal(noteLink.toUuid, b.note.uuid); // target resolved to its uuid
+        assert.ok(typeof noteLink.id === "number"); // usable with note_unlink
+        const memLink = res.links.find((l: any) => l.kind === "memory");
+        assert.equal(memLink.toMemory, m.id);
+    });
+});
+
+test("note_links direction:'in' is the reverse lookup", async () => {
+    await withTools(async ({ tools }) => {
+        const a = (await tool(tools, "note_save").run({ title: "A", content: "x" })) as any;
+        const b = (await tool(tools, "note_save").run({ title: "B", content: "y" })) as any;
+        await tool(tools, "note_link").run({ from: a.note.uuid, toNote: b.note.uuid });
+
+        // B has no outgoing links, but one incoming (from A).
+        const out = (await tool(tools, "note_links").run({ uuid: b.note.uuid })) as any;
+        assert.equal(out.count, 0);
+        const incoming = (await tool(tools, "note_links").run({
+            uuid: b.note.uuid,
+            direction: "in",
+        })) as any;
+        assert.equal(incoming.direction, "in");
+        assert.equal(incoming.count, 1);
+        assert.equal(incoming.links[0].toUuid, b.note.uuid);
+    });
+});
+
+test("note_links on a missing uuid reports cleanly", async () => {
+    await withTools(async ({ tools }) => {
+        const res = (await tool(tools, "note_links").run({ uuid: "nope" })) as any;
+        assert.match(res.error, /no note/);
+    });
+});
+
+test("note_unlink removes one edge by id without touching the notes", async () => {
+    await withTools(async ({ store, tools }) => {
+        const a = (await tool(tools, "note_save").run({ title: "A", content: "x" })) as any;
+        const b = (await tool(tools, "note_save").run({ title: "B", content: "y" })) as any;
+        const linked = (await tool(tools, "note_link").run({
+            from: a.note.uuid,
+            toNote: b.note.uuid,
+        })) as any;
+
+        const res = (await tool(tools, "note_unlink").run({ id: linked.link.id })) as any;
+        assert.equal(res.unlinked, true);
+        assert.equal(store.linksFrom(a.note.id).length, 0);
+        // Both notes survive: only the edge was removed.
+        assert.ok(store.getByUuid(a.note.uuid));
+        assert.ok(store.getByUuid(b.note.uuid));
+
+        // Unlinking a gone id is a clean false, not an error.
+        const again = (await tool(tools, "note_unlink").run({ id: linked.link.id })) as any;
+        assert.equal(again.unlinked, false);
+    });
+});
+
+test("note_unlink rejects a non-numeric id", async () => {
+    await withTools(async ({ tools }) => {
+        const res = (await tool(tools, "note_unlink").run({ id: "nope" })) as any;
+        assert.equal(res.unlinked, false);
+        assert.match(res.error, /finite number/);
+    });
+});
+
 test("the tool set exposes the documented names and default limit", async () => {
     await withTools(async ({ tools }) => {
         assert.deepEqual(tools.map((t) => t.name).sort(), [
+            "note_forget",
             "note_link",
+            "note_links",
             "note_recall",
             "note_save",
+            "note_unlink",
             "note_update",
         ]);
         assert.equal(DEFAULT_NOTE_RECALL_LIMIT, 8);

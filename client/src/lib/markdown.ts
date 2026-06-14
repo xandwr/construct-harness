@@ -7,9 +7,9 @@
 // agent's text is untrusted and a raw `@html` is an XSS sink. We render to a
 // flat string (no DOM nodes) so this stays a pure function usable straight in
 // markup.
-import { browser } from '$app/environment';
-import { marked } from 'marked';
-import DOMPurify from 'dompurify';
+import { browser } from "$app/environment";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
 
 // `breaks`: treat a single newline as <br>, matching how the transcript read
 // before (whitespace-pre-wrap), so a reply's line breaks survive. `gfm`: tables,
@@ -22,14 +22,14 @@ marked.setOptions({ breaks: true, gfm: true });
 // renderMarkdown short-circuit during SSR (the transcript is client-only — it
 // streams in over fetch/SSE, nothing of it renders server-side).
 if (browser) {
-	// Open links in a new tab and sever the opener so a rendered link can't
-	// reach back into this window. Hooked once at module load.
-	DOMPurify.addHook('afterSanitizeAttributes', (node) => {
-		if (node.tagName === 'A') {
-			node.setAttribute('target', '_blank');
-			node.setAttribute('rel', 'noopener noreferrer');
-		}
-	});
+    // Open links in a new tab and sever the opener so a rendered link can't
+    // reach back into this window. Hooked once at module load.
+    DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+        if (node.tagName === "A") {
+            node.setAttribute("target", "_blank");
+            node.setAttribute("rel", "noopener noreferrer");
+        }
+    });
 }
 
 /**
@@ -40,7 +40,7 @@ if (browser) {
  * hydrated client-side anyway.
  */
 export function renderMarkdown(src: string): string {
-	if (!src || !browser) return '';
-	const html = marked.parse(src) as string;
-	return DOMPurify.sanitize(html);
+    if (!src || !browser) return "";
+    const html = marked.parse(src) as string;
+    return DOMPurify.sanitize(html);
 }
