@@ -200,6 +200,40 @@ export function getCommands(fetchFn?: typeof fetch): Promise<{ commands: WireCom
     return getJson("/api/commands", fetchFn);
 }
 
+/** The runtime status, as `/api/status` returns it: the truth about what this
+ *  process is. Secret-free — `embeddingConfigured` is a flag, never a key. */
+export interface WireStatus {
+    provider: {
+        model: string;
+        capabilities: {
+            thinking: boolean;
+            effort: boolean;
+            promptCaching: boolean;
+            serverTools: boolean;
+            streaming: boolean;
+        };
+    };
+    serverTools: string[];
+    localTools: string[];
+    storage: {
+        memoryDb: string | null;
+        kbDir: string | null;
+        schemaVersion: number;
+        memories: number;
+        events: number;
+        goals: number;
+    };
+    compactAt: number | null;
+    embeddingConfigured: boolean;
+    features: { dreams: boolean; transcriptRecall: boolean; workingMind: boolean };
+    liveSessions: string[];
+}
+
+/** The read-only runtime status, for the settings page. */
+export function getStatus(fetchFn?: typeof fetch): Promise<WireStatus> {
+    return getJson("/api/status", fetchFn);
+}
+
 /** The accumulated dreams, newest first: each a disposable persona's choice on a
  *  scenario drawn from the corpus. The dreams applet renders this directly. */
 export function getDreams(fetchFn?: typeof fetch): Promise<{ dreams: WireDream[]; total: number }> {

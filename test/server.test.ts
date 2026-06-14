@@ -675,6 +675,83 @@ test("DELETE /api/goals/:id removes a goal; a missing id is a 404", async () => 
     deps.close();
 });
 
+// ── Status ───────────────────────────────────────────────────────────────────
+
+test("GET /api/status reports the static config snapshot when one is supplied", async () => {
+    const deps = {
+        ...makeDeps(new FakeClient([])),
+        status: {
+            model: "claude-test-1",
+            serverTools: ["web_search" as const, "web_fetch" as const],
+            localTools: ["note_save", "use__user__shell"],
+            memoryDb: "/tmp/db.sqlite",
+            kbDir: "/tmp/kb",
+            compactAt: 99_000,
+            embeddingConfigured: true,
+            dreamsEnabled: true,
+            transcriptRecall: true,
+            workingMind: true,
+        },
+    };
+    const { status, json } = await call(deps, getReq("/api/status"));
+    assert.equal(status, 200);
+    assert.equal(json.provider.model, "claude-test-1");
+    // Capabilities come from the live client, not the snapshot.
+    assert.deepEqual(json.provider.capabilities, deps.client.capabilities);
+    assert.deepEqual(json.serverTools, ["web_search", "web_fetch"]);
+    assert.deepEqual(json.localTools, ["note_save", "use__user__shell"]);
+    assert.equal(json.storage.memoryDb, "/tmp/db.sqlite");
+    assert.equal(json.storage.kbDir, "/tmp/kb");
+    assert.equal(json.compactAt, 99_000);
+    assert.equal(json.embeddingConfigured, true);
+    assert.deepEqual(json.features, { dreams: true, transcriptRecall: true, workingMind: true });
+    deps.close();
+});
+
+test("GET /api/status reports live dynamic data: schema version, counts, sessions", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    deps.store.save(new Memory({ content: "a fact" }));
+    deps.goals.create({ content: "a goal" });
+    const { json } = await call(deps, getReq("/api/status"));
+    // Schema version is the real migrated version of the shared store.
+    assert.equal(json.storage.schemaVersion, deps.store.version);
+    assert.equal(json.storage.memories, 1);
+    assert.equal(json.storage.goals, 1);
+    // The boot session is live in the pool.
+    assert.deepEqual(json.liveSessions, [defaultId(deps)]);
+    deps.close();
+});
+
+test("GET /api/status answers even with no static snapshot (no-key/no-embedder case)", async () => {
+    // makeDeps supplies no `status`, modelling a process booted without an
+    // embedder or an explicit model: the static fields degrade to empty/false but
+    // the route still answers with the live dynamic half rather than 500-ing.
+    const deps = makeDeps(new FakeClient([]));
+    const { status, json } = await call(deps, getReq("/api/status"));
+    assert.equal(status, 200);
+    // The model falls back to the live client's id.
+    assert.equal(json.provider.model, deps.client.model);
+    assert.deepEqual(json.serverTools, []);
+    assert.deepEqual(json.localTools, []);
+    assert.equal(json.embeddingConfigured, false);
+    assert.equal(json.storage.memoryDb, null);
+    assert.equal(json.compactAt, null);
+    assert.deepEqual(json.features, {
+        dreams: false,
+        transcriptRecall: false,
+        workingMind: false,
+    });
+    // No secrets ever appear in the body.
+    assert.ok(!/api[_-]?key/i.test(captured(json)), "no key field leaks");
+    deps.close();
+});
+
+/** Re-serialize a parsed body so a regex over the wire text can assert no secret
+ *  field name appears. */
+function captured(json: unknown): string {
+    return JSON.stringify(json);
+}
+
 // ── Server-tool resolution ──────────────────────────────────────────────────
 
 test("resolveServerTools defaults to live web access when unset", () => {

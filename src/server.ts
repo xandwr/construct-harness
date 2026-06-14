@@ -33,6 +33,8 @@
  *  - `DELETE /api/goals/:id`     — remove a goal.
  *  - `GET  /api/commands`        — the slash-command catalogue, for the client's
  *                                  `/` menu (mirrors {@link BUILTIN_COMMANDS}).
+ *  - `GET  /api/status`          — read-only runtime status (model, tools, storage,
+ *                                  features), for the settings page. No secrets.
  *
  * Run it with `npm run serve` (see package.json). It speaks only core types and
  * the stores' public surface, so it stays as provider-neutral as everything
@@ -103,7 +105,46 @@ interface ServerDeps {
     notes?: NotesService;
     notesStore?: NotesStore;
     corsOrigin?: string;
+    /** A snapshot of the *static* runtime configuration this process booted with,
+     *  for the read-only status endpoint (see {@link handleStatus}). The dynamic
+     *  parts (live session ids, store counts, schema version) are read off the
+     *  live deps at request time, not frozen here; this carries only what's fixed
+     *  at boot (model, db paths, thresholds, which features are on). Optional so a
+     *  test can omit it; the route then reports just the dynamic parts. */
+    status?: StatusConfig;
     close(): void;
+}
+
+/**
+ * The static slice of runtime configuration the status endpoint reports: what
+ * this process booted with that doesn't change while it runs. Captured once in
+ * {@link buildDeps} and handed to the deps, so the handler stays a pure read and
+ * a test can supply its own snapshot. Deliberately carries no secrets — the
+ * embedder is reported as a yes/no, never the key behind it.
+ */
+export interface StatusConfig {
+    /** The model id chat and dreaming run on (e.g. the configured MODEL). */
+    model: string;
+    /** Which provider-hosted tools are enabled (web_search, web_fetch, …). */
+    serverTools: ServerToolName[];
+    /** The names of the local (harness-owned) tools wired into every Session,
+     *  e.g. the note tools and the local shell. The agent-facing toolset minus
+     *  the memory/goal/transcript/dream tools the Session adds itself. */
+    localTools: string[];
+    /** The sqlite file every store shares (MEMORY_DB). */
+    memoryDb: string;
+    /** The knowledge-base markdown folder (KB_DIR), or null when no KB is wired. */
+    kbDir: string | null;
+    /** The compaction threshold in estimated tokens (COMPACT_AT). */
+    compactAt: number;
+    /** Whether an embedder is configured (semantic recall on), reported as a flag
+     *  so no key ever leaves the process. */
+    embeddingConfigured: boolean;
+    /** Standing feature flags the Sessions run with, so the status page reflects
+     *  what a turn actually does rather than a hardcoded guess. */
+    dreamsEnabled: boolean;
+    transcriptRecall: boolean;
+    workingMind: boolean;
 }
 
 /** Builds the shared {@link SessionConfig} every live conversation runs under,
@@ -266,6 +307,11 @@ function buildDeps(): ServerDeps {
     const notesStore = new NotesStore(dbPath);
     const notes = new NotesService({ store: notesStore, root: kbDir, embedder });
 
+    // The local (harness-owned) tools every Session runs with: the KB note tools
+    // and the local shell. Built once so both the session config and the status
+    // snapshot name the same set — the status page reports exactly what's wired.
+    const localTools = [...noteTools(notes, notesStore, embedder), ...shellTools()];
+
     // One wiring shared by every live conversation. Every Session in the pool —
     // the boot one and every resumed past conversation — runs under this exact
     // configuration; the pool pins the `sessionId` when resuming a specific
@@ -283,7 +329,7 @@ function buildDeps(): ServerDeps {
         // link) but notes are not auto-injected into context the way memories are.
         // It also gets use__user__shell, the unguarded local counterpart to the
         // sandboxed code_execution server tool wired in via serverTools below.
-        tools: [...noteTools(notes, notesStore, embedder), ...shellTools()],
+        tools: localTools,
         compaction: { thresholdTokens: compactAt },
         // Cache the system prefix; turn on adaptive thinking with a summarized
         // display so the streaming path emits readable `thinking` deltas the
@@ -335,6 +381,24 @@ function buildDeps(): ServerDeps {
         notes,
         notesStore,
         corsOrigin: process.env.CORS_ORIGIN,
+        // The static config snapshot for /api/status. Mirrors the wiring above so
+        // the page reports the truth: the model chat runs on, the tools that are
+        // on, where the data lives, and which standing features a turn uses.
+        status: {
+            model: client.model,
+            serverTools,
+            localTools: localTools.map((t) => t.name),
+            memoryDb: dbPath,
+            kbDir,
+            compactAt,
+            embeddingConfigured: embedder !== undefined,
+            // These mirror the Session defaults the config above leaves on: dreams
+            // and transcript recall default true when an events log is present
+            // (it always is here), and the working mind is on unless disabled.
+            dreamsEnabled: true,
+            transcriptRecall: true,
+            workingMind: true,
+        },
         close() {
             // Stop the watcher first so no inbound event races the store closing.
             notes.close();
@@ -1087,6 +1151,63 @@ function sendGoalError(res: ServerResponse, err: unknown): void {
     sendJson(res, 500, { error: message });
 }
 
+// ── Status route ─────────────────────────────────────────────────────────────
+
+/**
+ * Assemble the runtime status: the truth about what this process is, replacing
+ * the settings page's hardcoded rows. Two halves:
+ *
+ *  - **static** ({@link ServerDeps.status}, captured at boot): the model and its
+ *    capabilities, which provider-hosted and local tools are on, where the data
+ *    lives, the compaction threshold, whether embedding is configured, and the
+ *    standing feature flags. Reported verbatim, minus any secret — the embedder
+ *    is a yes/no, never a key.
+ *  - **dynamic** (read off the live deps now): the schema version the store is
+ *    migrated to, and the ids of the conversations currently live in the pool.
+ *
+ * Read-only, side-effect free: it never touches a Session or mutates a store, so
+ * polling it is free. When a test supplies no static snapshot, the static fields
+ * are reported as null/empty and only the dynamic half is real — the route still
+ * answers rather than 500-ing.
+ */
+function handleStatus(res: ServerResponse, deps: ServerDeps): void {
+    const s = deps.status;
+    // The schema version is the same across every store (one file, one
+    // user_version); read it off the memory store, which always exists.
+    const schemaVersion = deps.store.version;
+    const liveSessions = deps.sessions.ids();
+
+    sendJson(res, 200, {
+        provider: {
+            // The capabilities object is small and secret-free; ship it whole so the
+            // page can show thinking/serverTools/streaming support as the provider
+            // actually reports them, not a hardcoded guess.
+            model: s?.model ?? deps.client.model,
+            capabilities: deps.client.capabilities,
+        },
+        serverTools: s?.serverTools ?? [],
+        localTools: s?.localTools ?? [],
+        storage: {
+            memoryDb: s?.memoryDb ?? null,
+            kbDir: s?.kbDir ?? null,
+            schemaVersion,
+            // The current row counts: cheap indexed COUNT(*)s, useful orientation
+            // ("how much has this Construct accumulated") and a liveness check.
+            memories: deps.store.count(),
+            events: deps.events.count(),
+            goals: deps.goals.count(),
+        },
+        compactAt: s?.compactAt ?? null,
+        embeddingConfigured: s?.embeddingConfigured ?? false,
+        features: {
+            dreams: s?.dreamsEnabled ?? false,
+            transcriptRecall: s?.transcriptRecall ?? false,
+            workingMind: s?.workingMind ?? false,
+        },
+        liveSessions,
+    });
+}
+
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /** Build the request handler over a set of deps. Pure routing: it owns no
@@ -1107,6 +1228,14 @@ export function createHandler(deps: ServerDeps) {
         try {
             if (req.method === "GET" && path === "/api/health") {
                 sendJson(res, 200, { ok: true, sessions: deps.sessions.ids() });
+                return;
+            }
+
+            // The truthful runtime status: model, tools, storage, features. A
+            // read-only snapshot the settings page renders in place of hardcoded
+            // rows. No secrets leave (the embedder is a yes/no).
+            if (req.method === "GET" && path === "/api/status") {
+                handleStatus(res, deps);
                 return;
             }
 
