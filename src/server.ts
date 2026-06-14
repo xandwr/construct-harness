@@ -77,24 +77,14 @@ import { noteTools } from "./noteTools.ts";
 import { shellTools, resolveShellPolicy, type ShellPolicyMode } from "./shellTools.ts";
 import { BUILTIN_COMMANDS } from "./commands.ts";
 import { dreamLoop, DREAM_EVENT_KIND, type Dream } from "./dreaming.ts";
+import { SYSTEM_PROMPT } from "./systemPrompt.ts";
 
-const BASE_SYSTEM =
-    "You are a helpful, concise assistant: a long-lived Construct that remembers " +
-    "across conversations. Save durable facts and preferences with memory_save, and " +
-    "recall them with memory_recall. Don't save transient chatter. When the human " +
-    "gives you a task worth holding across turns, track it with goal_set and mark it " +
-    "goal_update done when achieved; your active goals are shown to you each turn. To " +
-    "look back over what actually happened earlier in this conversation (past " +
-    "messages, whether a tool already ran, what was decided), search your transcript " +
-    "with transcript_recall. Your most recent dream is shown to you each turn; to draw on " +
-    "earlier ones (stances you tried on while dreaming during downtime), search them with " +
-    "dream_recall. For longer-form documentation the human also edits (runbooks, " +
-    "references, design notes), use the knowledge base: note_save / note_update to " +
-    "write, note_recall to read it when relevant, note_link to relate a note to a " +
-    "memory or another note. You also have two ways to run code: the sandboxed " +
-    "code-execution tool for disposable computation, and use__user__shell to run " +
-    "commands on the user's real local machine (their files, tools, and working " +
-    "directory) when the work has to touch this environment.";
+// The base system prompt lives in SYSTEM.md at the repo root (see
+// systemPrompt.ts), not inline here, so the Construct's persona is a markdown
+// file a human reads and edits. The server wires in the full tool set, so it
+// loads the full prompt (memory, goals, transcript, dreams, the knowledge base,
+// and both code paths).
+const BASE_SYSTEM = SYSTEM_PROMPT;
 
 /** Compaction threshold (estimated tokens), well below the model's real window
  *  so there's headroom for the next turn. Overridable via COMPACT_AT. */

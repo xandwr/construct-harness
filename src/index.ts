@@ -7,16 +7,13 @@ import { OpenAIEmbedder, EmbeddingError, type Embedder } from "./embeddings.ts";
 import { Session } from "./session.ts";
 import { shellTools, resolveShellPolicy } from "./shellTools.ts";
 import { runRepl } from "./repl.ts";
+import { CLI_SYSTEM_PROMPT } from "./systemPrompt.ts";
 
-const BASE_SYSTEM =
-    "You are a helpful, concise assistant: a long-lived Construct that remembers " +
-    "across conversations. Save durable facts and preferences with memory_save, and " +
-    "recall them with memory_recall. Don't save transient chatter. When given a task " +
-    "worth holding across turns, track it with goal_set and mark it goal_update done " +
-    "when achieved; your active goals are shown to you each turn. You can run commands " +
-    "on the user's local machine with use__user__shell (their real files, tools, and " +
-    "working directory), so reach for it to run tests, inspect or edit real files, and " +
-    "drive their CLIs.";
+// The base system prompt lives in SYSTEM.cli.md at the repo root (see
+// systemPrompt.ts), not inline here, so the Construct's persona is a markdown
+// file a human reads and edits. The CLI ships only memory, goals, and the local
+// shell, so it loads the leaner CLI prompt rather than the full server one.
+const BASE_SYSTEM = CLI_SYSTEM_PROMPT;
 
 /**
  * Construct the cloud embedder when an OpenAI key is configured, else return
