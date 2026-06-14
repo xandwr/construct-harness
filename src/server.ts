@@ -32,6 +32,7 @@ import { HarnessError, type ErrorKind } from "./bridge/errors.ts";
 import type { ModelClient } from "./bridge/types.ts";
 import { MemoryStore } from "./memory.ts";
 import { EventStore, type Event } from "./events.ts";
+import { backfillEventEmbeddings } from "./eventTools.ts";
 import { GoalStore } from "./goals.ts";
 import { OpenAIEmbedder, EmbeddingError, type Embedder } from "./embeddings.ts";
 import { Session } from "./session.ts";
@@ -194,6 +195,24 @@ function buildDeps(): ServerDeps {
                 `knowledge-base sync disabled: ${err instanceof Error ? err.message : String(err)}`,
             ),
         );
+
+    // The Session embeds each new message turn as it's logged, but a log that
+    // predates this (turns recorded before an embedder was wired up) is
+    // lexical-only until backfilled. Run one bounded catch-up pass at startup so
+    // semantic transcript_recall covers the existing transcript too. Fire-and-
+    // forget like the watcher above: an embedding outage just leaves those rows
+    // lexical, and a slow embed must not block the server accepting requests.
+    if (embedder) {
+        backfillEventEmbeddings(events, embedder)
+            .then((n) => {
+                if (n) console.log(`  embedded ${n} past event${n === 1 ? "" : "s"} for recall`);
+            })
+            .catch((err) =>
+                console.warn(
+                    `event-embedding backfill skipped: ${err instanceof Error ? err.message : String(err)}`,
+                ),
+            );
+    }
 
     return {
         store,

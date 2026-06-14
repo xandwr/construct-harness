@@ -21,7 +21,7 @@ import type { ContextProvider } from "./context.ts";
 import { temporalContext } from "./context.ts";
 import { MemoryStore } from "./memory.ts";
 import { memoryTools, recallContext } from "./memoryTools.ts";
-import { eventTools } from "./eventTools.ts";
+import { eventTools, embedEventIfPossible } from "./eventTools.ts";
 import { goalTools, goalContext } from "./goalTools.ts";
 import { GoalStore } from "./goals.ts";
 import type { Embedder } from "./embeddings.ts";
@@ -74,7 +74,14 @@ export interface SessionConfig {
      * replaces it (add {@link goalContext} yourself if you want both).
      */
     goals?: GoalStore;
-    /** Embedder for semantic recall. Only meaningful alongside `store`. */
+    /**
+     * Embedder for semantic recall. Meaningful alongside `store` (saved memories
+     * are embedded so memory_recall matches by meaning) and alongside `events`
+     * (each message turn is embedded as it's logged so `transcript_recall`'s
+     * semantic path lights up, not just its lexical FTS one). Best-effort
+     * throughout: an embedding outage degrades recall to lexical, never failing a
+     * turn. Omit to keep recall purely lexical.
+     */
     embedder?: Embedder;
     /** Passive context providers. Defaults to a single temporal provider so the
      *  Construct always knows the current date/time; pass `[]` to disable, or
@@ -131,6 +138,14 @@ export class Session {
      *  turn is rebuilt per send (recall is turn-relevant), so it is NOT stored
      *  here; it's prepended at send time and never persisted. */
     private conversation: Message[] = [];
+    /** In-flight, fire-and-forget event embeds. An appended message is embedded
+     *  off the turn's hot path (embedding is a network call; the turn must not
+     *  block on it), so we track the promises here. {@link flushEmbeddings} awaits
+     *  them, which the tests use for determinism and a clean shutdown can use to
+     *  drain before closing the store. Each promise already swallows its own
+     *  failure (see {@link embedMessage}), so this set never holds a rejecting
+     *  promise. */
+    private readonly pendingEmbeds = new Set<Promise<void>>();
 
     constructor(config: SessionConfig) {
         this.cfg = config;
@@ -242,6 +257,9 @@ export class Session {
         // memory the model saves this turn can be linked back to the message that
         // prompted it (provenance: curation over the log).
         const userEvent = this.logEvent({ kind: "message", role: "user", content: text });
+        // Embed it (off the hot path) so semantic transcript_recall covers this
+        // turn, not just lexical FTS. No-op without an embedder or a log.
+        this.embedMessage(userEvent);
 
         const systemTurn = await this.buildSystem(text);
 
@@ -297,7 +315,16 @@ export class Session {
                 // log (skip an empty reply: a turn that only called tools and
                 // stopped has nothing to record as a message).
                 const reply = assistantText.trim();
-                if (reply) this.logEvent({ kind: "message", role: "agent", content: reply });
+                if (reply) {
+                    const replyEvent = this.logEvent({
+                        kind: "message",
+                        role: "agent",
+                        content: reply,
+                    });
+                    // Embed the agent's reply too: it's the other half of the
+                    // conversation a later turn might recall by meaning.
+                    this.embedMessage(replyEvent);
+                }
                 // Commit the durable conversation: everything the run produced
                 // except the system turn we prepended (which is rebuilt per turn).
                 this.conversation = r.messages.filter((m) => m.sender.role !== RoleType.System);
@@ -338,6 +365,57 @@ export class Session {
             // the turn. (A persistent failure shows up as a gap in transcript().)
             return undefined;
         }
+    }
+
+    /**
+     * Embed one freshly-logged message event so it becomes semantically
+     * recallable, and track the in-flight work in {@link pendingEmbeds}.
+     *
+     * Why only messages, and why off the hot path:
+     *  - {@link EventStore.append} never embeds; the log is total but the vector
+     *    index is deliberately selective (a linear cosine scan stays cheap only
+     *    while most events have no vector). Messages are the semantically
+     *    meaningful turns worth recalling by meaning; tool calls/results (often a
+     *    whole file or search dump) stay lexical-only by design. This is the call
+     *    that lights `transcript_recall`'s semantic path up at all.
+     *  - Embedding is a network round-trip. The turn must never block on it, so
+     *    we fire it without awaiting and let it settle in the background; the user
+     *    sees their reply stream immediately. A turn whose embed hasn't finished
+     *    is simply lexical-only until it does, exactly as before.
+     *
+     * No-op without an embedder, without a log (no event was created), or for a
+     * non-message event. The promise swallows its own failure (see
+     * {@link embedEventIfPossible}) so {@link pendingEmbeds} never rejects, and
+     * removes itself on settle so the set doesn't grow unbounded across a long
+     * conversation.
+     */
+    private embedMessage(event: Event | undefined): void {
+        if (!this.events || !this.cfg.embedder || !event) return;
+        const store = this.events;
+        const task = embedEventIfPossible(store, this.cfg.embedder, event)
+            .catch(() => {
+                // embedEventIfPossible already swallows EmbeddingError and a
+                // closed-store EventError; this guards any other surprise so a
+                // background embed can never become an unhandled rejection that
+                // crashes the process.
+                return false;
+            })
+            .then(() => {
+                this.pendingEmbeds.delete(task);
+            });
+        this.pendingEmbeds.add(task);
+    }
+
+    /**
+     * Await every in-flight message embed kicked off by this Session. The embeds
+     * run off the turn's hot path (see {@link embedMessage}), so a caller that
+     * needs them durable before proceeding — a test asserting semantic recall, or
+     * a shutdown draining work before it closes the store — awaits this. No-op
+     * when nothing is pending. Never rejects: each tracked promise already
+     * swallowed its own failure.
+     */
+    async flushEmbeddings(): Promise<void> {
+        await Promise.all([...this.pendingEmbeds]);
     }
 
     /**

@@ -13,7 +13,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { EventStore } from "../src/events.ts";
-import { eventTools, DEFAULT_TRANSCRIPT_LIMIT } from "../src/eventTools.ts";
+import {
+    eventTools,
+    embedEventIfPossible,
+    backfillEventEmbeddings,
+    DEFAULT_TRANSCRIPT_LIMIT,
+} from "../src/eventTools.ts";
 import { EmbeddingError, type Embedder } from "../src/embeddings.ts";
 import { runLoop } from "../src/bridge/loop.ts";
 import { RoleType } from "../src/types.ts";
@@ -338,5 +343,138 @@ test("transcript_recall is dispatchable through runLoop and results flow back", 
     const payload = toolResults[0].result as { count: number; events: { content: string }[] };
     assert.equal(payload.count, 1);
     assert.match(payload.events[0].content, /sqlite/);
+    store.close();
+});
+
+// ---------------------------------------------------------------------------
+// embedEventIfPossible: embed one event on append
+// ---------------------------------------------------------------------------
+
+test("embedEventIfPossible stores a vector and makes the event semantically visible", async () => {
+    const store = freshStore();
+    const embedder = fakeEmbedder({ "shipping a release": [1, 0], deploy: [1, 0.05] });
+    const e = store.append({ kind: "message", role: "user", content: "shipping a release", ts: 1 });
+
+    assert.ok(!store.hasEmbedding(e.id), "should start with no vector");
+    const ok = await embedEventIfPossible(store, embedder, e);
+    assert.equal(ok, true);
+    assert.ok(store.hasEmbedding(e.id), "vector was not stored");
+
+    const [qv] = await embedder.embed(["deploy"]);
+    const hits = store.semanticSearch(qv);
+    assert.equal(hits[0]?.event.content, "shipping a release");
+    store.close();
+});
+
+test("embedEventIfPossible is a no-op without an embedder", async () => {
+    const store = freshStore();
+    const e = store.append({ kind: "message", role: "user", content: "x", ts: 1 });
+    const ok = await embedEventIfPossible(store, undefined, e);
+    assert.equal(ok, false);
+    assert.ok(!store.hasEmbedding(e.id));
+    store.close();
+});
+
+test("embedEventIfPossible swallows an embedding outage rather than throwing", async () => {
+    const store = freshStore();
+    const embedder = fakeEmbedder({}, { fail: true });
+    const e = store.append({ kind: "message", role: "user", content: "x", ts: 1 });
+    const ok = await embedEventIfPossible(store, embedder, e);
+    assert.equal(ok, false);
+    assert.ok(!store.hasEmbedding(e.id));
+    store.close();
+});
+
+test("embedEventIfPossible swallows a write to a closed store", async () => {
+    const store = freshStore();
+    const e = store.append({ kind: "message", role: "user", content: "x", ts: 1 });
+    // A slow embed whose store closes before it resolves: the setEmbedding write
+    // throws EventError, which the helper swallows so a background embed can never
+    // crash a turn.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const slow: Embedder = {
+        provider: "fake",
+        model: "fake-2d",
+        dimensions: 2,
+        async embed(texts) {
+            await gate;
+            return texts.map(() => Float32Array.from([1, 0]));
+        },
+    };
+    const pending = embedEventIfPossible(store, slow, e);
+    store.close();
+    release();
+    const ok = await pending;
+    assert.equal(ok, false);
+});
+
+// ---------------------------------------------------------------------------
+// backfillEventEmbeddings: catch up a log that predates embed-on-append
+// ---------------------------------------------------------------------------
+
+test("backfillEventEmbeddings embeds every event missing a vector", async () => {
+    const store = freshStore();
+    const embedder = fakeEmbedder({
+        "shipping a release": [1, 0],
+        "what's for dinner": [0, 1],
+        deploy: [1, 0.05],
+    });
+    store.append({ kind: "message", role: "user", content: "shipping a release", ts: 1 });
+    store.append({ kind: "message", role: "user", content: "what's for dinner", ts: 2 });
+
+    const n = await backfillEventEmbeddings(store, embedder);
+    assert.equal(n, 2);
+
+    // Both are now semantically searchable; "deploy" ranks the release first.
+    const [qv] = await embedder.embed(["deploy"]);
+    const hits = store.semanticSearch(qv);
+    assert.equal(hits.length, 2);
+    assert.equal(hits[0]?.event.content, "shipping a release");
+    store.close();
+});
+
+test("backfillEventEmbeddings skips events that already have a vector", async () => {
+    const store = freshStore();
+    const embedder = fakeEmbedder({ a: [1, 0], b: [0, 1] });
+    const a = store.append({ kind: "message", role: "user", content: "a", ts: 1 });
+    store.append({ kind: "message", role: "user", content: "b", ts: 2 });
+    // Pre-embed `a`, so only `b` is on the missing-vector work-list.
+    const [va] = await embedder.embed(["a"]);
+    store.setEmbedding(a.id, va);
+
+    const n = await backfillEventEmbeddings(store, embedder);
+    assert.equal(n, 1, "should embed only the one missing vector");
+    store.close();
+});
+
+test("backfillEventEmbeddings returns 0 on an embedding outage, leaving rows lexical", async () => {
+    const store = freshStore();
+    const embedder = fakeEmbedder({}, { fail: true });
+    const e = store.append({ kind: "message", role: "user", content: "x", ts: 1 });
+    const n = await backfillEventEmbeddings(store, embedder);
+    assert.equal(n, 0);
+    assert.ok(!store.hasEmbedding(e.id));
+    store.close();
+});
+
+test("backfillEventEmbeddings returns 0 on an empty log", async () => {
+    const store = freshStore();
+    const embedder = fakeEmbedder({});
+    assert.equal(await backfillEventEmbeddings(store, embedder), 0);
+    store.close();
+});
+
+test("backfillEventEmbeddings honors the limit, newest first", async () => {
+    const store = freshStore();
+    const embedder = fakeEmbedder({ old: [1, 0], mid: [0, 1], new: [1, 1] });
+    store.append({ kind: "message", role: "user", content: "old", ts: 1 });
+    store.append({ kind: "message", role: "user", content: "mid", ts: 2 });
+    const newest = store.append({ kind: "message", role: "user", content: "new", ts: 3 });
+
+    const n = await backfillEventEmbeddings(store, embedder, 1);
+    assert.equal(n, 1);
+    // Newest first: only the most recent event got a vector this pass.
+    assert.ok(store.hasEmbedding(newest.id), "newest should be embedded first");
     store.close();
 });

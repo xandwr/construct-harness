@@ -21,7 +21,37 @@ import { RoleType } from "../src/types.ts";
 import { MemoryStore } from "../src/memory.ts";
 import { EventStore } from "../src/events.ts";
 import { GoalStore } from "../src/goals.ts";
+import { EmbeddingError, type Embedder } from "../src/embeddings.ts";
 import { FakeClient, callTurn, textTurn } from "./helpers/fakeClient.ts";
+
+/**
+ * A deterministic, offline {@link Embedder}: maps each text to a normalized 2-D
+ * vector via a caller-supplied table, so semantic ranking is fully predictable
+ * with no network. Unknown texts get a fixed "far" vector. Mirrors the helper in
+ * eventTools.test.ts; `calls` records each batch so a test can assert *which*
+ * events were embedded (and that tool turns were not).
+ */
+function fakeEmbedder(
+    table: Record<string, [number, number]>,
+    opts: { fail?: boolean } = {},
+): Embedder & { calls: string[][] } {
+    const norm = ([x, y]: [number, number]): Float32Array => {
+        const len = Math.hypot(x, y) || 1;
+        return Float32Array.from([x / len, y / len]);
+    };
+    const calls: string[][] = [];
+    return {
+        provider: "fake",
+        model: "fake-2d",
+        dimensions: 2,
+        calls,
+        async embed(texts) {
+            calls.push(texts);
+            if (opts.fail) throw new EmbeddingError("embedding service down");
+            return texts.map((t) => norm(table[t] ?? [-1, -1]));
+        },
+    };
+}
 
 /** Drive one send to completion, returning streamed text and the TurnResult. */
 async function send(
@@ -463,4 +493,164 @@ test("a memory saved during a turn is linked to the prompting user event", async
         store.close();
         rmSync(dir, { recursive: true, force: true });
     }
+});
+
+// ── Event embedding on append (lights up transcript_recall's semantic path) ──
+
+test("with an embedder, message turns are embedded on append so semantic recall works", async () => {
+    const events = new EventStore(":memory:");
+    const embedder = fakeEmbedder({
+        // The query "deploy" lands near the release turn, far from dinner.
+        "shipping the release": [1, 0],
+        "what's for dinner": [0, 1],
+        "ok, shipping it": [1, 0.02],
+        deploy: [1, 0.05],
+    });
+    try {
+        // Two turns: one about the release, one about dinner. Each turn's user
+        // message and agent reply should get embedded as it's logged.
+        const session = new Session({
+            client: new FakeClient([textTurn("ok, shipping it"), textTurn("pasta")]),
+            system: "S",
+            events,
+            embedder,
+        });
+        await send(session, "shipping the release");
+        await send(session, "what's for dinner");
+        // The embeds run off the hot path; await them before asserting recall.
+        await session.flushEmbeddings();
+
+        // Every appended message now has a vector (4 messages: 2 user, 2 agent).
+        const logged = events.recent({ session: session.id });
+        const messages = logged.filter((e) => e.kind === "message");
+        assert.equal(messages.length, 4);
+        assert.ok(
+            messages.every((e) => events.hasEmbedding(e.id)),
+            "not every message turn was embedded on append",
+        );
+
+        // Semantic recall now ranks by meaning: "deploy" surfaces the release
+        // turn ahead of the dinner one, which lexical FTS (no shared word) could
+        // not have done.
+        const [qv] = await embedder.embed(["deploy"]);
+        const hits = events.semanticSearch(qv, { session: session.id });
+        assert.ok(hits.length > 0, "semantic search found nothing: vectors absent");
+        assert.match(hits[0]!.event.content, /shipping/);
+    } finally {
+        events.close();
+    }
+});
+
+test("tool calls and results are not embedded; only message turns are", async () => {
+    const events = new EventStore(":memory:");
+    const embedder = fakeEmbedder({});
+    const noop = {
+        name: "noop",
+        description: "does nothing",
+        parameters: { type: "object" },
+        async run() {
+            return { ok: true };
+        },
+    };
+    try {
+        const session = new Session({
+            client: new FakeClient([callTurn("c1", "noop", { x: 1 }), textTurn("done")]),
+            system: "S",
+            events,
+            embedder,
+            tools: [noop],
+        });
+        await send(session, "go");
+        await session.flushEmbeddings();
+
+        const logged = events.recent({ session: session.id });
+        // The vector index is selective by design: messages get embedded, the
+        // tool_call and tool_result (potentially huge payloads) do not.
+        for (const e of logged) {
+            const embedded = events.hasEmbedding(e.id);
+            if (e.kind === "message") assert.ok(embedded, `message ${e.id} should be embedded`);
+            else assert.ok(!embedded, `${e.kind} ${e.id} should not be embedded`);
+        }
+    } finally {
+        events.close();
+    }
+});
+
+test("a failing embedder degrades to lexical: the turn still completes, no vector stored", async () => {
+    const events = new EventStore(":memory:");
+    const embedder = fakeEmbedder({}, { fail: true });
+    try {
+        const session = new Session({
+            client: new FakeClient([textTurn("a reply")]),
+            system: "S",
+            events,
+            embedder,
+        });
+        // The turn must complete normally despite the embedding outage.
+        const { result } = await send(session, "a question");
+        assert.equal(result.text, "a reply");
+        // flushEmbeddings never rejects, even though every embed failed.
+        await session.flushEmbeddings();
+
+        // The messages are still logged (lexical recall intact), just unembedded.
+        const logged = events.recent({ session: session.id });
+        const messages = logged.filter((e) => e.kind === "message");
+        assert.equal(messages.length, 2);
+        assert.ok(
+            messages.every((e) => !events.hasEmbedding(e.id)),
+            "a failed embed must not leave a vector",
+        );
+    } finally {
+        events.close();
+    }
+});
+
+test("flushEmbeddings is a no-op (resolves) with no embedder or no log", async () => {
+    // No embedder, with a log: nothing is ever scheduled, flush resolves cleanly.
+    const events = new EventStore(":memory:");
+    try {
+        const withLog = new Session({
+            client: new FakeClient([textTurn("ok")]),
+            system: "S",
+            events,
+        });
+        await send(withLog, "hi");
+        await withLog.flushEmbeddings();
+    } finally {
+        events.close();
+    }
+
+    // No log at all: still resolves.
+    const noLog = new Session({ client: new FakeClient([textTurn("ok")]), system: "S" });
+    await send(noLog, "hi");
+    await noLog.flushEmbeddings();
+});
+
+test("a background embed resolving after the store closes does not throw", async () => {
+    // The store is closed while an embed is still in flight; embedEventIfPossible
+    // swallows the closed-store write, so flush still resolves and nothing leaks.
+    const events = new EventStore(":memory:");
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const embedder: Embedder = {
+        provider: "fake",
+        model: "fake-2d",
+        dimensions: 2,
+        async embed(texts) {
+            await gate; // hold the embed open until we've closed the store
+            return texts.map(() => Float32Array.from([1, 0]));
+        },
+    };
+    const session = new Session({
+        client: new FakeClient([textTurn("hi back")]),
+        system: "S",
+        events,
+        embedder,
+    });
+    await send(session, "hello");
+    // Close the store with the embed still pending, then let it resolve.
+    events.close();
+    release();
+    // Must not reject despite writing to a closed store.
+    await session.flushEmbeddings();
 });

@@ -23,6 +23,81 @@ import { EventStore, EventError } from "./events.ts";
 import type { Event, EventQuery } from "./events.ts";
 import { embedOne, EmbeddingError, type Embedder } from "./embeddings.ts";
 
+/**
+ * Embed one event's content and store its vector, swallowing embedding failures.
+ * Returns whether a vector was stored. This is the events counterpart to
+ * memory's `embedIfPossible`: it's what lights up `transcript_recall`'s semantic
+ * path, since {@link EventStore.append} never embeds (the log is total, the
+ * vector index is opt-in). An {@link EmbeddingError} (a model outage, a bad key)
+ * degrades recall to lexical rather than ever failing the turn that logged the
+ * event; any other error is a real bug and propagates.
+ *
+ * Defends against a race the memory path doesn't have to: an event is embedded
+ * off the turn's hot path (see {@link Session}), so the store may have been
+ * closed by the time the network call resolves. A closed-store write throws an
+ * {@link EventError}, which we also swallow here: a vector we can no longer
+ * persist is not worth crashing on.
+ */
+export async function embedEventIfPossible(
+    store: EventStore,
+    embedder: Embedder | undefined,
+    event: Event,
+): Promise<boolean> {
+    if (!embedder) return false;
+    try {
+        const vec = await embedOne(embedder, event.content);
+        return store.setEmbedding(event.id, vec);
+    } catch (err) {
+        if (err instanceof EmbeddingError || err instanceof EventError) return false;
+        throw err;
+    }
+}
+
+/** Default ceiling on how many missing event embeddings a single backfill pass
+ *  computes, to bound startup latency and embedding cost on a large log. The log
+ *  is total and grows fast (every message, tool call, and result), so this is the
+ *  newest N — older turns stay lexical-until-recalled rather than embedding the
+ *  whole history at once. */
+export const DEFAULT_EVENT_BACKFILL_LIMIT = 200;
+
+/**
+ * Embed events that have no vector yet: the catch-up pass for a log that
+ * predates embed-on-append (turns logged before an embedder was wired up), so
+ * `transcript_recall`'s semantic path covers the existing transcript and not
+ * only turns from now on. Newest first (see {@link EventStore.idsMissingEmbedding}),
+ * bounded by `limit`. Best-effort: an {@link EmbeddingError} (a model outage, a
+ * bad key) leaves those rows lexical-only and returns 0 rather than throwing; any
+ * other error is a real bug and propagates. Returns how many events were embedded.
+ *
+ * Unlike {@link embedEventIfPossible} (one event, off a turn's hot path), this is
+ * a deliberate batch a caller runs at startup, so it embeds in one request and
+ * does block its caller — keep `limit` modest if it sits on a hot path.
+ */
+export async function backfillEventEmbeddings(
+    store: EventStore,
+    embedder: Embedder,
+    limit: number = DEFAULT_EVENT_BACKFILL_LIMIT,
+): Promise<number> {
+    const ids = store.idsMissingEmbedding(limit);
+    if (ids.length === 0) return 0;
+
+    // Resolve to events, dropping any that vanished between listing and read.
+    const events = ids.map((id) => store.get(id)).filter((e): e is Event => e !== undefined);
+    if (events.length === 0) return 0;
+
+    try {
+        const vectors = await embedder.embed(events.map((e) => e.content));
+        let n = 0;
+        for (let i = 0; i < events.length; i++) {
+            if (store.setEmbedding(events[i]!.id, vectors[i]!)) n++;
+        }
+        return n;
+    } catch (err) {
+        if (err instanceof EmbeddingError) return 0;
+        throw err;
+    }
+}
+
 /** How many events `transcript_recall` returns by default. Smaller than memory's
  *  recall: a transcript line is verbose (a whole tool result), so a tighter
  *  default keeps the turn's budget in check while still spanning several turns. */
