@@ -177,31 +177,62 @@ export function goalTools(store: GoalStore, sessionId?: string): ToolDef[] {
 }
 
 /**
- * A passive provider that injects this session's active goals into the system
- * prompt every turn, so the Construct keeps them in view.
+ * A passive provider that injects active goals into the system prompt every turn,
+ * so the Construct keeps them in view. It folds in two distinct sets, kept under
+ * separate headings so the model can tell shared standing intent from the work of
+ * the conversation it's in:
  *
- * Async (the now-supported provider shape): it reads the store each turn. That
+ *  - **Shared goals** — store-global goals (`session IS NULL`), visible to *every*
+ *    conversation. These are the human-editable, cross-session intent the Goals
+ *    page maintains: standing objectives every Construct turn should serve.
+ *  - **This conversation's active goals** — goals scoped to this {@link sessionId},
+ *    the ones the agent set (or a human set against this session) for the work at
+ *    hand. Omitted entirely for a session-less store (a single-session REPL needs
+ *    no such distinction; its goals are all "this conversation's").
+ *
+ * Async (the now-supported provider shape): it reads the store each turn. Each
  * read is a single indexed lookup (idx_goals_session_status), cheap enough for
  * the hot path; anything heavier wouldn't belong here. Returns `undefined` (adds
- * nothing) when there are no active goals, so a goal-less conversation pays no
- * tokens for an empty list.
+ * nothing) when there are no active goals in either set, so a goal-less
+ * conversation pays no tokens for an empty list.
  */
 export function goalContext(store: GoalStore, sessionId?: string): ContextProvider {
     return {
         name: "goals",
         async contribute() {
-            const active = store.list({
+            // Shared goals belong to no session; read them with the global scope so
+            // a bare session filter doesn't sweep in every session's goals.
+            const shared = store.list({
                 status: "active",
-                session: sessionId,
+                scope: "global",
                 limit: DEFAULT_GOAL_LIMIT,
             });
-            if (active.length === 0) return undefined;
-            const lines = active.map((g) => `- (#${g.id}) ${g.content}`);
-            return {
-                system:
-                    `Your active goals (pursue these; mark done with goal_update ` +
-                    `when achieved):\n${lines.join("\n")}`,
-            };
+            // This conversation's own goals, only when the store is session-scoped.
+            const session = sessionId
+                ? store.list({
+                      status: "active",
+                      scope: "session",
+                      session: sessionId,
+                      limit: DEFAULT_GOAL_LIMIT,
+                  })
+                : [];
+            if (shared.length === 0 && session.length === 0) return undefined;
+
+            const sections: string[] = [];
+            const render = (gs: typeof shared) =>
+                gs.map((g) => `- (#${g.id}) ${g.content}`).join("\n");
+            if (shared.length > 0) {
+                sections.push(
+                    `Shared goals (standing intent for every conversation; pursue these):\n${render(shared)}`,
+                );
+            }
+            if (session.length > 0) {
+                sections.push(
+                    `This conversation's active goals (pursue these; mark done with ` +
+                        `goal_update when achieved):\n${render(session)}`,
+                );
+            }
+            return { system: sections.join("\n\n") };
         },
     };
 }

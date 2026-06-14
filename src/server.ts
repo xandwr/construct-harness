@@ -27,6 +27,10 @@
  *  - `GET  /api/dreams`          — the accumulated dreams, newest first.
  *  - `POST /api/dreams`          — run N dreams now (a disposable persona faces a
  *                                  scenario drawn from the corpus); each is logged.
+ *  - `GET  /api/goals`           — the goal store, filtered by scope/session/status.
+ *  - `POST /api/goals`           — create a goal (global, or scoped to a session).
+ *  - `PUT  /api/goals/:id`       — edit a goal's content and/or status.
+ *  - `DELETE /api/goals/:id`     — remove a goal.
  *  - `GET  /api/commands`        — the slash-command catalogue, for the client's
  *                                  `/` menu (mirrors {@link BUILTIN_COMMANDS}).
  *
@@ -42,7 +46,7 @@ import type { ModelClient } from "./bridge/types.ts";
 import { MemoryStore } from "./memory.ts";
 import { EventStore, type Event } from "./events.ts";
 import { backfillEventEmbeddings } from "./eventTools.ts";
-import { GoalStore } from "./goals.ts";
+import { GoalStore, Goal, GoalError, isGoalStatus, type GoalStatus } from "./goals.ts";
 import { OpenAIEmbedder, EmbeddingError, type Embedder } from "./embeddings.ts";
 import { Session, type SessionConfig } from "./session.ts";
 import type { LoopEvent } from "./bridge/loop.ts";
@@ -460,6 +464,19 @@ function dreamEventToJson(e: Event) {
         // The persona's choice rides in the event content (FTS-searchable there).
         choice: e.content,
         sourceMemoryIds: sources,
+    };
+}
+
+/** Serialize a goal for the wire: the full record the Goals page edits. A global
+ *  (shared) goal has `session: null`; a session-scoped one carries its id. */
+function goalToJson(g: Goal) {
+    return {
+        id: g.id,
+        content: g.content,
+        status: g.status,
+        session: g.session ?? null,
+        created: g.created,
+        updated: g.updated,
     };
 }
 
@@ -893,6 +910,183 @@ async function handleDreams(
     sendJson(res, 405, { error: `method ${req.method} not allowed on /api/dreams` });
 }
 
+// ── Goals routes ─────────────────────────────────────────────────────────────
+
+/**
+ * Handle every `/api/goals` and `/api/goals/:id` request: the human-editable
+ * surface over the {@link GoalStore}. Goals are the harness's most *immediate*
+ * standing context — unlike a memory the agent chose to keep or a note it wrote,
+ * a goal here is intent a human can set, sharpen, or retire live, and the next
+ * turn reads it (see goalContext). Two ownership tiers, both editable here:
+ *
+ *  - **global** (`session: null`) — shared goals every conversation sees.
+ *  - **session** (`session: <id>`) — goals scoped to one conversation, the same
+ *    rows the agent's goal_set writes against that session.
+ *
+ *  - GET    /api/goals?scope=&session=&status=   list, filtered
+ *  - POST   /api/goals  { content, session? }    create (no session ⇒ global)
+ *  - PUT    /api/goals/:id { content?, status? } edit text and/or status
+ *  - DELETE /api/goals/:id                        remove (prefer status=abandoned)
+ *
+ * Mirrors {@link handleNotes}: list/read are GETs, writes funnel through the
+ * store and translate {@link GoalError} into a clean 400 the client can show.
+ */
+async function handleGoals(
+    req: IncomingMessage,
+    res: ServerResponse,
+    deps: ServerDeps,
+    url: URL,
+    path: string,
+): Promise<void> {
+    if (path === "/api/goals") {
+        if (req.method === "GET") {
+            // `scope` picks the ownership tier the read sees:
+            //  - all (default): every goal, across global and all sessions.
+            //  - global: only shared goals (session IS NULL).
+            //  - session: only the goals of `session` (requires it).
+            const scopeParam = url.searchParams.get("scope");
+            const sessionParam = url.searchParams.get("session") ?? undefined;
+            const statusParam = url.searchParams.get("status");
+            const status = isGoalStatus(statusParam) ? statusParam : undefined;
+            // A bad status filter is a client error worth naming, not a silent
+            // "every status" that hides the typo.
+            if (statusParam !== null && status === undefined) {
+                sendJson(res, 400, { error: "status must be one of active, done, abandoned" });
+                return;
+            }
+            const limit = clampPage(url.searchParams.get("limit"), DEFAULT_PAGE, 1000);
+
+            const query: Parameters<GoalStore["list"]>[0] = { status, limit };
+            if (scopeParam === "global") {
+                query.scope = "global";
+            } else if (scopeParam === "session") {
+                if (!sessionParam) {
+                    sendJson(res, 400, { error: "scope=session requires a session query param" });
+                    return;
+                }
+                query.scope = "session";
+                query.session = sessionParam;
+            } else if (sessionParam) {
+                // No explicit scope but a session given: the legacy "this session's
+                // goals" filter, kept for the deep-link from a conversation.
+                query.session = sessionParam;
+            }
+
+            const goals = deps.goals.list(query).map(goalToJson);
+            sendJson(res, 200, { goals, total: deps.goals.count({ status }) });
+            return;
+        }
+
+        if (req.method === "POST") {
+            const body = await readJsonObject(req);
+            if (!body) {
+                sendJson(res, 400, { error: "invalid JSON body" });
+                return;
+            }
+            if (typeof body.content !== "string") {
+                sendJson(res, 400, { error: "content must be a string" });
+                return;
+            }
+            // An explicit empty/whitespace `session` means "no session" (global),
+            // not a session literally named "". Only a non-empty string scopes it.
+            const session =
+                typeof body.session === "string" && body.session.trim() !== ""
+                    ? body.session
+                    : undefined;
+            try {
+                const goal = deps.goals.create({ content: body.content, session });
+                sendJson(res, 201, { goal: goalToJson(goal) });
+            } catch (err) {
+                sendGoalError(res, err);
+            }
+            return;
+        }
+
+        sendJson(res, 405, { error: `method ${req.method} not allowed on /api/goals` });
+        return;
+    }
+
+    // The item endpoint: /api/goals/:id (update, delete).
+    const idText = decodeURIComponent(path.slice("/api/goals/".length));
+    const id = Number(idText);
+    if (!idText || !Number.isInteger(id) || id <= 0) {
+        sendJson(res, 404, { error: "goal not found" });
+        return;
+    }
+
+    if (req.method === "PUT") {
+        const body = await readJsonObject(req);
+        if (!body) {
+            sendJson(res, 400, { error: "invalid JSON body" });
+            return;
+        }
+        if (body.content === undefined && body.status === undefined) {
+            sendJson(res, 400, { error: "provide content and/or status to update" });
+            return;
+        }
+        let status: GoalStatus | undefined;
+        if (body.status !== undefined) {
+            if (!isGoalStatus(body.status)) {
+                sendJson(res, 400, { error: "status must be one of active, done, abandoned" });
+                return;
+            }
+            status = body.status;
+        }
+        try {
+            // Apply the content edit and the status change independently, the way
+            // goal_update does; either touching a missing id means a 404.
+            let goal: Goal | undefined;
+            let found = false;
+            if (typeof body.content === "string") {
+                goal = deps.goals.edit(id, body.content);
+                found = found || goal !== undefined;
+            } else if (body.content !== undefined) {
+                sendJson(res, 400, { error: "content must be a string" });
+                return;
+            }
+            if (status !== undefined) {
+                goal = deps.goals.setStatus(id, status);
+                found = found || goal !== undefined;
+            }
+            if (!goal) {
+                if (found) {
+                    sendJson(res, 500, { error: "update failed" });
+                } else {
+                    sendJson(res, 404, { error: `no goal with id ${id}` });
+                }
+                return;
+            }
+            sendJson(res, 200, { goal: goalToJson(goal) });
+        } catch (err) {
+            sendGoalError(res, err);
+        }
+        return;
+    }
+
+    if (req.method === "DELETE") {
+        const removed = deps.goals.delete(id);
+        if (!removed) {
+            sendJson(res, 404, { error: `no goal with id ${id}` });
+            return;
+        }
+        sendJson(res, 200, { deleted: true });
+        return;
+    }
+
+    sendJson(res, 405, { error: `method ${req.method} not allowed on ${path}` });
+}
+
+/** Map a {@link GoalError} (bad input the store refused) to a 400 with its
+ *  message; anything else is a real 500. Mirrors {@link sendNoteError}. */
+function sendGoalError(res: ServerResponse, err: unknown): void {
+    if (err instanceof GoalError) {
+        sendJson(res, 400, { error: err.message });
+        return;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    sendJson(res, 500, { error: message });
+}
+
 // ── Router ──────────────────────────────────────────────────────────────────
 
 /** Build the request handler over a set of deps. Pure routing: it owns no
@@ -997,6 +1191,15 @@ export function createHandler(deps: ServerDeps) {
             // appends each as a dream event the GET then reflects.
             if (path === "/api/dreams") {
                 await handleDreams(req, res, deps, url);
+                return;
+            }
+
+            // Goals: the human-editable standing-context surface. List/read are
+            // GETs; create/edit/delete mutate the GoalStore directly (the same rows
+            // the agent's goal tools write), so a UI edit and an agent goal_set
+            // converge on one store the next turn reads.
+            if (path === "/api/goals" || path.startsWith("/api/goals/")) {
+                await handleGoals(req, res, deps, url, path);
                 return;
             }
 

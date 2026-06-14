@@ -82,8 +82,22 @@ export class Goal {
 export interface GoalQuery {
     /** Only goals in this state. Omit for every state. */
     status?: GoalStatus;
-    /** Only goals scoped to this session. Omit to read across all sessions. */
+    /** Only goals scoped to this session. Omit to read across all sessions.
+     *  Ignored when {@link scope} is `"global"` (a global read has no session). */
     session?: string;
+    /**
+     * Restrict by ownership rather than by a specific session id:
+     *  - `"global"` — only store-global goals (`session IS NULL`), visible to
+     *    every conversation. This is the distinction a bare
+     *    `list({ session: undefined })` *cannot* draw: undefined means "no session
+     *    filter" (every goal), whereas `scope: "global"` means "the goals belonging
+     *    to no session". Set it to read the shared goals on their own.
+     *  - `"session"` — only goals scoped to {@link session} (requires `session`).
+     *    Equivalent to passing `session` with no scope; named for symmetry.
+     *  - omitted — the legacy behavior: filter by `session` when given, else every
+     *    goal across all sessions.
+     */
+    scope?: "global" | "session";
     /** Max rows. Defaults to the shared {@link DEFAULT_LIMIT}; capped at MAX_LIMIT. */
     limit?: number;
 }
@@ -214,27 +228,40 @@ export class GoalStore {
     /**
      * List goals, newest intent last so the model reads them in the order they
      * were set (oldest first, the natural order of a to-do list). Filters by
-     * status and/or session. The hot call is `list({ status: 'active', session })`
-     * (goalContext, every turn), which the idx_goals_session_status index serves
-     * without a scan.
+     * status, session, and/or {@link GoalQuery.scope}. The hot call is
+     * `list({ status: 'active', session })` (goalContext, every turn), which the
+     * idx_goals_session_status index serves without a scan; `scope: 'global'`
+     * reads the shared goals (`session IS NULL`) the same index also covers.
      */
     list(opts: GoalQuery = {}): Goal[] {
         this.assertOpen();
+        const { where, params } = this.buildFilter(opts);
+        const sql = `SELECT * FROM goals ${where} ORDER BY created ASC, id ASC LIMIT ?`;
+        params.push(clampLimit(opts.limit));
+        const rows = this.db.prepare(sql).all(...(params as never[])) as unknown as GoalRow[];
+        return rows.map(rowToGoal);
+    }
+
+    /** Build the shared WHERE clause for {@link list} and {@link count}: status,
+     *  and a session predicate that honors {@link GoalQuery.scope} —
+     *  `session IS NULL` for global, `session = ?` for a specific session. */
+    private buildFilter(opts: Omit<GoalQuery, "limit">): { where: string; params: unknown[] } {
         const conditions: string[] = [];
         const params: unknown[] = [];
         if (opts.status !== undefined) {
             conditions.push("status = ?");
             params.push(opts.status);
         }
-        if (opts.session !== undefined) {
+        if (opts.scope === "global") {
+            // The distinction a bare session filter can't draw: goals owned by no
+            // session, shared across every conversation.
+            conditions.push("session IS NULL");
+        } else if (opts.session !== undefined) {
             conditions.push("session = ?");
             params.push(opts.session);
         }
         const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-        const sql = `SELECT * FROM goals ${where} ORDER BY created ASC, id ASC LIMIT ?`;
-        params.push(clampLimit(opts.limit));
-        const rows = this.db.prepare(sql).all(...(params as never[])) as unknown as GoalRow[];
-        return rows.map(rowToGoal);
+        return { where, params };
     }
 
     /** Move a goal to a new status (e.g. mark it done). Returns the updated goal,
@@ -265,20 +292,11 @@ export class GoalStore {
         return this.deleteStmt.run(id).changes > 0;
     }
 
-    /** Count goals matching the filters (no limit applied). */
+    /** Count goals matching the filters (no limit applied). Honors
+     *  {@link GoalQuery.scope} the same way {@link list} does. */
     count(opts: Omit<GoalQuery, "limit"> = {}): number {
         this.assertOpen();
-        const conditions: string[] = [];
-        const params: unknown[] = [];
-        if (opts.status !== undefined) {
-            conditions.push("status = ?");
-            params.push(opts.status);
-        }
-        if (opts.session !== undefined) {
-            conditions.push("session = ?");
-            params.push(opts.session);
-        }
-        const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+        const { where, params } = this.buildFilter(opts);
         const row = this.db
             .prepare(`SELECT COUNT(*) AS n FROM goals ${where}`)
             .get(...(params as never[])) as { n: number };

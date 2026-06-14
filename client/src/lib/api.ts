@@ -105,6 +105,20 @@ export interface WireDream {
     sourceMemoryIds: number[];
 }
 
+/** A goal's lifecycle state, mirroring the harness `GoalStatus`. */
+export type GoalStatus = "active" | "done" | "abandoned";
+
+/** One goal, as `/api/goals` returns it. A `session` of null is a shared (global)
+ *  goal every conversation sees; a non-null id scopes it to one conversation. */
+export interface WireGoal {
+    id: number;
+    content: string;
+    status: GoalStatus;
+    session: string | null;
+    created: number;
+    updated: number;
+}
+
 /** One parameter a slash command accepts, as `/api/commands` returns it. Mirrors
  *  the harness `CommandParam`: a placeholder name, a hint, and whether it's
  *  required (which decides the `<name>` vs `[name]` bracket in the signature). */
@@ -281,6 +295,52 @@ export function runDreams(
     fetchFn?: typeof fetch,
 ): Promise<{ dreams: WireDream[]; failures: { index: number; error: string }[] }> {
     return writeJson("POST", "/api/dreams", opts, fetchFn);
+}
+
+/**
+ * The goal store, filtered. `scope` picks the ownership tier:
+ *  - `'all'` (default): every goal, global and across all sessions.
+ *  - `'global'`: only shared goals (no session) — the standing intent every
+ *    conversation sees.
+ *  - `'session'`: only one conversation's goals (requires `session`).
+ * `status` further narrows by lifecycle. `total` counts goals matching `status`
+ * across every scope (so the header can show "12 active" regardless of the scope
+ * filter in view).
+ */
+export function getGoals(
+    opts: { scope?: "all" | "global" | "session"; session?: string; status?: GoalStatus } = {},
+    fetchFn?: typeof fetch,
+): Promise<{ goals: WireGoal[]; total: number }> {
+    const params = new URLSearchParams();
+    if (opts.scope && opts.scope !== "all") params.set("scope", opts.scope);
+    if (opts.session) params.set("session", opts.session);
+    if (opts.status) params.set("status", opts.status);
+    const qs = params.toString();
+    return getJson(`/api/goals${qs ? `?${qs}` : ""}`, fetchFn);
+}
+
+/** Create a goal. With no `session` it's a shared (global) goal; pass a session id
+ *  to scope it to that conversation. Returns the created goal. */
+export function createGoal(
+    input: { content: string; session?: string },
+    fetchFn?: typeof fetch,
+): Promise<{ goal: WireGoal }> {
+    return writeJson("POST", "/api/goals", input, fetchFn);
+}
+
+/** Update a goal by id: revise its content, change its status, or both. */
+export function updateGoal(
+    id: number,
+    patch: { content?: string; status?: GoalStatus },
+    fetchFn?: typeof fetch,
+): Promise<{ goal: WireGoal }> {
+    return writeJson("PUT", `/api/goals/${id}`, patch, fetchFn);
+}
+
+/** Delete a goal by id. Prefer setting status to 'abandoned' when the record of
+ *  intent is worth keeping; this is for genuine mistakes. */
+export function deleteGoal(id: number, fetchFn?: typeof fetch): Promise<{ deleted: boolean }> {
+    return writeJson("DELETE", `/api/goals/${id}`, undefined, fetchFn);
 }
 
 /** The events the chat SSE stream delivers, in the same `kind` vocabulary the

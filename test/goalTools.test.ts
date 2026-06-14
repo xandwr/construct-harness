@@ -204,6 +204,49 @@ test("goalContext shows only active goals, scoped to its session", async () => {
     store.close();
 });
 
+test("goalContext injects shared (global) goals under their own heading", async () => {
+    const store = freshStore();
+    // A global goal (no session) is shared standing intent every conversation sees.
+    store.create({ content: "uphold the house style" });
+    store.create({ content: "ship the migration", session: "s" });
+
+    const out = systemText(await applyContext([user("hi")], [goalContext(store, "s")], 0));
+    // Both sections present, kept distinct.
+    assert.match(out, /shared goals/i);
+    assert.match(out, /uphold the house style/);
+    assert.match(out, /this conversation's active goals/i);
+    assert.match(out, /ship the migration/);
+    // The shared section comes first (standing intent before the turn's work).
+    assert.ok(out.indexOf("uphold the house style") < out.indexOf("ship the migration"));
+    store.close();
+});
+
+test("goalContext shows shared goals to every session, not just one", async () => {
+    const store = freshStore();
+    store.create({ content: "global standing goal" });
+
+    // A different session — with no goals of its own — still sees the shared one.
+    const out = systemText(await applyContext([user("hi")], [goalContext(store, "other")], 0));
+    assert.match(out, /shared goals/i);
+    assert.match(out, /global standing goal/);
+    assert.ok(
+        !/this conversation's active goals/i.test(out),
+        "a session with no goals of its own shows only the shared section",
+    );
+    store.close();
+});
+
+test("goalContext does not leak one session's goals into another via the global scope", async () => {
+    const store = freshStore();
+    store.create({ content: "session-A goal", session: "A" });
+    // Session B reads: it must see neither A's goal (wrong session) nor treat it as
+    // global (it has a session, so it's not session-less).
+    const out = systemText(await applyContext([user("hi")], [goalContext(store, "B")], 0));
+    assert.ok(!/session-A goal/.test(out), "session A's goal must not surface for session B");
+    assert.equal(out, "", "with no shared and no B goals, nothing is injected");
+    store.close();
+});
+
 test("goalContext caps the injected list at DEFAULT_GOAL_LIMIT", async () => {
     const store = freshStore();
     for (let i = 0; i < DEFAULT_GOAL_LIMIT + 5; i++) {

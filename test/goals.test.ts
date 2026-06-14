@@ -130,6 +130,62 @@ test("list filters by session, and a no-session read sees everything", () => {
     store.close();
 });
 
+test("scope='global' reads only goals with no session (session IS NULL)", () => {
+    const store = freshStore();
+    store.create({ content: "shared-a" });
+    store.create({ content: "scoped", session: "s_x" });
+    store.create({ content: "shared-b" });
+    // The distinction a bare session filter can't draw: a no-session read sees
+    // everything, but scope='global' sees only the session-less rows.
+    assert.deepEqual(
+        store
+            .list({ scope: "global" })
+            .map((g) => g.content)
+            .sort(),
+        ["shared-a", "shared-b"],
+    );
+    // A bare list (no scope, no session) still sees all three.
+    assert.equal(store.list().length, 3);
+    store.close();
+});
+
+test("scope='global' composes with status", () => {
+    const store = freshStore();
+    const a = store.create({ content: "shared-active" });
+    const b = store.create({ content: "shared-done" });
+    store.setStatus(b.id, "done");
+    store.create({ content: "scoped-active", session: "s_x" });
+    assert.deepEqual(
+        store.list({ scope: "global", status: "active" }).map((g) => g.content),
+        ["shared-active"],
+    );
+    void a;
+    store.close();
+});
+
+test("scope='session' reads only that session, never the global rows", () => {
+    const store = freshStore();
+    store.create({ content: "global" });
+    store.create({ content: "mine", session: "s_me" });
+    store.create({ content: "theirs", session: "s_other" });
+    assert.deepEqual(
+        store.list({ scope: "session", session: "s_me" }).map((g) => g.content),
+        ["mine"],
+    );
+    store.close();
+});
+
+test("count honors scope='global'", () => {
+    const store = freshStore();
+    store.create({ content: "shared-a" });
+    store.create({ content: "shared-b" });
+    store.create({ content: "scoped", session: "s_x" });
+    assert.equal(store.count(), 3);
+    assert.equal(store.count({ scope: "global" }), 2);
+    assert.equal(store.count({ scope: "session", session: "s_x" }), 1);
+    store.close();
+});
+
 // ---------------------------------------------------------------------------
 // Update: status & content
 // ---------------------------------------------------------------------------

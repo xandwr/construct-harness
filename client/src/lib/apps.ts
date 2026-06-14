@@ -30,6 +30,7 @@ export const APPS: AppDef[] = [
     { id: "chat", title: "chat", href: "/", icon: "chat" },
     { id: "conversations", title: "conversations", href: "/conversations", icon: "conversations" },
     { id: "memories", title: "memories", href: "/memories", icon: "memories" },
+    { id: "goals", title: "goals", href: "/goals", icon: "goals" },
     { id: "kb", title: "knowledge base", href: "/kb", icon: "knowledge-base" },
     { id: "log", title: "event log", href: "/log", icon: "event-log" },
     { id: "dreams", title: "dreams", href: "/dreams", icon: "dreams" },

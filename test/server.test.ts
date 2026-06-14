@@ -506,6 +506,175 @@ test("POST /api/chat resuming a past conversation feeds its history to the model
     deps.close();
 });
 
+// ── Goals CRUD ───────────────────────────────────────────────────────────────
+
+/** A fake request with a method and a JSON body, for PUT/DELETE/POST. Mirrors
+ *  `postReq` but lets the test pick the verb; the body streams on the next tick. */
+function bodyReq(method: string, url: string, body?: string): any {
+    const req: any = new EventEmitter();
+    req.method = method;
+    req.url = url;
+    req.destroy = () => {};
+    queueMicrotask(() => {
+        if (body !== undefined) req.emit("data", Buffer.from(body, "utf8"));
+        req.emit("end");
+    });
+    return req;
+}
+
+/** Run one request through the handler and return the captured response, parsed. */
+async function call(
+    deps: ReturnType<typeof makeDeps>,
+    req: any,
+): Promise<{ status: number; json: any }> {
+    const handle = createHandler(deps);
+    const { res, captured } = fakeRes();
+    await handle(req, res);
+    let json: any = null;
+    try {
+        json = JSON.parse(captured.body);
+    } catch {
+        // non-JSON body (none expected in these tests)
+    }
+    return { status: captured.status, json };
+}
+
+test("POST /api/goals creates a global goal when no session is given", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const { status, json } = await call(
+        deps,
+        bodyReq("POST", "/api/goals", JSON.stringify({ content: "uphold the house style" })),
+    );
+    assert.equal(status, 201);
+    assert.equal(json.goal.content, "uphold the house style");
+    assert.equal(json.goal.status, "active");
+    assert.equal(json.goal.session, null, "no session ⇒ a shared (global) goal");
+    deps.close();
+});
+
+test("POST /api/goals scopes to a session when one is given", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const { json } = await call(
+        deps,
+        bodyReq("POST", "/api/goals", JSON.stringify({ content: "ship it", session: "s_1" })),
+    );
+    assert.equal(json.goal.session, "s_1");
+    deps.close();
+});
+
+test("POST /api/goals rejects a missing/empty content with 400", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const missing = await call(deps, bodyReq("POST", "/api/goals", JSON.stringify({})));
+    assert.equal(missing.status, 400);
+    const empty = await call(
+        deps,
+        bodyReq("POST", "/api/goals", JSON.stringify({ content: "   " })),
+    );
+    assert.equal(empty.status, 400, "the store's GoalError maps to a 400");
+    deps.close();
+});
+
+test("GET /api/goals?scope=global returns only the shared goals", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    deps.goals.create({ content: "shared one" });
+    deps.goals.create({ content: "shared two" });
+    deps.goals.create({ content: "session-scoped", session: "s_1" });
+
+    const all = await call(deps, getReq("/api/goals"));
+    assert.equal(all.json.goals.length, 3);
+
+    const global = await call(deps, getReq("/api/goals?scope=global"));
+    assert.equal(global.json.goals.length, 2);
+    assert.ok(global.json.goals.every((g: any) => g.session === null));
+    deps.close();
+});
+
+test("GET /api/goals?scope=session filters to one conversation; requires a session", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    deps.goals.create({ content: "global" });
+    deps.goals.create({ content: "mine", session: "s_me" });
+    deps.goals.create({ content: "theirs", session: "s_other" });
+
+    const mine = await call(deps, getReq("/api/goals?scope=session&session=s_me"));
+    assert.equal(mine.json.goals.length, 1);
+    assert.equal(mine.json.goals[0].content, "mine");
+
+    // scope=session with no session id is a client error, not a silent all-read.
+    const noSession = await call(deps, getReq("/api/goals?scope=session"));
+    assert.equal(noSession.status, 400);
+    deps.close();
+});
+
+test("GET /api/goals filters by status and rejects a bad status", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const a = deps.goals.create({ content: "active goal" });
+    const b = deps.goals.create({ content: "done goal" });
+    deps.goals.setStatus(b.id, "done");
+    void a;
+
+    const active = await call(deps, getReq("/api/goals?status=active"));
+    assert.deepEqual(
+        active.json.goals.map((g: any) => g.content),
+        ["active goal"],
+    );
+
+    const bad = await call(deps, getReq("/api/goals?status=bogus"));
+    assert.equal(bad.status, 400);
+    deps.close();
+});
+
+test("PUT /api/goals/:id edits content and changes status", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const g = deps.goals.create({ content: "rough draft" });
+
+    const edited = await call(
+        deps,
+        bodyReq(
+            "PUT",
+            `/api/goals/${g.id}`,
+            JSON.stringify({ content: "sharpened", status: "done" }),
+        ),
+    );
+    assert.equal(edited.status, 200);
+    assert.equal(edited.json.goal.content, "sharpened");
+    assert.equal(edited.json.goal.status, "done");
+
+    // An empty patch is a 400 (nothing to change), a bad id is a 404.
+    const empty = await call(deps, bodyReq("PUT", `/api/goals/${g.id}`, JSON.stringify({})));
+    assert.equal(empty.status, 400);
+    const missing = await call(
+        deps,
+        bodyReq("PUT", "/api/goals/999999", JSON.stringify({ status: "done" })),
+    );
+    assert.equal(missing.status, 404);
+    deps.close();
+});
+
+test("PUT /api/goals/:id rejects a bad status with 400", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const g = deps.goals.create({ content: "x" });
+    const bad = await call(
+        deps,
+        bodyReq("PUT", `/api/goals/${g.id}`, JSON.stringify({ status: "bogus" })),
+    );
+    assert.equal(bad.status, 400);
+    deps.close();
+});
+
+test("DELETE /api/goals/:id removes a goal; a missing id is a 404", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const g = deps.goals.create({ content: "oops" });
+
+    const removed = await call(deps, bodyReq("DELETE", `/api/goals/${g.id}`));
+    assert.equal(removed.status, 200);
+    assert.equal(removed.json.deleted, true);
+    assert.equal(deps.goals.get(g.id), undefined);
+
+    const again = await call(deps, bodyReq("DELETE", `/api/goals/${g.id}`));
+    assert.equal(again.status, 404);
+    deps.close();
+});
+
 // ── Server-tool resolution ──────────────────────────────────────────────────
 
 test("resolveServerTools defaults to live web access when unset", () => {
