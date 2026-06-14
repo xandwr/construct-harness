@@ -26,6 +26,7 @@ import {
     DEFAULT_LIMIT,
     MAX_LIMIT,
 } from "../src/memory.ts";
+import { EventStore } from "../src/events.ts";
 
 /**
  * Run `fn` with a path to a fresh temp directory, cleaned up afterward. Used by
@@ -725,5 +726,114 @@ test("refuses to open a database newer than the code supports", () => {
         raw.close();
 
         assert.throws(() => new MemoryStore(path), MigrationError);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Provenance overlay (memory_meta): curation over the log
+// ---------------------------------------------------------------------------
+//
+// Provenance links a memory to the event it was curated from. The link's foreign
+// keys span both tables, so these tests open a MemoryStore and an EventStore over
+// the *same* file (a `:memory:` db is private per connection and can't be shared).
+
+/** Open a memory store and an event log over one shared temp file, run `fn`, and
+ *  clean both up. */
+function withSharedStores(fn: (mem: MemoryStore, events: EventStore) => void): void {
+    withTempDir((dir) => {
+        const path = join(dir, "shared.sqlite");
+        const memStore = new MemoryStore(path);
+        const events = new EventStore(path);
+        try {
+            fn(memStore, events);
+        } finally {
+            events.close();
+            memStore.close();
+        }
+    });
+}
+
+test("setProvenance links a memory to an event and provenanceOf reads it back", () => {
+    withSharedStores((memStore, events) => {
+        const ev = events.append({ kind: "message", content: "remember my name is Ada" });
+        const m = memStore.save(mem("user's name is Ada"));
+
+        assert.equal(memStore.setProvenance(m.id, ev.id), true);
+        assert.equal(memStore.provenanceOf(m.id), ev.id);
+    });
+});
+
+test("provenanceOf is undefined for a memory with no recorded provenance", () => {
+    withSharedStores((memStore) => {
+        const m = memStore.save(mem("unsourced fact"));
+        assert.equal(memStore.provenanceOf(m.id), undefined);
+    });
+});
+
+test("setProvenance returns false for a missing memory (no orphan row)", () => {
+    withSharedStores((memStore, events) => {
+        const ev = events.append({ kind: "message", content: "x" });
+        assert.equal(memStore.setProvenance(9999, ev.id), false);
+    });
+});
+
+test("setProvenance is re-pointable: a second call replaces the link", () => {
+    withSharedStores((memStore, events) => {
+        const e1 = events.append({ kind: "message", content: "first" });
+        const e2 = events.append({ kind: "message", content: "second" });
+        const m = memStore.save(mem("fact"));
+
+        memStore.setProvenance(m.id, e1.id);
+        memStore.setProvenance(m.id, e2.id);
+        assert.equal(memStore.provenanceOf(m.id), e2.id);
+    });
+});
+
+test("setProvenance to a non-existent event is rejected by the foreign key", () => {
+    withSharedStores((memStore) => {
+        const m = memStore.save(mem("fact"));
+        assert.throws(() => memStore.setProvenance(m.id, 123456), /FOREIGN KEY/);
+    });
+});
+
+test("memoriesFromEvent returns every memory curated from an event, newest first", () => {
+    withSharedStores((memStore, events) => {
+        const ev = events.append({ kind: "message", content: "a rich turn" });
+        const m1 = memStore.save(mem("fact one", { created: 1000 }));
+        const m2 = memStore.save(mem("fact two", { created: 2000 }));
+        memStore.setProvenance(m1.id, ev.id);
+        memStore.setProvenance(m2.id, ev.id);
+
+        const from = memStore.memoriesFromEvent(ev.id);
+        assert.deepEqual(
+            from.map((x) => x.content),
+            ["fact two", "fact one"],
+        );
+    });
+});
+
+test("deleting a memory cascades away its provenance row", () => {
+    withSharedStores((memStore, events) => {
+        const ev = events.append({ kind: "message", content: "x" });
+        const m = memStore.save(mem("fact"));
+        memStore.setProvenance(m.id, ev.id);
+        assert.equal(memStore.memoriesFromEvent(ev.id).length, 1);
+
+        memStore.delete(m.id);
+        assert.equal(memStore.memoriesFromEvent(ev.id).length, 0);
+    });
+});
+
+test("clearProvenance drops the link but keeps the memory", () => {
+    withSharedStores((memStore, events) => {
+        const ev = events.append({ kind: "message", content: "x" });
+        const m = memStore.save(mem("fact"));
+        memStore.setProvenance(m.id, ev.id);
+
+        assert.equal(memStore.clearProvenance(m.id), true);
+        assert.equal(memStore.provenanceOf(m.id), undefined);
+        assert.ok(memStore.get(m.id), "memory itself must survive clearProvenance");
+        // Idempotent: clearing again removes nothing.
+        assert.equal(memStore.clearProvenance(m.id), false);
     });
 });

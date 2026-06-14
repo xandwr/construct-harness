@@ -22,6 +22,8 @@ import { temporalContext } from "./context.ts";
 import { MemoryStore } from "./memory.ts";
 import { memoryTools, recallContext } from "./memoryTools.ts";
 import type { Embedder } from "./embeddings.ts";
+import { EventStore } from "./events.ts";
+import type { Event, EventInput } from "./events.ts";
 
 /** Configuration for a {@link Session}. */
 export interface SessionConfig {
@@ -34,6 +36,23 @@ export interface SessionConfig {
     /** Memory store. When given, the model gets memory_save/recall/forget tools
      *  and each turn injects turn-relevant recalled memories. */
     store?: MemoryStore;
+    /**
+     * Append-only event log. When given, every turn this Session runs (the user
+     * message, each tool call and its result, and the assistant's reply) is
+     * appended to the log under {@link sessionId}, so the transcript persists
+     * beyond the in-memory {@link history} and outlives the process. The log is
+     * the load-bearing substrate {@link MemoryStore} curates over: a Session with
+     * one writes its whole life into it for free. Omit to keep a Session purely
+     * in-memory.
+     */
+    events?: EventStore;
+    /**
+     * The id grouping this Session's events in the {@link events} log. Defaults to
+     * a fresh id per Session so two Sessions sharing one log stay separable. Only
+     * meaningful alongside `events`; pass a stable id to resume appending to (and
+     * recalling) an earlier conversation's transcript.
+     */
+    sessionId?: string;
     /** Embedder for semantic recall. Only meaningful alongside `store`. */
     embedder?: Embedder;
     /** Passive context providers. Defaults to a single temporal provider so the
@@ -76,6 +95,11 @@ export class Session {
     private readonly cfg: SessionConfig;
     private readonly tools: ToolDef[];
     private readonly context: ContextProvider[];
+    /** The log this Session appends its turns to, or undefined when none was
+     *  configured (a purely in-memory Session). */
+    private readonly events?: EventStore;
+    /** The id under which this Session's events are grouped in {@link events}. */
+    private readonly sessionId: string;
     /** The durable conversation: user/assistant/tool turns only. The system
      *  turn is rebuilt per send (recall is turn-relevant), so it is NOT stored
      *  here; it's prepended at send time and never persisted. */
@@ -87,6 +111,15 @@ export class Session {
         const memTools = config.store ? memoryTools(config.store, config.embedder) : [];
         this.tools = [...memTools, ...(config.tools ?? [])];
         this.context = config.context ?? [temporalContext()];
+        this.events = config.events;
+        this.sessionId = config.sessionId ?? freshSessionId();
+    }
+
+    /** The id this Session's events are grouped under in the log. Read it to
+     *  later query {@link EventStore} for this conversation's transcript, or to
+     *  resume the Session by passing it back as {@link SessionConfig.sessionId}. */
+    get id(): string {
+        return this.sessionId;
     }
 
     /** A read-only snapshot of the durable conversation (no system turn). */
@@ -94,10 +127,30 @@ export class Session {
         return this.conversation;
     }
 
-    /** Drop all conversation history, starting the Construct fresh. Memory in
-     *  the store is untouched: only the in-session transcript is cleared. */
+    /** Drop the in-memory conversation, starting the Construct fresh. Memory in
+     *  the store and the appended event log are both untouched: only the live
+     *  in-session transcript is cleared. The log keeps the full record, so
+     *  {@link transcript} still returns the turns this reset just forgot. */
     reset(): void {
         this.conversation = [];
+    }
+
+    /**
+     * Read this Session's turns back out of the {@link EventStore} as a scoped
+     * view: the events appended under this Session's {@link id}, oldest first
+     * (reading order). This is the persistent counterpart to {@link history}:
+     * where `history` is the live in-memory conversation (cleared by
+     * {@link reset}, lost on process exit), this is the durable record the log
+     * kept, queryable across restarts and independent of the current process.
+     *
+     * Returns an empty array when no log is configured. `limit` bounds the read
+     * (default {@link EventStore}'s page size); pass a larger one to page deeper.
+     */
+    transcript(limit?: number): Event[] {
+        if (!this.events) return [];
+        // `recent` is newest-first; reverse to natural reading order so the
+        // transcript reads top-to-bottom like the conversation it records.
+        return this.events.recent({ session: this.sessionId, limit }).reverse();
     }
 
     /**
@@ -120,6 +173,14 @@ export class Session {
             content: [{ kind: "text", text }],
         };
 
+        // The user's message is the first thing that happened this turn: log it
+        // before the model runs, so even a turn that errors mid-flight leaves its
+        // prompt in the transcript. The rest of the turn (tool activity, the
+        // reply) is appended as the stream surfaces it below. We keep its id so a
+        // memory the model saves this turn can be linked back to the message that
+        // prompted it (provenance: curation over the log).
+        const userEvent = this.logEvent({ kind: "message", role: "user", content: text });
+
         const systemTurn = await this.buildSystem(text);
 
         // The run sees: system + durable history + this user turn. We pass a
@@ -141,8 +202,39 @@ export class Session {
 
         for await (const event of stream) {
             if (event.kind === "text") assistantText += event.text;
+            // Mirror the tool lifecycle into the log: a call when it starts, its
+            // result when it ends, correlated by the call id so a reader can
+            // thread a request to its answer. tool_result content is stringified
+            // because the log's `content` is text; the structured payload rides
+            // along in `meta`.
+            if (event.kind === "tool_start") {
+                this.logEvent({
+                    kind: "tool_call",
+                    role: "agent",
+                    content: event.name,
+                    correlation: event.id,
+                    meta: { name: event.name, args: event.args },
+                });
+            } else if (event.kind === "tool_end") {
+                this.logEvent({
+                    kind: "tool_result",
+                    role: "tool",
+                    content: stringifyResult(event.result),
+                    correlation: event.id,
+                    meta: { name: event.name, result: event.result, isError: event.isError },
+                });
+                // A memory the model just saved is curated from *this* turn:
+                // point its provenance at the user message that prompted it. This
+                // is the overlay turning MemoryStore into curation over the log.
+                this.linkSavedMemory(event, userEvent);
+            }
             if (event.kind === "loop_done") {
                 const r = event.result;
+                // The assistant's final text for this turn closes it out in the
+                // log (skip an empty reply: a turn that only called tools and
+                // stopped has nothing to record as a message).
+                const reply = assistantText.trim();
+                if (reply) this.logEvent({ kind: "message", role: "agent", content: reply });
                 // Commit the durable conversation: everything the run produced
                 // except the system turn we prepended (which is rebuilt per turn).
                 this.conversation = r.messages.filter((m) => m.sender.role !== RoleType.System);
@@ -167,6 +259,49 @@ export class Session {
     }
 
     /**
+     * Append one event to the log under this Session's id, if a log is
+     * configured. Stamps the {@link sessionId} so every turn is scoped to this
+     * conversation. Best-effort by contract: the log is an observer of the
+     * conversation, never a gate on it, so a logging failure (a closed store, a
+     * bad payload) must not take down the turn the user is mid-way through. We
+     * swallow it rather than let it surface as a send error.
+     */
+    private logEvent(input: Omit<EventInput, "session">): Event | undefined {
+        if (!this.events) return undefined;
+        try {
+            return this.events.append({ ...input, session: this.sessionId });
+        } catch {
+            // The transcript is a side-record; losing one event must not fail
+            // the turn. (A persistent failure shows up as a gap in transcript().)
+            return undefined;
+        }
+    }
+
+    /**
+     * If a tool_end event reports a successful `memory_save`, link the new
+     * memory's provenance to `userEvent` (the message that prompted this turn).
+     * No-op unless a store, a log, and a captured user event are all present, and
+     * the tool actually saved (the result shape `memory_save` returns on success
+     * is `{ saved: true, memory: { id } }`). Best-effort like the rest of the
+     * logging: a provenance failure must not disturb the turn.
+     */
+    private linkSavedMemory(event: LoopEvent, userEvent: Event | undefined): void {
+        const store = this.cfg.store;
+        if (!store || !userEvent) return;
+        if (event.kind !== "tool_end" || event.name !== "memory_save" || event.isError) return;
+        const result = event.result;
+        if (typeof result !== "object" || result === null) return;
+        const r = result as { saved?: unknown; memory?: { id?: unknown } };
+        if (r.saved !== true || typeof r.memory?.id !== "number") return;
+        try {
+            store.setProvenance(r.memory.id, userEvent.id);
+        } catch {
+            // Provenance is an annotation; failing to record it must not fail the
+            // turn the user is in the middle of.
+        }
+    }
+
+    /**
      * Build the system turn for a send: base guidance plus memory relevant to
      * `query`. With no store, it's just the base guidance. Async because
      * semantic recall embeds the query.
@@ -186,5 +321,32 @@ export class Session {
             timestamp: Date.now(),
             content: [{ kind: "text", text }],
         };
+    }
+}
+
+/** A short, unique id for a Session's events when the caller didn't pin one.
+ *  Time-ordered prefix plus a random suffix so two Sessions created in the same
+ *  millisecond on one shared log don't collide. Not security-sensitive; it only
+ *  needs to separate one conversation's events from another's. */
+function freshSessionId(): string {
+    const stamp = Date.now().toString(36);
+    const rand = Math.random().toString(36).slice(2, 10);
+    return `s_${stamp}_${rand}`;
+}
+
+/** Render a tool result into the log's text `content` column. A string passes
+ *  through verbatim; anything else is JSON-stringified (the structured form is
+ *  also kept in the event's `meta`, so this is for lexical/FTS search, not the
+ *  authoritative payload). Falls back to String() for a value JSON can't
+ *  represent (a circular object, a BigInt), and to a placeholder for the empty
+ *  string so the log's non-empty-content rule never rejects a tool's result. */
+function stringifyResult(result: unknown): string {
+    if (typeof result === "string") return result.length ? result : "(empty)";
+    if (result === undefined) return "(no result)";
+    try {
+        const json = JSON.stringify(result);
+        return json && json.length ? json : String(result);
+    } catch {
+        return String(result);
     }
 }

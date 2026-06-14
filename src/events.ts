@@ -4,12 +4,13 @@
  * Where {@link MemoryStore} holds a curated set of facts the agent chose to keep,
  * the event log holds *everything that happened*: every message, tool call, tool
  * result, recall, and dream, in the order it occurred. It is the source of truth
- * the higher-level views are meant to be scoped queries over. Memory becomes an
- * annotation overlay on top of this (a future `memory_meta(event_id, ...)`
- * table), which is why this store keeps `events` strictly content-bearing and
- * annotation-free, and never exposes a content UPDATE or DELETE: immutability is
- * the substrate's whole value. The only mutable thing EventStore owns is an
- * event's embedding (set/delete, for re-embed).
+ * the higher-level views are meant to be scoped queries over. Memory is an
+ * annotation overlay on top of this: the `memory_meta(memory_id, event_id, ...)`
+ * table (see {@link MemoryStore.setProvenance}) links a curated fact back to the
+ * event it was distilled from, which is why this store keeps `events` strictly
+ * content-bearing and annotation-free, and never exposes a content UPDATE or
+ * DELETE: immutability is the substrate's whole value. The only mutable thing
+ * EventStore owns is an event's embedding (set/delete, for re-embed).
  *
  * Two indexing properties shape the design:
  *  - The log is total; the vector index is selective. {@link EventStore.append}

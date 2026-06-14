@@ -29,8 +29,10 @@
 
 import { Session } from "./session.ts";
 import type { ModelClient, ProviderOptions } from "./bridge/types.ts";
-import { dealStakes } from "./critics.ts";
-import type { Personality, DealOptions } from "./critics.ts";
+import { critic, dealStakes } from "./critics.ts";
+import type { Personality, DealOptions, Random } from "./critics.ts";
+import type { Memory, MemoryStore } from "./memory.ts";
+import type { Event, EventStore } from "./events.ts";
 
 /** Thrown when persona generation fails: the model returned no JSON object, the
  *  JSON didn't parse, or it parsed but wasn't a valid {@link Personality}.
@@ -274,4 +276,335 @@ export async function generatePersona(options: GeneratePersonaOptions): Promise<
 
     const persona = parsePersonaReply(reply);
     return options.deal ? dealStakes(persona, options.deal) : persona;
+}
+
+// ── The dream loop ────────────────────────────────────────────────────────────
+//
+// This is where dreaming stops being a persona *factory* and becomes the
+// feature. {@link generatePersona} conjures a person from nothing; the loop
+// takes that person, pulls a *scenario* abstracted from the user's own memory
+// corpus, drops the persona into it, and appends the choice it makes as a
+// `dream` event on the log. Run unattended during downtime, it accumulates a
+// record of how synthetic agents navigate the decision-space the user inhabits:
+// the corpus reads it back the same way it reads any other event.
+//
+// Everything here is hardened the way the persona factory is: a daemon that
+// dreams while no one watches must degrade (log the bad dream, roll the next
+// one) rather than crash a loop. A model that returns junk for a scenario, an
+// empty corpus, a persona that won't parse: each is a recoverable miss, not a
+// throw that ends the night.
+
+/** The `kind` every dream choice is appended under, so a corpus reader can
+ *  filter the log to just the dreams (`events.recent({ kind: DREAM_EVENT_KIND })`).
+ *  A constant, not a string literal scattered around, so the producer and any
+ *  consumer agree by construction. */
+export const DREAM_EVENT_KIND = "dream";
+
+/**
+ * A decision situation abstracted from the corpus, for a dreamed persona to face.
+ *
+ * The `prompt` is the scene as the persona will receive it: a concrete dilemma
+ * with a choice to make, drawn from (but not naming) the user's real memories,
+ * so the dream explores the user's decision-space without replaying their
+ * literal history. `sourceMemoryIds` records which memories it was distilled
+ * from, so a dream's provenance threads back to the corpus the way a curated
+ * memory's does (see {@link MemoryStore.setProvenance}).
+ */
+export interface DreamScenario {
+    /** The dilemma, phrased as a situation with a decision to make. */
+    prompt: string;
+    /** Ids of the memories this scenario was abstracted from (may be empty when
+     *  the corpus was empty and a generic scenario was used). */
+    sourceMemoryIds: number[];
+}
+
+/** The system prompt that turns a model turn into a scenario abstractor. Kept a
+ *  constant (like {@link PERSONA_SYSTEM}) so a test can assert it drove the turn
+ *  and a caller can read exactly what shapes the scenario. */
+export const SCENARIO_SYSTEM =
+    "You design decision scenarios. Given a handful of facts about a person and " +
+    "their world, invent ONE concrete dilemma that someone in that world might " +
+    "face: a situation with a real choice to make and something at stake on " +
+    "either side. Abstract away from the literal facts: do not name the person " +
+    "or quote their details back; use them only to ground the *kind* of decision " +
+    "in their actual life. Write the scenario in the second person, addressed to " +
+    "whoever must decide, and end by asking them to choose and say why. Reply " +
+    "with only the scenario prose, no preamble.";
+
+/** A fallback scenario when the corpus is empty (or scenario synthesis fails):
+ *  a generic-but-real dilemma so a dream can still run rather than aborting. The
+ *  decision-space it explores is a default one, which is the honest thing to do
+ *  when there's no corpus to draw a personal one from. */
+const FALLBACK_SCENARIO =
+    "You are handed a piece of work to approve under time pressure. It mostly " +
+    "looks right, but verifying the one part you are unsure of would cost a delay " +
+    "that matters to people waiting on you. Do you approve it now, or hold it to " +
+    "check? Choose, and say why.";
+
+/** Options for {@link sampleScenario}. */
+export interface SampleScenarioOptions {
+    /** The model client to drive the abstraction turn. Required. */
+    client: ModelClient;
+    /** How many memories to draw from the corpus as raw material. Default 5.
+     *  More gives the model richer grounding; too many dilutes the scenario. */
+    sampleSize?: number;
+    /** Randomness for sampling which memories ground the scenario, so repeated
+     *  dreams don't all abstract the same top-importance rows. Default
+     *  `Math.random`; pin it for a deterministic test. */
+    random?: Random;
+    /** Provider knobs for the abstraction turn, forwarded as-is. */
+    providerOptions?: ProviderOptions;
+}
+
+/**
+ * Pull a scenario from the corpus: sample some memories and abstract them into
+ * one decision dilemma via a single model turn.
+ *
+ * Reads up to a page of memories from `store`, randomly samples `sampleSize` of
+ * them (so dreams don't all key off the same most-important facts), and asks the
+ * model to invent a dilemma grounded in that material but not naming it. On an
+ * empty corpus, or if the model returns nothing usable, it falls back to a
+ * generic scenario rather than failing: a dream should always have something to
+ * face. The returned scenario carries the ids of the memories it drew from.
+ *
+ * Never throws for an empty/odd corpus or a thin model reply; a genuine
+ * transport error from the client still propagates (the loop above catches it).
+ */
+export async function sampleScenario(
+    store: MemoryStore,
+    options: SampleScenarioOptions,
+): Promise<DreamScenario> {
+    const sampleSize = options.sampleSize ?? 5;
+    const random = options.random ?? Math.random;
+
+    // Draw a generous page, then sample within it so the choice of grounding
+    // facts varies run to run instead of always being the top-importance rows.
+    const pool = store.all({ limit: Math.max(sampleSize * 4, sampleSize) });
+    const sampled = sampleMemories(pool, sampleSize, random);
+
+    if (sampled.length === 0) {
+        return { prompt: FALLBACK_SCENARIO, sourceMemoryIds: [] };
+    }
+
+    const material = sampled.map((m) => `- ${m.content}`).join("\n");
+    const session = new Session({
+        client: options.client,
+        system: SCENARIO_SYSTEM,
+        context: [],
+        providerOptions: options.providerOptions,
+    });
+
+    const reply = await drainText(
+        session,
+        `Here are facts about a person and their world:\n${material}\n\n` +
+            `Invent one decision scenario grounded in this.`,
+    );
+
+    const prompt = reply.trim();
+    return {
+        prompt: prompt.length ? prompt : FALLBACK_SCENARIO,
+        sourceMemoryIds: sampled.map((m) => m.id),
+    };
+}
+
+/** Sample up to `count` memories without replacement, using `random`. A partial
+ *  Fisher–Yates over a copy, mirroring {@link dealStakes}'s draw: we settle only
+ *  the first `count` slots and stop. */
+function sampleMemories(pool: Memory[], count: number, random: Random): Memory[] {
+    const n = Math.min(Math.max(0, Math.floor(count)), pool.length);
+    if (n === 0) return [];
+    const deck = [...pool];
+    for (let i = 0; i < n; i++) {
+        const j = i + Math.floor(random() * (deck.length - i));
+        const tmp = deck[i]!;
+        deck[i] = deck[j]!;
+        deck[j] = tmp;
+    }
+    return deck.slice(0, n);
+}
+
+/** Drive one {@link Session.send} to completion and return only its final text.
+ *  The dream path never needs the streamed events, just the choice/scenario the
+ *  turn produced. */
+async function drainText(session: Session, prompt: string): Promise<string> {
+    const gen = session.send(prompt);
+    let next = await gen.next();
+    while (!next.done) next = await gen.next();
+    return next.value.text;
+}
+
+/** A completed dream: the persona that dreamed, the scenario it faced, the choice
+ *  it made, and the event the choice was appended as. The whole record, so a
+ *  caller can inspect a dream without re-reading it from the log. */
+export interface Dream {
+    /** The disposable persona that was conjured and dropped into the scenario. */
+    persona: Personality;
+    /** The scenario it faced, with its corpus provenance. */
+    scenario: DreamScenario;
+    /** The persona's reply: the choice it made and its reasoning, verbatim. */
+    choice: string;
+    /** The `dream` event the choice was appended as, so the caller has its id and
+     *  timestamp without a re-query. */
+    event: Event;
+}
+
+/** Options for {@link dreamOnce}. */
+export interface DreamOptions {
+    /** The model client driving persona generation, scenario abstraction, and the
+     *  persona's choice. Required. */
+    client: ModelClient;
+    /** The corpus to pull scenarios from. Required: a dream is grounded in the
+     *  user's decision-space, which is what the corpus holds. */
+    store: MemoryStore;
+    /** The log to append the dream choice to. Required: appending the choice as a
+     *  `dream` event is what makes the dream part of the record rather than a
+     *  throwaway. */
+    events: EventStore;
+    /** A pre-built scenario to use instead of sampling one from the corpus. When
+     *  omitted, {@link sampleScenario} draws one. Pass this to dream a roster of
+     *  personas through the *same* scenario (sample once, reuse). */
+    scenario?: DreamScenario;
+    /** A short string folded into persona generation to vary the dreamer run to
+     *  run (see {@link GeneratePersonaOptions.seed}). */
+    seed?: string;
+    /** Deal the dreamer stakes so it arrives biased (see {@link dealStakes}).
+     *  Omit to dream a persona with nothing on the line. */
+    deal?: DealOptions;
+    /** How many memories scenario sampling draws (ignored when `scenario` is
+     *  given). Forwarded to {@link sampleScenario}. */
+    sampleSize?: number;
+    /** Randomness for scenario sampling (ignored when `scenario` is given). */
+    random?: Random;
+    /** Provider knobs, forwarded to every model turn this dream runs. */
+    providerOptions?: ProviderOptions;
+}
+
+/**
+ * Dream once: conjure a persona, face it with a scenario from the corpus, and
+ * append its choice to the log as a `dream` event.
+ *
+ * The full arc the rest of this module was building toward. It
+ * {@link generatePersona}s a (optionally stake-dealt) dreamer, gets a
+ * {@link DreamScenario} (sampled from the corpus unless one is supplied), mints
+ * the persona into a {@link critic} Session so the Construct *is* that person,
+ * drives one turn on the scenario, and records the reply as a `dream` event whose
+ * `meta` carries the persona and the scenario's corpus provenance. Returns the
+ * whole {@link Dream}.
+ *
+ * The choice event is logged under {@link DREAM_EVENT_KIND} and, like the persona
+ * factory, this path is the one a daemon loops: a {@link PersonaError} (a dream
+ * that wouldn't parse) propagates so {@link dreamLoop} can count it and roll the
+ * next one; a transport error likewise propagates to the loop's per-dream catch.
+ */
+export async function dreamOnce(options: DreamOptions): Promise<Dream> {
+    const persona = await generatePersona({
+        client: options.client,
+        seed: options.seed,
+        deal: options.deal,
+        providerOptions: options.providerOptions,
+    });
+
+    const scenario =
+        options.scenario ??
+        (await sampleScenario(options.store, {
+            client: options.client,
+            sampleSize: options.sampleSize,
+            random: options.random,
+            providerOptions: options.providerOptions,
+        }));
+
+    // The dreamer *becomes* the persona: a critic Session whose system prompt is
+    // the rendered persona. No memory tools, no log on this inner Session: the
+    // dreamer is disposable and we record only its choice, on the outer log.
+    const dreamer = critic(persona, {
+        client: options.client,
+        context: [],
+        providerOptions: options.providerOptions,
+    });
+
+    const choice = (await drainText(dreamer, scenario.prompt)).trim();
+
+    // Append the choice as a dream event. content is the choice (FTS-searchable);
+    // meta carries the structured record so a reader can reconstruct the dream:
+    // who dreamed it, what they faced, and which memories grounded it.
+    const event = options.events.append({
+        kind: DREAM_EVENT_KIND,
+        role: "agent",
+        content: choice.length ? choice : "(no choice)",
+        meta: {
+            persona,
+            scenario: scenario.prompt,
+            sourceMemoryIds: scenario.sourceMemoryIds,
+        },
+    });
+
+    return { persona, scenario, choice, event };
+}
+
+/** Options for {@link dreamLoop}. */
+export interface DreamLoopOptions extends DreamOptions {
+    /** How many dreams to run. Must be ≥ 1. The loop runs this many *attempts*;
+     *  a dream that fails to parse counts as an attempt and is recorded in
+     *  {@link DreamLoopResult.failures}, not retried. */
+    count: number;
+    /** Called after each settled dream (success or failure), e.g. to log
+     *  progress. The `index` is 0-based. Errors thrown by this observer are not
+     *  caught: it's the caller's, keep it total. */
+    onDream?(outcome: { index: number; dream?: Dream; error?: unknown }): void;
+}
+
+/** The outcome of a {@link dreamLoop} run: the dreams that completed and the
+ *  attempts that failed, so a caller sees both what was learned and what was
+ *  lost. */
+export interface DreamLoopResult {
+    /** Every dream that ran to completion and was appended, in order. */
+    dreams: Dream[];
+    /** One entry per attempt that threw (a malformed dream, a transport error),
+     *  paired with its 0-based attempt index, so the night's misses are visible
+     *  rather than silently dropped. */
+    failures: Array<{ index: number; error: unknown }>;
+}
+
+/**
+ * Run {@link dreamOnce} `count` times, tolerating per-dream failures.
+ *
+ * This is the unattended daemon: it dreams in a loop and, crucially, a single bad
+ * dream (a persona that wouldn't parse, a momentary transport error) does not end
+ * the night. Each failure is caught, recorded in {@link DreamLoopResult.failures},
+ * and the loop rolls the next dream: the degrade-don't-crash contract the whole
+ * module is written for, applied at the loop level.
+ *
+ * Dreams run sequentially by design: each appends to the same log and samples
+ * the same corpus, and a daemon dreaming on downtime is not in a hurry: the
+ * value is in the accumulated record, not the wall-clock. A caller who wants
+ * concurrency can run several `dreamOnce` calls themselves.
+ *
+ * Each dream samples its own scenario (unless one was supplied in `options`), so
+ * a loop naturally explores many corners of the decision-space rather than one.
+ *
+ * @throws RangeError if `count < 1`: a loop must run at least once.
+ */
+export async function dreamLoop(options: DreamLoopOptions): Promise<DreamLoopResult> {
+    if (options.count < 1) {
+        throw new RangeError(`dreamLoop: count must be ≥ 1, got ${options.count}`);
+    }
+
+    const dreams: Dream[] = [];
+    const failures: Array<{ index: number; error: unknown }> = [];
+
+    for (let i = 0; i < options.count; i++) {
+        try {
+            // Vary the dreamer per iteration so a near-deterministic provider
+            // doesn't return the same persona every time; fold any caller seed in.
+            const seed = options.seed ? `${options.seed} #${i + 1}` : `dream #${i + 1}`;
+            const dream = await dreamOnce({ ...options, seed });
+            dreams.push(dream);
+            options.onDream?.({ index: i, dream });
+        } catch (error) {
+            failures.push({ index: i, error });
+            options.onDream?.({ index: i, error });
+        }
+    }
+
+    return { dreams, failures };
 }

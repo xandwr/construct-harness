@@ -45,7 +45,7 @@ function unit(x: number, y: number): Float32Array {
 test("a fresh EventStore is migrated to SCHEMA_VERSION", () => {
     const store = freshStore();
     assert.equal(store.version, SCHEMA_VERSION);
-    assert.ok(SCHEMA_VERSION >= 4); // memory's 3 migrations + the events one
+    assert.ok(SCHEMA_VERSION >= 4); // memory's 3 migrations, the events one, the provenance overlay
     store.close();
 });
 

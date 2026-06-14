@@ -276,6 +276,37 @@ const MIGRATIONS: ReadonlyArray<{ name: string; up: (db: DatabaseSync) => void }
             `);
         },
     },
+    {
+        // The annotation overlay that makes a memory *curation over the log*
+        // rather than a second, parallel store. Each row links one memory to the
+        // event it was saved from: the turn in the transcript a fact was distilled
+        // out of. This is the table `events.ts` reserves the log's shape for: the
+        // log stays strictly content-bearing, and provenance lives here, on the
+        // memory side, where it belongs (a memory's provenance is a property of
+        // the memory, not the immutable event).
+        //
+        // The two foreign keys lean opposite directions on purpose:
+        //  - memory_id is the PRIMARY KEY (one provenance row per memory) and
+        //    CASCADEs: forget the memory and its provenance goes with it.
+        //  - event_id is ON DELETE SET NULL. The log is append-only and never
+        //    deletes in practice, so this is belt-and-braces; but if an event
+        //    ever did vanish, the memory should survive with its provenance
+        //    nulled, not be dragged down with it. A memory outranks the pointer.
+        // Both cascades need `PRAGMA foreign_keys = ON`, which both stores set.
+        name: "add memory_meta provenance overlay linking a memory to its event",
+        up(db) {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS memory_meta (
+                    memory_id INTEGER PRIMARY KEY REFERENCES memory(id) ON DELETE CASCADE,
+                    event_id  INTEGER REFERENCES events(id) ON DELETE SET NULL,
+                    created   INTEGER NOT NULL
+                );
+                -- Reverse lookup (which memories were curated from this event?)
+                -- without scanning the whole overlay.
+                CREATE INDEX IF NOT EXISTS idx_memory_meta_event ON memory_meta (event_id);
+            `);
+        },
+    },
 ];
 
 /** The schema version this build of the code expects. */
@@ -484,6 +515,10 @@ export class MemoryStore {
     private readonly deleteVecStmt;
     private readonly getVecStmt;
     private readonly missingVecStmt;
+    private readonly upsertMetaStmt;
+    private readonly getMetaStmt;
+    private readonly deleteMetaStmt;
+    private readonly memoriesFromEventStmt;
     private closed = false;
 
     constructor(options: string | StoreOptions = "db.sqlite") {
@@ -547,6 +582,24 @@ export class MemoryStore {
              WHERE v.rowid IS NULL
              ORDER BY m.created DESC
              LIMIT ?`,
+        );
+
+        // Provenance overlay: link a memory to the event it was curated from.
+        // Upsert so re-pointing a memory's provenance replaces the old link
+        // rather than erroring on the PRIMARY KEY.
+        this.upsertMetaStmt = this.db.prepare(
+            `INSERT INTO memory_meta (memory_id, event_id, created) VALUES (?, ?, ?)
+             ON CONFLICT(memory_id) DO UPDATE SET event_id = excluded.event_id`,
+        );
+        this.getMetaStmt = this.db.prepare(`SELECT event_id FROM memory_meta WHERE memory_id = ?`);
+        this.deleteMetaStmt = this.db.prepare(`DELETE FROM memory_meta WHERE memory_id = ?`);
+        // Reverse lookup: which memories were curated from a given event, newest
+        // memory first. Joins memory in so callers get full rows in one query.
+        this.memoriesFromEventStmt = this.db.prepare(
+            `SELECT m.* FROM memory_meta mm
+             JOIN memory m ON m.id = mm.memory_id
+             WHERE mm.event_id = ?
+             ORDER BY m.created DESC, m.id DESC`,
         );
     }
 
@@ -770,6 +823,70 @@ export class MemoryStore {
             (a, b) => b.score - a.score || (b.memory.importance ?? 0) - (a.memory.importance ?? 0),
         );
         return scored.slice(offset, offset + limit);
+    }
+
+    // ── Provenance overlay (curation over the log) ────────────────────────────
+    //
+    // A memory points at the event it was saved from: the turn in the transcript
+    // a fact was distilled out of. This is what makes the store *curation over
+    // the log* rather than a second, parallel store. The link lives in
+    // `memory_meta`; these methods are its whole surface. The event log itself
+    // stays annotation-free (see {@link EventStore}): provenance is a property of
+    // the memory, recorded on the memory side.
+
+    /**
+     * Record that a memory was curated from a given event. Returns false if no
+     * memory with that id exists (we won't keep an orphan provenance row).
+     *
+     * The `eventId` must reference a real row in the `events` table of the *same*
+     * database file: the foreign key enforces it, so pointing at an event that
+     * isn't there (e.g. when memory and the log live in separate files) throws a
+     * FOREIGN KEY constraint error rather than recording a dangling link. The
+     * intended layout is one shared file (see {@link EventStore}); a caller that
+     * splits them gets no provenance, which is the right failure for a pointer
+     * that can't be honored.
+     *
+     * Idempotent and re-pointable: calling again replaces the link rather than
+     * erroring, so a re-curated memory tracks the latest event it came from.
+     */
+    setProvenance(memoryId: number, eventId: number, now = Date.now()): boolean {
+        this.assertOpen();
+        if (!this.get(memoryId)) return false;
+        this.upsertMetaStmt.run(memoryId, eventId, now);
+        return true;
+    }
+
+    /**
+     * The event a memory was curated from, or undefined if it has no recorded
+     * provenance (or its event was since deleted, nulling the link). Returns the
+     * event *id*, not the event itself: the memory store doesn't hold the log, so
+     * the caller reads the row from their {@link EventStore} over the same file.
+     */
+    provenanceOf(memoryId: number): number | undefined {
+        this.assertOpen();
+        const row = this.getMetaStmt.get(memoryId) as { event_id: number | null } | undefined;
+        if (!row || row.event_id === null) return undefined;
+        return row.event_id;
+    }
+
+    /** Drop a memory's provenance link without deleting the memory. Returns
+     *  whether a row was removed. (Deleting the memory does this too, via the
+     *  memory_id CASCADE.) */
+    clearProvenance(memoryId: number): boolean {
+        this.assertOpen();
+        return this.deleteMetaStmt.run(memoryId).changes > 0;
+    }
+
+    /**
+     * The reverse lookup: every memory curated from a given event, newest first.
+     * Lets a caller go from a point in the transcript to the durable facts it
+     * produced: the curation that event earned. Empty when nothing was saved
+     * from it.
+     */
+    memoriesFromEvent(eventId: number): Memory[] {
+        this.assertOpen();
+        const rows = this.memoriesFromEventStmt.all(eventId) as unknown as MemoryRow[];
+        return rows.map(rowToMemory);
     }
 
     private query(needle: string | null, opts: QueryOptions): Memory[] {

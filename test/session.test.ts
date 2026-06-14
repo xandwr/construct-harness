@@ -10,11 +10,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { Session } from "../src/session.ts";
 import type { LoopEvent } from "../src/bridge/loop.ts";
 import type { TurnResult } from "../src/session.ts";
 import { RoleType } from "../src/types.ts";
 import { MemoryStore } from "../src/memory.ts";
+import { EventStore } from "../src/events.ts";
 import { FakeClient, callTurn, textTurn } from "./helpers/fakeClient.ts";
 
 /** Drive one send to completion, returning streamed text and the TurnResult. */
@@ -169,4 +174,184 @@ test("TurnResult carries usage and compaction accounting", async () => {
     assert.equal(result.usage.outputTokens, 2);
     assert.equal(result.compactions, 0);
     assert.equal(result.stoppedAtMaxTurns, false);
+});
+
+// ── Event log wiring ──────────────────────────────────────────────────────────
+
+test("a plain text turn appends a user message and an agent reply to the log", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        const client = new FakeClient([textTurn("hi there")]);
+        const session = new Session({ client, system: "S", events });
+
+        await send(session, "hello");
+
+        const log = events.recent({ session: session.id }).reverse();
+        assert.equal(log.length, 2);
+        assert.equal(log[0]!.kind, "message");
+        assert.equal(log[0]!.role, "user");
+        assert.equal(log[0]!.content, "hello");
+        assert.equal(log[1]!.kind, "message");
+        assert.equal(log[1]!.role, "agent");
+        assert.equal(log[1]!.content, "hi there");
+    } finally {
+        events.close();
+    }
+});
+
+test("a tool turn logs the call and its result, correlated by id", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        const client = new FakeClient([callTurn("c1", "noop", { x: 1 }), textTurn("done")]);
+        const noop = {
+            name: "noop",
+            description: "does nothing",
+            parameters: { type: "object" },
+            async run() {
+                return { ok: true };
+            },
+        };
+        const session = new Session({ client, system: "S", events, tools: [noop] });
+
+        await send(session, "go");
+
+        const log = events.recent({ session: session.id }).reverse();
+        // user message, tool_call, tool_result, agent message.
+        assert.deepEqual(
+            log.map((e) => e.kind),
+            ["message", "tool_call", "tool_result", "message"],
+        );
+        const call = log[1]!;
+        const result = log[2]!;
+        assert.equal(call.kind, "tool_call");
+        assert.equal(call.content, "noop");
+        assert.deepEqual((call.meta as { args: unknown }).args, { x: 1 });
+        // The call and its result share a correlation id so a reader can thread them.
+        assert.ok(call.correlation);
+        assert.equal(call.correlation, result.correlation);
+        assert.equal(result.kind, "tool_result");
+        assert.match(result.content, /"ok":true/);
+    } finally {
+        events.close();
+    }
+});
+
+test("transcript() reads this session's turns back in reading order", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        const client = new FakeClient([textTurn("a1"), textTurn("a2")]);
+        const session = new Session({ client, system: "S", events });
+
+        await send(session, "u1");
+        await send(session, "u2");
+
+        const transcript = session.transcript();
+        assert.deepEqual(
+            transcript.map((e) => e.content),
+            ["u1", "a1", "u2", "a2"],
+        );
+        // Survives a reset: the log keeps what the in-memory history forgot.
+        session.reset();
+        assert.equal(session.history().length, 0);
+        assert.equal(session.transcript().length, 4);
+    } finally {
+        events.close();
+    }
+});
+
+test("two sessions on one shared log stay separable by id", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        const a = new Session({ client: new FakeClient([textTurn("ra")]), system: "S", events });
+        const b = new Session({ client: new FakeClient([textTurn("rb")]), system: "S", events });
+        assert.notEqual(a.id, b.id);
+
+        await send(a, "qa");
+        await send(b, "qb");
+
+        assert.deepEqual(
+            a.transcript().map((e) => e.content),
+            ["qa", "ra"],
+        );
+        assert.deepEqual(
+            b.transcript().map((e) => e.content),
+            ["qb", "rb"],
+        );
+    } finally {
+        events.close();
+    }
+});
+
+test("a pinned sessionId resumes appending to the same transcript", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        const first = new Session({
+            client: new FakeClient([textTurn("r1")]),
+            system: "S",
+            events,
+            sessionId: "fixed",
+        });
+        await send(first, "q1");
+
+        // A second Session pinned to the same id continues the same transcript.
+        const second = new Session({
+            client: new FakeClient([textTurn("r2")]),
+            system: "S",
+            events,
+            sessionId: "fixed",
+        });
+        await send(second, "q2");
+
+        assert.deepEqual(
+            second.transcript().map((e) => e.content),
+            ["q1", "r1", "q2", "r2"],
+        );
+    } finally {
+        events.close();
+    }
+});
+
+test("no log configured: send still works and transcript is empty", async () => {
+    const client = new FakeClient([textTurn("ok")]);
+    const session = new Session({ client, system: "S" });
+    const { result } = await send(session, "hi");
+    assert.equal(result.text, "ok");
+    assert.deepEqual(session.transcript(), []);
+});
+
+test("a memory saved during a turn is linked to the prompting user event", async () => {
+    // Provenance spans both tables, so memory + log must share one db file.
+    const dir = mkdtempSync(join(tmpdir(), "session-prov-"));
+    const path = join(dir, "shared.sqlite");
+    const store = new MemoryStore(path);
+    const events = new EventStore(path);
+    try {
+        const client = new FakeClient([
+            callTurn("c1", "memory_save", { content: "user likes tea" }),
+            textTurn("noted"),
+        ]);
+        const session = new Session({ client, system: "S", store, events });
+
+        await send(session, "remember I like tea");
+
+        // The save persisted exactly one memory, and its provenance points at the
+        // user-message event that opened the turn.
+        assert.equal(store.count(), 1);
+        const saved = store.all()[0]!;
+        const eventId = store.provenanceOf(saved.id);
+        assert.ok(eventId, "saved memory has no provenance");
+        const sourceEvent = events.get(eventId!);
+        assert.equal(sourceEvent?.kind, "message");
+        assert.equal(sourceEvent?.role, "user");
+        assert.equal(sourceEvent?.content, "remember I like tea");
+        // And the reverse lookup goes from that event back to the memory.
+        assert.deepEqual(
+            store.memoriesFromEvent(eventId!).map((m) => m.content),
+            ["user likes tea"],
+        );
+    } finally {
+        events.close();
+        store.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
 });
