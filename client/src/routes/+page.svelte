@@ -21,6 +21,12 @@
 		role: 'user' | 'agent';
 		text: string;
 		tool?: string;
+		// The agent's streamed reasoning trace for this line, accumulated from
+		// `thinking` events. Rendered as a collapsible block above the reply;
+		// `thinkingOpen` tracks whether the human has expanded it. Live-only:
+		// thinking isn't persisted to the log, so replayed lines never have it.
+		thinking?: string;
+		thinkingOpen?: boolean;
 		pending?: boolean;
 		ts?: number;
 		eventId?: number;
@@ -165,6 +171,14 @@
 			case 'text':
 				reply.text += e.text;
 				break;
+			case 'thinking':
+				// Accumulate the reasoning trace. Auto-expand while it's the only
+				// thing streaming (no reply text yet) so the human sees the model
+				// working; they can collapse it, and we don't fight that choice once
+				// the answer starts arriving.
+				reply.thinking = (reply.thinking ?? '') + e.text;
+				if (reply.thinkingOpen === undefined) reply.thinkingOpen = !reply.text;
+				break;
 			case 'tool': {
 				// Note each tool as it starts; mark a failure on its end.
 				if (e.phase === 'start') {
@@ -239,6 +253,26 @@
 					{/if}
 				</span>
 				<div class="min-w-0 flex-1">
+					{#if m.thinking}
+						<!-- Collapsible reasoning trace. The summary toggles it; the body
+						     is muted and indented to read as a thought, not the answer. -->
+						<div class="mb-1">
+							<button
+								type="button"
+								onclick={() => (m.thinkingOpen = !m.thinkingOpen)}
+								class="text-faint hover:text-muted text-[10px] lowercase"
+							>
+								{m.thinkingOpen ? '▾' : '▸'} thinking
+							</button>
+							{#if m.thinkingOpen}
+								<div
+									class="text-faint mt-1 border-l border-border pl-2 text-[10px] leading-relaxed whitespace-pre-wrap italic"
+								>
+									{m.thinking}
+								</div>
+							{/if}
+						</div>
+					{/if}
 					<span class="text-text text-xs leading-relaxed whitespace-pre-wrap"
 						>{m.text}{#if m.pending}<span class="text-glow">▍</span>{/if}</span
 					>

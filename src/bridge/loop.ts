@@ -30,6 +30,12 @@ export interface RunLoopParams extends GenerateParams {
      */
     context?: ContextProvider[];
     /**
+     * Epoch-ms the conversation began, forwarded to {@link ContextProvider}s via
+     * {@link ContextScope.sessionStart} so a temporal provider can report how long
+     * the session has run. Omit for a one-shot run with no session notion.
+     */
+    sessionStart?: number;
+    /**
      * Auto-compaction: keep a long-lived conversation under the context window
      * by summarizing older turns once the estimated size crosses a threshold.
      * Omit to disable (the loop never compacts on its own). See
@@ -243,7 +249,7 @@ export async function runLoop(client: ModelClient, params: RunLoopParams): Promi
         // Fold this turn's passive context (e.g. the current time) onto the
         // outgoing messages only: `messages` itself, and so the conversation we
         // return, stays free of per-turn injected content.
-        const outgoing = applyContext(messages, context, turns);
+        const outgoing = await applyContext(messages, context, turns, params.sessionStart);
         const result = await client.generate({ ...params, messages: outgoing });
         turns++;
         final = result;
@@ -328,7 +334,7 @@ export async function* runLoopStream(
 
         yield { kind: "turn_start", turn: turns };
 
-        const outgoing = applyContext(messages, context, turns);
+        const outgoing = await applyContext(messages, context, turns, params.sessionStart);
 
         // Consume the model stream, passing its deltas straight through and
         // capturing the terminal `done` as this turn's result.

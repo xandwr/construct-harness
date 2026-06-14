@@ -27,16 +27,27 @@ import { RoleType } from "./types.ts";
 import type { Message } from "./types.ts";
 
 /**
- * What a provider sees when it's asked to contribute. Deliberately minimal: the
- * conversation so far (read-only) and the turn index. Providers that need the
- * wall clock read it themselves: passing a frozen "now" in here would defeat
- * the whole point for temporal providers, which must observe time advancing.
+ * What a provider sees when it's asked to contribute. Kept lean: the
+ * conversation so far (read-only), the turn index, and an optional session-start
+ * timestamp. Providers that need the wall clock read it themselves: passing a
+ * frozen "now" in here would defeat the whole point for temporal providers,
+ * which must observe time advancing. `sessionStart` is the exception — it's a
+ * *fixed* reference point (when the conversation began), so it's safe to pass in,
+ * and a provider can't recover it from `messages` alone once early turns are
+ * compacted away.
  */
 export interface ContextScope {
     /** The conversation as it stands this turn, oldest first. Read-only. */
     readonly messages: readonly Message[];
     /** 0-based index of the model turn about to run (0 = first call). */
     readonly turn: number;
+    /**
+     * Epoch-ms the conversation began, when the caller knows it (a Session passes
+     * its own start). Lets a provider report how long the session has run without
+     * relying on the first message's timestamp, which compaction may have dropped.
+     * Undefined when the caller doesn't track it.
+     */
+    readonly sessionStart?: number;
 }
 
 /**
@@ -57,21 +68,26 @@ export interface ContextContribution {
 }
 
 /**
- * A passive context provider: pure, synchronous, named. Returning `undefined`
- * means "nothing to add this turn" and is distinct from returning empty text:
- * it lets a provider stay silent when it has nothing relevant (e.g. a provider
- * gated on conversation state).
+ * A passive context provider: pure, named, evaluated before every turn.
+ * Returning `undefined` means "nothing to add this turn" and is distinct from
+ * returning empty text: it lets a provider stay silent when it has nothing
+ * relevant (e.g. a provider gated on conversation state).
  *
- * Kept synchronous on purpose: passive context is evaluated on the hot path
- * before *every* turn, so it must not block on I/O. Anything that needs a
- * network or disk read belongs in a tool or in the one-time system build, not
- * here.
+ * `contribute` may be synchronous (return the contribution directly) or async
+ * (return a promise the loop awaits). Synchronous is the common, cheapest case —
+ * the temporal provider just reads the clock — and stays the default. Async
+ * exists for the provider that must read a store to know what to inject (an
+ * agent's open goals, say); keep that read fast and indexed, because it sits on
+ * the hot path ahead of *every* model turn. Anything heavier than a single keyed
+ * lookup belongs in a tool or the one-time system build, not here.
  */
 export interface ContextProvider {
     /** Stable identifier, for logging and so the same provider is recognizable
      *  across turns. */
     readonly name: string;
-    contribute(scope: ContextScope): ContextContribution | undefined;
+    contribute(
+        scope: ContextScope,
+    ): ContextContribution | undefined | Promise<ContextContribution | undefined>;
 }
 
 /**
@@ -84,22 +100,44 @@ export interface ContextProvider {
  * contributions are appended after the conversation so they sit closest to the
  * model's next turn, where standing reminders are most effective.
  *
- * Empty / whitespace-only system text is dropped so a provider returning `""`
- * doesn't inject a blank system turn.
+ * Async because a provider may read a store to decide what to inject. Providers
+ * run concurrently (they're independent), but their contributions are folded in
+ * *provider order*, not completion order, so the system-text join is stable turn
+ * to turn regardless of which lookup finished first. A provider that throws is
+ * dropped for this turn rather than failing the turn: passive context is an
+ * enhancement, never a gate on the conversation (mirrors the Session's
+ * best-effort logging). Empty / whitespace-only system text is dropped so a
+ * provider returning `""` doesn't inject a blank system turn.
+ *
+ * `sessionStart`, when given, is threaded into the {@link ContextScope} so a
+ * temporal provider can report session duration.
  */
-export function applyContext(
+export async function applyContext(
     messages: readonly Message[],
     providers: readonly ContextProvider[],
     turn: number,
-): Message[] {
+    sessionStart?: number,
+): Promise<Message[]> {
     if (providers.length === 0) return [...messages];
 
-    const scope: ContextScope = { messages, turn };
+    const scope: ContextScope = { messages, turn, sessionStart };
+
+    // Run every provider, swallowing a single provider's failure to a `null`
+    // contribution so one bad provider can't take down the turn. Order is
+    // preserved by `Promise.all` resolving the array positionally.
+    const contributions = await Promise.all(
+        providers.map(async (provider) => {
+            try {
+                return (await provider.contribute(scope)) ?? null;
+            } catch {
+                return null;
+            }
+        }),
+    );
+
     const systemTexts: string[] = [];
     const injected: Message[] = [];
-
-    for (const provider of providers) {
-        const contribution = provider.contribute(scope);
+    for (const contribution of contributions) {
         if (!contribution) continue;
         if (contribution.system && contribution.system.trim()) {
             systemTexts.push(contribution.system);
@@ -137,6 +175,44 @@ export interface TemporalOptions {
     /** Locale for formatting. Defaults to `"en-US"` for stable, readable output
      *  independent of the host's locale. */
     locale?: string;
+    /**
+     * Also state how long since the previous turn and how long the session has
+     * run, when those are derivable (a prior message timestamp; a
+     * {@link ContextScope.sessionStart}). On by default — it's the cheap part of
+     * temporal awareness, and the thing the bare wall-clock can't give the model.
+     * Set false for just the absolute date/time.
+     */
+    elapsed?: boolean;
+}
+
+/** Render a millisecond span as a short, human relative phrase ("3 days", "an
+ *  hour", "just now"). Coarse on purpose: the model reasons about scale, not
+ *  precision, and a stable phrasing keeps the cached prefix from churning every
+ *  second. Always non-negative; a clock skew that yields a negative span reads as
+ *  "just now". */
+export function humanizeDuration(ms: number): string {
+    const s = Math.max(0, Math.round(ms / 1000));
+    if (s < 45) return "just now";
+    const mins = Math.round(s / 60);
+    if (mins < 60) return mins <= 1 ? "a minute" : `${mins} minutes`;
+    const hours = Math.round(mins / 60);
+    if (hours < 24) return hours <= 1 ? "an hour" : `${hours} hours`;
+    const days = Math.round(hours / 24);
+    if (days < 7) return days <= 1 ? "a day" : `${days} days`;
+    const weeks = Math.round(days / 7);
+    if (days < 30) return weeks <= 1 ? "a week" : `${weeks} weeks`;
+    const months = Math.round(days / 30);
+    if (days < 365) return months <= 1 ? "a month" : `${months} months`;
+    const years = Math.round(days / 365);
+    return years <= 1 ? "a year" : `${years} years`;
+}
+
+/** The newest message timestamp in a turn's scope, or undefined when there are
+ *  no messages yet (turn 0 of a fresh conversation). Reads the last entry: the
+ *  conversation is oldest-first, so the tail is the most recent thing said. */
+function lastMessageTime(messages: readonly Message[]): number | undefined {
+    const last = messages[messages.length - 1];
+    return last?.timestamp;
 }
 
 /** Resolve the host's local IANA timezone, with a hard fallback to UTC if the
@@ -165,6 +241,7 @@ function hostTimeZone(): string {
 export function temporalContext(options: TemporalOptions = {}): ContextProvider {
     const locale = options.locale ?? "en-US";
     const requested = options.timeZone ?? hostTimeZone();
+    const elapsed = options.elapsed ?? true;
 
     // Probe the requested zone once; fall back to the host default if it's not a
     // zone the runtime recognizes. Doing this here (not per turn) keeps the hot
@@ -179,11 +256,33 @@ export function temporalContext(options: TemporalOptions = {}): ContextProvider 
 
     return {
         name: "temporal",
-        contribute() {
-            const now = formatter.format(new Date());
-            return {
-                system: `The current date and time in the user's timezone (${timeZone}) is ${now}.`,
-            };
+        contribute(scope) {
+            const nowMs = Date.now();
+            const lines = [
+                `The current date and time in the user's timezone (${timeZone}) is ${formatter.format(new Date(nowMs))}.`,
+            ];
+            if (elapsed) {
+                // Time since the previous turn: lets the model tell a follow-up a
+                // few seconds later from one resumed after a long gap. Skipped on
+                // the opening turn (nothing came before it).
+                const last = lastMessageTime(scope.messages);
+                if (last !== undefined && nowMs - last >= 0) {
+                    const ago = humanizeDuration(nowMs - last);
+                    if (ago !== "just now") {
+                        lines.push(`The previous message was ${ago} ago.`);
+                    }
+                }
+                // How long this conversation has been going, when the caller
+                // tracks its start. Orientation for "earlier today" vs a session
+                // spanning days.
+                if (scope.sessionStart !== undefined && nowMs - scope.sessionStart >= 0) {
+                    const dur = humanizeDuration(nowMs - scope.sessionStart);
+                    if (dur !== "just now") {
+                        lines.push(`This conversation has been running for ${dur}.`);
+                    }
+                }
+            }
+            return { system: lines.join("\n") };
         },
     };
 }

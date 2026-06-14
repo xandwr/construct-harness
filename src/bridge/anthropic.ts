@@ -36,6 +36,16 @@ const DEFAULT_STREAM_MAX_TOKENS = 64_000; // streaming: room to think + act
  * `ProviderOptions`. The harness sets these only after checking
  * {@link ANTHROPIC_CAPABILITIES}.
  */
+/**
+ * The provider-hosted tools the model can run server-side, with no `run` of ours
+ * to dispatch: Anthropic executes them and folds the result into the same
+ * assistant turn (the stop reason stays `end_turn`, so the loop never tries to
+ * run them). The friendly names here map to the dated tool blocks the SDK ships
+ * (see {@link SERVER_TOOL_BLOCKS}); the harness sets {@link AnthropicOptions.serverTools}
+ * only after checking {@link ANTHROPIC_CAPABILITIES.serverTools}.
+ */
+export type ServerToolName = "web_search" | "web_fetch" | "code_execution";
+
 export interface AnthropicOptions {
     /** Reasoning depth / spend. Maps to `output_config.effort`. */
     effort?: "low" | "medium" | "high" | "xhigh" | "max";
@@ -45,21 +55,58 @@ export interface AnthropicOptions {
     thinkingDisplay?: boolean;
     /** Cache the system prompt prefix across requests. */
     cacheSystem?: boolean;
+    /**
+     * Provider-hosted tools to enable for the request (web search, web fetch,
+     * code execution). These run server-side: Anthropic executes them and returns
+     * the result inline, so unlike a custom {@link ToolDef} there is no `run` and
+     * the agentic loop never dispatches them. Omit or pass `[]` for none. Gated by
+     * {@link ANTHROPIC_CAPABILITIES.serverTools}.
+     */
+    serverTools?: ServerToolName[];
 }
 
 export const ANTHROPIC_CAPABILITIES: ProviderCapabilities = {
     thinking: true,
     effort: true,
     promptCaching: true,
-    // Anthropic the *provider* hosts server-side tools (web search, code
-    // execution), but this client does not wire them yet: toAnthropicTools only
-    // emits custom {name, description, input_schema} tools, and AnthropicOptions
-    // exposes no server-tool knob. Every other flag here maps to something the
-    // client actually does, so we keep this one honest and false until the
-    // wiring exists. Flip it the same commit that emits a server-tool block.
-    serverTools: false,
+    // Anthropic hosts tools server-side (web search, web fetch, code execution);
+    // we emit the dated tool blocks for them when AnthropicOptions.serverTools
+    // asks (see toServerTools / buildRequest). The model runs them in-turn, so
+    // the loop never dispatches a `run` for them.
+    serverTools: true,
     streaming: true,
 };
+
+/**
+ * Map each friendly {@link ServerToolName} to the dated SDK tool block to emit.
+ * Pinned to the newest version this SDK exposes; bump these in lockstep with an
+ * SDK upgrade. A `name` the model sees plus a versioned `type` is all the API
+ * needs to host the tool.
+ */
+const SERVER_TOOL_BLOCKS: Record<ServerToolName, Anthropic.ToolUnion> = {
+    web_search: { name: "web_search", type: "web_search_20260209" },
+    web_fetch: { name: "web_fetch", type: "web_fetch_20260309" },
+    code_execution: { name: "code_execution", type: "code_execution_20260120" },
+};
+
+/** Build the server-tool blocks for the requested tools, de-duplicated and in a
+ *  stable order, or undefined when none were asked for. Unknown names are skipped
+ *  defensively (the option is typed, but providerOptions is opaque upstream). */
+export function toServerTools(
+    names: ServerToolName[] | undefined,
+): Anthropic.ToolUnion[] | undefined {
+    if (!names?.length) return undefined;
+    const seen = new Set<ServerToolName>();
+    const out: Anthropic.ToolUnion[] = [];
+    for (const name of names) {
+        const block = SERVER_TOOL_BLOCKS[name];
+        if (block && !seen.has(name)) {
+            seen.add(name);
+            out.push(block);
+        }
+    }
+    return out.length ? out : undefined;
+}
 
 // ── Core → Anthropic ────────────────────────────────────────────────────────
 
@@ -367,8 +414,11 @@ export class AnthropicClient implements ModelClient {
                 : system;
         }
 
-        const tools = toAnthropicTools(params.tools);
-        if (tools) req.tools = tools;
+        // Custom tools (ours, dispatched by the loop) and provider-hosted server
+        // tools (run by Anthropic in-turn) share the one `tools` array.
+        const custom = toAnthropicTools(params.tools);
+        const server = toServerTools(opts.serverTools);
+        if (custom || server) req.tools = [...(custom ?? []), ...(server ?? [])];
 
         if (opts.thinking) {
             req.thinking = {

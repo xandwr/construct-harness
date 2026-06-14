@@ -16,10 +16,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 
-import { createHandler } from "../src/server.ts";
+import { createHandler, resolveServerTools } from "../src/server.ts";
 import { Session } from "../src/session.ts";
 import { MemoryStore, Memory } from "../src/memory.ts";
 import { EventStore } from "../src/events.ts";
+import { GoalStore } from "../src/goals.ts";
 import { FakeClient, textTurn, callTurn } from "./helpers/fakeClient.ts";
 
 /** A captured response: status, headers, and the concatenated body. For SSE the
@@ -105,13 +106,16 @@ function postReq(url: string, body: string): any {
 function makeDeps(client: FakeClient) {
     const store = new MemoryStore(":memory:");
     const events = new EventStore(":memory:");
-    const session = new Session({ client, system: "be brief", store, events });
+    const goals = new GoalStore(":memory:");
+    const session = new Session({ client, system: "be brief", store, events, goals });
     return {
         store,
         events,
+        goals,
         session,
         close() {
             events.close();
+            goals.close();
             store.close();
         },
     };
@@ -210,6 +214,38 @@ test("POST /api/chat streams SSE frames and persists the turn to the log", async
     deps.close();
 });
 
+test("POST /api/chat forwards the model's thinking trace as `thinking` frames", async () => {
+    // A scripted turn that thinks before answering. The FakeClient streams the
+    // thinking as a delta; the server must relay it as a `thinking` SSE frame
+    // ahead of the text, and it must never appear in the persisted log (thinking
+    // isn't a content part).
+    const deps = makeDeps(
+        new FakeClient([
+            { content: [{ kind: "text", text: "42." }], thinking: "let me work it out" },
+        ]),
+    );
+    const handle = createHandler(deps);
+    const { res, captured } = fakeRes();
+
+    await handle(postReq("/api/chat", JSON.stringify({ message: "the answer?" })), res);
+
+    const frames = captured.frames();
+    const thinking = frames
+        .filter((f) => f.event === "thinking")
+        .map((f) => (f.data as { text: string }).text)
+        .join("");
+    assert.equal(thinking, "let me work it out");
+    // The thinking frame precedes the text frame in the stream.
+    const kinds = frames.map((f) => f.event);
+    assert.ok(kinds.indexOf("thinking") < kinds.indexOf("text"), "thinking should stream first");
+
+    // Reasoning is ephemeral: the log holds the reply, never the trace.
+    const logged = deps.events.recent({ session: deps.session.id }).map((e) => e.content);
+    assert.ok(!logged.some((c) => /work it out/.test(c)), "thinking must not be persisted");
+
+    deps.close();
+});
+
 test("a tool turn surfaces tool frames and the conversation appears in /api/sessions", async () => {
     // A turn that calls memory_recall, then replies. The FakeClient's callTurn
     // requests the tool; the Session runs it and feeds the result back.
@@ -233,4 +269,25 @@ test("a tool turn surfaces tool frames and the conversation appears in /api/sess
     assert.ok(mine.count > 0);
 
     deps.close();
+});
+
+// ── Server-tool resolution ──────────────────────────────────────────────────
+
+test("resolveServerTools defaults to live web access when unset", () => {
+    assert.deepEqual(resolveServerTools(undefined), ["web_search", "web_fetch"]);
+});
+
+test("resolveServerTools disables tools on 'none' or empty", () => {
+    assert.deepEqual(resolveServerTools("none"), []);
+    assert.deepEqual(resolveServerTools(""), []);
+    assert.deepEqual(resolveServerTools("  "), []);
+});
+
+test("resolveServerTools parses an explicit comma-separated set", () => {
+    assert.deepEqual(resolveServerTools("web_search,code_execution"), [
+        "web_search",
+        "code_execution",
+    ]);
+    // Whitespace and case are tolerated; an unknown name is dropped, not fatal.
+    assert.deepEqual(resolveServerTools(" Web_Search , bogus "), ["web_search"]);
 });

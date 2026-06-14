@@ -20,6 +20,7 @@ import type { TurnResult } from "../src/session.ts";
 import { RoleType } from "../src/types.ts";
 import { MemoryStore } from "../src/memory.ts";
 import { EventStore } from "../src/events.ts";
+import { GoalStore } from "../src/goals.ts";
 import { FakeClient, callTurn, textTurn } from "./helpers/fakeClient.ts";
 
 /** Drive one send to completion, returning streamed text and the TurnResult. */
@@ -254,6 +255,114 @@ test("transcript() reads this session's turns back in reading order", async () =
         session.reset();
         assert.equal(session.history().length, 0);
         assert.equal(session.transcript().length, 4);
+    } finally {
+        events.close();
+    }
+});
+
+// ── Goal wiring ────────────────────────────────────────────────────────────
+
+test("a goal store wires goal tools and injects active goals each turn", async () => {
+    const goals = new GoalStore(":memory:");
+    try {
+        // Turn 1: the model sets a goal. Turn 2: it replies. The goal it set this
+        // turn is scoped to the session and then stands in the system prompt.
+        const client = new FakeClient([
+            callTurn("c1", "goal_set", { content: "finish the audit" }),
+            textTurn("on it"),
+        ]);
+        const session = new Session({ client, system: "S", goals });
+
+        await send(session, "please finish the audit");
+
+        // The goal landed, scoped to this Session's id.
+        const stored = goals.list({ session: session.id });
+        assert.equal(stored.length, 1);
+        assert.equal(stored[0]!.content, "finish the audit");
+
+        // On the next turn, goalContext injects it: assert via the system prompt
+        // the loop builds. We can observe it by sending again and checking the
+        // client saw a system turn naming the goal.
+        const client2 = new FakeClient([textTurn("still on it")]);
+        const s2 = new Session({ client: client2, system: "S", goals, sessionId: session.id });
+        await send(s2, "status?");
+        const sentSystem = client2.calls
+            .flatMap((c) => c.messages)
+            .filter((m) => m.sender.role === RoleType.System)
+            .flatMap((m) => m.content)
+            .map((p) => (p.kind === "text" ? p.text : ""))
+            .join("\n");
+        assert.match(sentSystem, /active goals/i);
+        assert.match(sentSystem, /finish the audit/);
+    } finally {
+        goals.close();
+    }
+});
+
+test("a log wires transcript_recall, scoped to this session's own turns", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        // Session A records a turn; Session B (sharing the log) recalls and must
+        // see only its own transcript, not A's.
+        const a = new Session({
+            client: new FakeClient([textTurn("we picked sqlite")]),
+            system: "S",
+            events,
+        });
+        await send(a, "what storage?");
+
+        const b = new Session({
+            client: new FakeClient([callTurn("c1", "transcript_recall", {}), textTurn("checked")]),
+            system: "S",
+            events,
+        });
+        const gen = b.send("recall my history");
+        let toolPayload: { count: number; events: { content: string }[] } | undefined;
+        let next = await gen.next();
+        while (!next.done) {
+            const e: LoopEvent = next.value;
+            if (e.kind === "tool_end" && e.name === "transcript_recall") {
+                toolPayload = e.result as { count: number; events: { content: string }[] };
+            }
+            next = await gen.next();
+        }
+        // B's transcript holds only its own turn so far (its user message, plus
+        // the in-flight tool_call logged before the tool ran). Crucially, A's
+        // "we picked sqlite" turn is invisible: recall is scoped to B's session.
+        assert.ok(toolPayload, "transcript_recall did not run");
+        assert.ok(
+            !toolPayload!.events.some((e) => /sqlite/.test(e.content)),
+            "recall leaked another session's turns",
+        );
+        assert.ok(
+            toolPayload!.events.some((e) => /recall my history/.test(e.content)),
+            "recall should see this session's own user message",
+        );
+    } finally {
+        events.close();
+    }
+});
+
+test("transcriptRecall: false withholds the tool; no log means no tool", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        // With a log but the flag off, the model calling transcript_recall hits
+        // the loop's "No such tool" path rather than a registered handler.
+        const off = new Session({
+            client: new FakeClient([callTurn("c1", "transcript_recall", {}), textTurn("done")]),
+            system: "S",
+            events,
+            transcriptRecall: false,
+        });
+        const gen = off.send("go");
+        let errored = false;
+        let next = await gen.next();
+        while (!next.done) {
+            const e: LoopEvent = next.value;
+            if (e.kind === "tool_end" && e.name === "transcript_recall") errored = e.isError;
+            next = await gen.next();
+        }
+        assert.ok(errored, "withheld tool should resolve as an error result");
     } finally {
         events.close();
     }

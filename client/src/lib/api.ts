@@ -203,6 +203,7 @@ export function deleteNote(uuid: string, fetchFn?: typeof fetch): Promise<{ dele
 export type ChatEvent =
     | { kind: "open"; session: string }
     | { kind: "text"; text: string }
+    | { kind: "thinking"; text: string }
     | { kind: "tool"; phase: "start" | "end"; name: string; args?: unknown; isError?: boolean }
     | { kind: "compacted"; turn: number }
     | {
@@ -295,6 +296,8 @@ function parseFrame(frame: string): ChatEvent | null {
             return { kind: "open", session: String(payload.session) };
         case "text":
             return { kind: "text", text: String(payload.text) };
+        case "thinking":
+            return { kind: "thinking", text: String(payload.text) };
         case "tool":
             return {
                 kind: "tool",

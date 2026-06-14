@@ -27,6 +27,18 @@ substring, then importance order. If the embedding service is down, recall
 quietly falls back to lexical instead of failing a turn. See
 [`src/memory.ts`](src/memory.ts) and [`src/memoryTools.ts`](src/memoryTools.ts).
 
+**A Construct that knows where it is.** Beyond memory, a waking Construct gets a
+working sense of its situation: the current time _and_ how long since the last
+turn and how long the session has run ([`src/context.ts`](src/context.ts)); a
+`transcript_recall` tool to search its own durable event log, not just the
+in-context window ([`src/eventTools.ts`](src/eventTools.ts)); goals it sets and
+holds across turns, injected into every prompt so it doesn't drift from the task
+([`src/goals.ts`](src/goals.ts), [`src/goalTools.ts`](src/goalTools.ts)); and
+provider-hosted web search / fetch / code execution it can run server-side
+([`src/bridge/anthropic.ts`](src/bridge/anthropic.ts)). Its reasoning trace
+streams through to the UI as a collapsible block. None of this is auto-magic: each
+is a tool or a passive context provider you opt into when wiring the `Session`.
+
 **An adversarial critic panel with stakes.** This is the part with no shipped
 equivalent we have found, and the reason the project exists. A reviewer agent
 that has been told to "be blunt" still drifts toward the average, agreeable
@@ -163,10 +175,16 @@ arrows only ever point inward.
   allowed to import an SDK. Adding a second provider means a second file like it.
 - [`src/memory.ts`](src/memory.ts), [`src/embeddings.ts`](src/embeddings.ts),
   [`src/memoryTools.ts`](src/memoryTools.ts): storage, vectors, and the tools and
-  passive recall that bridge memory into a run.
+  passive recall that bridge memory into a run. The same SQLite file, one
+  migration runner, also holds the append-only event log
+  ([`src/events.ts`](src/events.ts), [`src/eventTools.ts`](src/eventTools.ts)) and
+  the goal store ([`src/goals.ts`](src/goals.ts),
+  [`src/goalTools.ts`](src/goalTools.ts)).
 - [`src/context.ts`](src/context.ts), [`src/compaction.ts`](src/compaction.ts),
-  [`src/usage.ts`](src/usage.ts): per-turn context (the current time, for one),
-  summarizing old turns to stay under the window, and token accounting.
+  [`src/usage.ts`](src/usage.ts): per-turn passive context (the time, elapsed and
+  session duration, active goals), summarizing old turns to stay under the window,
+  and token accounting. A context provider may be async, so it can read a store to
+  decide what to inject.
 - [`src/session.ts`](src/session.ts): the stateful thing a person talks to.
 - [`src/orchestrate.ts`](src/orchestrate.ts), [`src/critics.ts`](src/critics.ts):
   driving Constructs without a human in the seat, and judging their work.
@@ -204,8 +222,11 @@ project is trying not to be.
 - **Argument validation is shallow.** The loop checks a tool call's top-level
   shape (object-ness and required keys), not a full JSON Schema. The tool stays
   the final authority on its own input.
-- **Transcripts are in memory.** Conversation history lives for the life of the
-  process. Only saved memories persist across runs.
+- **The live conversation is in memory; the transcript is not.** A Session's
+  in-process history lives for the life of the process, but when an event log is
+  wired (the server always does) every turn is appended to durable SQLite, so it
+  outlives the process and the Construct can search it with `transcript_recall`.
+  Saved memories and goals persist the same way.
 - **The decorrelation claim is unmeasured.** See the note under the critic panel
   above.
 

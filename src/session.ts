@@ -21,6 +21,9 @@ import type { ContextProvider } from "./context.ts";
 import { temporalContext } from "./context.ts";
 import { MemoryStore } from "./memory.ts";
 import { memoryTools, recallContext } from "./memoryTools.ts";
+import { eventTools } from "./eventTools.ts";
+import { goalTools, goalContext } from "./goalTools.ts";
+import { GoalStore } from "./goals.ts";
 import type { Embedder } from "./embeddings.ts";
 import { EventStore } from "./events.ts";
 import type { Event, EventInput } from "./events.ts";
@@ -53,6 +56,24 @@ export interface SessionConfig {
      * recalling) an earlier conversation's transcript.
      */
     sessionId?: string;
+    /**
+     * Give the model a `transcript_recall` tool over its own {@link events} log,
+     * so it can introspect its past (what happened earlier, whether a tool already
+     * ran) beyond the in-context history. Scoped to this Session's transcript by
+     * default. Defaults to `true` when an `events` log is configured; pass `false`
+     * to withhold the tool (the log still records the turn either way). No-op
+     * without `events`: there's nothing to recall.
+     */
+    transcriptRecall?: boolean;
+    /**
+     * Goal store. When given, the model gets goal_set/update/list tools and each
+     * turn injects this session's *active* goals into the system prompt, so the
+     * Construct holds its intent across turns. Goals are scoped to this Session's
+     * {@link sessionId}. Omit for a goal-less Session. Only the default context
+     * provider list picks up the goal injection; passing your own `context`
+     * replaces it (add {@link goalContext} yourself if you want both).
+     */
+    goals?: GoalStore;
     /** Embedder for semantic recall. Only meaningful alongside `store`. */
     embedder?: Embedder;
     /** Passive context providers. Defaults to a single temporal provider so the
@@ -100,6 +121,12 @@ export class Session {
     private readonly events?: EventStore;
     /** The id under which this Session's events are grouped in {@link events}. */
     private readonly sessionId: string;
+    /** Epoch-ms this conversation began, forwarded to context providers so a
+     *  temporal provider can report session duration. For a resumed Session
+     *  (pinned id with an existing transcript) this is the earliest logged event's
+     *  time, so "running for 2 days" reflects the real conversation, not this
+     *  process's uptime; otherwise it's construction time. */
+    private readonly startedAt: number;
     /** The durable conversation: user/assistant/tool turns only. The system
      *  turn is rebuilt per send (recall is turn-relevant), so it is NOT stored
      *  here; it's prepended at send time and never persisted. */
@@ -107,12 +134,47 @@ export class Session {
 
     constructor(config: SessionConfig) {
         this.cfg = config;
-        // A store contributes its memory tools; the model's own tools come after.
-        const memTools = config.store ? memoryTools(config.store, config.embedder) : [];
-        this.tools = [...memTools, ...(config.tools ?? [])];
-        this.context = config.context ?? [temporalContext()];
         this.events = config.events;
         this.sessionId = config.sessionId ?? freshSessionId();
+        // A store contributes its memory tools; an event log can contribute the
+        // transcript tool (scoped to this Session); the model's own tools come
+        // last. transcript_recall is on by default whenever a log is present.
+        const memTools = config.store ? memoryTools(config.store, config.embedder) : [];
+        const txTools =
+            this.events && config.transcriptRecall !== false
+                ? eventTools(this.events, {
+                      sessionId: this.sessionId,
+                      embedder: config.embedder,
+                  })
+                : [];
+        const goTools = config.goals ? goalTools(config.goals, this.sessionId) : [];
+        this.tools = [...memTools, ...txTools, ...goTools, ...(config.tools ?? [])];
+        // Default context: the temporal provider, plus a goal provider when a goal
+        // store is configured so active goals stand in front of the model each
+        // turn. A caller-supplied `context` replaces this whole list.
+        this.context = config.context ?? [
+            temporalContext(),
+            ...(config.goals ? [goalContext(config.goals, this.sessionId)] : []),
+        ];
+        this.startedAt = this.resolveStart();
+    }
+
+    /** When this conversation began: the earliest event already in the log under
+     *  this Session's id (a resume), else now (a fresh Session). Best-effort —
+     *  a log read failure falls back to now rather than breaking construction. */
+    private resolveStart(): number {
+        const now = Date.now();
+        if (!this.events) return now;
+        try {
+            // The oldest event for this session, if any. `recent` is newest-first
+            // and capped, so for a long transcript this is the oldest *within the
+            // page* — close enough for a coarse "running for N days" phrasing.
+            const turns = this.events.recent({ session: this.sessionId });
+            const earliest = turns.length ? turns[turns.length - 1]!.ts : now;
+            return Math.min(earliest, now);
+        } catch {
+            return now;
+        }
     }
 
     /** The id this Session's events are grouped under in the log. Read it to
@@ -195,6 +257,7 @@ export class Session {
             messages: startMessages,
             tools: this.tools.length ? this.tools : undefined,
             context: this.context,
+            sessionStart: this.startedAt,
             compaction: this.cfg.compaction,
             maxTurns: this.cfg.maxTurns,
             providerOptions: this.cfg.providerOptions,

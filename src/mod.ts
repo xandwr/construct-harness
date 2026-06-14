@@ -29,6 +29,9 @@ export * from "./memory.ts";
 export * from "./embeddings.ts";
 export * from "./events.ts";
 export * from "./memoryTools.ts";
+export * from "./eventTools.ts";
+export * from "./goals.ts";
+export * from "./goalTools.ts";
 
 // The knowledge base: a markdown frontmatter (de)serializer, the notes store
 // (a separate corpus linked to memory), the two-way file sync engine, and the

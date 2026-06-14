@@ -27,11 +27,12 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { AnthropicClient } from "./bridge/anthropic.ts";
+import { AnthropicClient, type ServerToolName } from "./bridge/anthropic.ts";
 import { HarnessError, type ErrorKind } from "./bridge/errors.ts";
 import type { ModelClient } from "./bridge/types.ts";
 import { MemoryStore } from "./memory.ts";
 import { EventStore, type Event } from "./events.ts";
+import { GoalStore } from "./goals.ts";
 import { OpenAIEmbedder, EmbeddingError, type Embedder } from "./embeddings.ts";
 import { Session } from "./session.ts";
 import type { LoopEvent } from "./bridge/loop.ts";
@@ -42,10 +43,15 @@ import { noteTools } from "./noteTools.ts";
 const BASE_SYSTEM =
     "You are a helpful, concise assistant: a long-lived Construct that remembers " +
     "across conversations. Save durable facts and preferences with memory_save, and " +
-    "recall them with memory_recall. Don't save transient chatter. For longer-form " +
-    "documentation the human also edits (runbooks, references, design notes), use the " +
-    "knowledge base: note_save / note_update to write, note_recall to read it when " +
-    "relevant, note_link to relate a note to a memory or another note.";
+    "recall them with memory_recall. Don't save transient chatter. When the human " +
+    "gives you a task worth holding across turns, track it with goal_set and mark it " +
+    "goal_update done when achieved; your active goals are shown to you each turn. To " +
+    "look back over what actually happened earlier in this conversation (past " +
+    "messages, whether a tool already ran, what was decided), search your transcript " +
+    "with transcript_recall. For longer-form documentation the human also edits (runbooks, " +
+    "references, design notes), use the knowledge base: note_save / note_update to " +
+    "write, note_recall to read it when relevant, note_link to relate a note to a " +
+    "memory or another note.";
 
 /** Compaction threshold (estimated tokens), well below the model's real window
  *  so there's headroom for the next turn. Overridable via COMPACT_AT. */
@@ -61,6 +67,7 @@ const DEFAULT_PAGE = 100;
 interface ServerDeps {
     store: MemoryStore;
     events: EventStore;
+    goals: GoalStore;
     session: Session;
     notes?: NotesService;
     notesStore?: NotesStore;
@@ -70,6 +77,39 @@ interface ServerDeps {
 
 /** Where the knowledge-base markdown folder lives, mirroring MEMORY_DB. */
 const DEFAULT_KB_DIR = "kb";
+
+/** The provider-hosted tools enabled by default: live web access so the Construct
+ *  can answer about the current world. Code execution is opt-in (it spins up a
+ *  sandbox and bills accordingly), so it's left out of the default set. */
+const DEFAULT_SERVER_TOOLS: ServerToolName[] = ["web_search", "web_fetch"];
+
+/** The full set a caller may name in SERVER_TOOLS, for validation. */
+const KNOWN_SERVER_TOOLS: ServerToolName[] = ["web_search", "web_fetch", "code_execution"];
+
+/**
+ * Resolve which provider-hosted tools to enable from the `SERVER_TOOLS` env var.
+ * Unset uses {@link DEFAULT_SERVER_TOOLS} (web access on). A comma-separated list
+ * picks an explicit set (e.g. `web_search,code_execution`); `none` (or an empty
+ * value) disables them entirely. Unknown names are dropped with a warning so a
+ * typo degrades to fewer tools rather than a crash.
+ */
+export function resolveServerTools(raw: string | undefined): ServerToolName[] {
+    if (raw === undefined) return DEFAULT_SERVER_TOOLS;
+    const trimmed = raw.trim().toLowerCase();
+    if (trimmed === "" || trimmed === "none") return [];
+    const out: ServerToolName[] = [];
+    for (const part of trimmed
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)) {
+        if ((KNOWN_SERVER_TOOLS as string[]).includes(part)) {
+            out.push(part as ServerToolName);
+        } else {
+            console.warn(`SERVER_TOOLS: ignoring unknown tool "${part}"`);
+        }
+    }
+    return out;
+}
 
 /**
  * Construct the cloud embedder when an OpenAI key is configured, else undefined
@@ -108,8 +148,10 @@ function buildDeps(): ServerDeps {
     const dbPath = process.env.MEMORY_DB ?? "db.sqlite";
     const store = new MemoryStore(dbPath);
     const events = new EventStore(dbPath);
+    const goals = new GoalStore(dbPath);
     const embedder = makeEmbedder();
     const compactAt = Number(process.env.COMPACT_AT) || DEFAULT_COMPACT_AT;
+    const serverTools = resolveServerTools(process.env.SERVER_TOOLS);
 
     // The knowledge base shares the same database file (one schema, one migration
     // runner) and a markdown folder on disk. The NotesService starts its watcher
@@ -125,12 +167,23 @@ function buildDeps(): ServerDeps {
         system: BASE_SYSTEM,
         store,
         events,
+        goals,
         embedder,
         // The agent opts into the KB: it gets the note tools (save/update/recall/
         // link) but notes are not auto-injected into context the way memories are.
         tools: noteTools(notes, notesStore, embedder),
         compaction: { thresholdTokens: compactAt },
-        providerOptions: { cacheSystem: true },
+        // Cache the system prefix; turn on adaptive thinking with a summarized
+        // display so the streaming path emits readable `thinking` deltas the
+        // client can show (see streamChat); and give the Construct provider-hosted
+        // web access (search + fetch) so it can answer about the live world. The
+        // model runs these server-side, so there's no tool loop to drive them.
+        providerOptions: {
+            cacheSystem: true,
+            thinking: true,
+            thinkingDisplay: true,
+            serverTools,
+        },
     });
 
     notes
@@ -145,6 +198,7 @@ function buildDeps(): ServerDeps {
     return {
         store,
         events,
+        goals,
         session,
         notes,
         notesStore,
@@ -156,6 +210,7 @@ function buildDeps(): ServerDeps {
             // the WAL, so order only affects which one truncates it. Either order
             // is correct; this is deterministic.
             events.close();
+            goals.close();
             notesStore.close();
             store.close();
         },
@@ -365,6 +420,12 @@ async function streamChat(session: Session, text: string, res: ServerResponse): 
                 case "text":
                     sse(res, "text", { text: event.text });
                     break;
+                case "thinking":
+                    // The model's reasoning trace, streamed so the client can show
+                    // it live (collapsible). Only present when thinking is enabled
+                    // on the provider (see buildDeps' providerOptions).
+                    sse(res, "thinking", { text: event.text });
+                    break;
                 case "tool_start":
                     sse(res, "tool", { phase: "start", name: event.name, args: event.args });
                     break;
@@ -378,9 +439,9 @@ async function streamChat(session: Session, text: string, res: ServerResponse): 
                 case "compacted":
                     sse(res, "compacted", { turn: event.turn });
                     break;
-                // thinking / tool_call_start / tool_call_args / turn_start /
-                // loop_done are not surfaced to the client (loop_done's payload
-                // is folded into the `done` frame below, from the TurnResult).
+                // tool_call_start / tool_call_args / turn_start / loop_done are not
+                // surfaced to the client (loop_done's payload is folded into the
+                // `done` frame below, from the TurnResult).
             }
             next = await turn.next();
         }

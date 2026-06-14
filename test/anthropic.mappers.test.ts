@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import {
     toAnthropicMessages,
     toAnthropicTools,
+    toServerTools,
     fromAnthropicMessage,
     toStopReason,
     stringifyResult,
@@ -213,27 +214,58 @@ test("a tool_call round-trips Anthropic → core → Anthropic with id intact", 
     assert.deepEqual(block.input, { k: "v" });
 });
 
-// ── Capability honesty ──────────────────────────────────────────────────────
+// ── Server tools ──────────────────────────────────────────────────────────────
 
-test("advertised serverTools capability matches what toAnthropicTools emits", () => {
-    const tools: ToolDef[] = [
-        {
-            name: "echo",
-            description: "echoes",
-            parameters: { type: "object", properties: {} },
-            run: async (x) => x,
-        },
-    ];
-    const mapped = toAnthropicTools(tools) ?? [];
+test("the advertised serverTools capability matches that we emit server blocks", () => {
+    // The honesty contract: the flag is true because toServerTools actually emits
+    // provider-hosted tool blocks. (It was false while only custom tools shipped.)
+    assert.equal(ANTHROPIC_CAPABILITIES.serverTools, true);
+    const emitted = toServerTools(["web_search"]) ?? [];
+    assert.ok(emitted.length > 0, "the flag claims server tools, so we must emit one");
+});
 
-    // A server tool is a typed block (e.g. { type: "web_search_20250305" });
-    // a custom tool has no `type`. The client only ever emits custom tools, so
-    // the capability flag must not claim otherwise.
-    const emitsServerTool = mapped.some((t) => "type" in (t as Record<string, unknown>));
-    assert.equal(emitsServerTool, false, "no server-tool block is emitted");
-    assert.equal(
-        ANTHROPIC_CAPABILITIES.serverTools,
-        false,
-        "serverTools must stay false while only custom tools are emitted",
+test("toServerTools maps each friendly name to its dated SDK tool block", () => {
+    const out = toServerTools(["web_search", "web_fetch", "code_execution"])!;
+    // A server tool is a typed block with the friendly `name` the model calls and
+    // a versioned `type` the API routes on. Unlike a custom tool, it has no
+    // input_schema/run.
+    assert.deepEqual(
+        out.map((t) => (t as { name: string }).name),
+        ["web_search", "web_fetch", "code_execution"],
     );
+    for (const t of out) {
+        assert.ok("type" in (t as Record<string, unknown>), "server tool carries a versioned type");
+        assert.equal("input_schema" in (t as Record<string, unknown>), false);
+    }
+});
+
+test("toServerTools de-duplicates and returns undefined for an empty/missing list", () => {
+    assert.equal(toServerTools(undefined), undefined);
+    assert.equal(toServerTools([]), undefined);
+    const dup = toServerTools(["web_search", "web_search"])!;
+    assert.equal(dup.length, 1, "a repeated tool is emitted once");
+});
+
+test("fromAnthropicMessage drops server-tool result blocks, keeping the text answer", () => {
+    // When the model uses a server tool, the turn comes back with server_tool_use
+    // and *_tool_result blocks plus the model's final text, and stops at end_turn
+    // (the provider ran the tool in-turn). The core has no vocabulary for those
+    // blocks, so they drop — exactly like thinking — and the loop never tries to
+    // dispatch them. Only the text survives into the conversation.
+    const msg: any = {
+        model: "claude-test",
+        content: [
+            { type: "server_tool_use", id: "s1", name: "web_search", input: { query: "x" } },
+            { type: "web_search_tool_result", tool_use_id: "s1", content: [] },
+            { type: "text", text: "Based on the search, the answer is 42." },
+        ],
+    };
+    const core = fromAnthropicMessage(msg);
+    assert.equal(core.content.length, 1, "only the text block survives");
+    assert.deepEqual(core.content[0], {
+        kind: "text",
+        text: "Based on the search, the answer is 42.",
+    });
+    // No tool_call part: the loop must not try to run a server tool.
+    assert.ok(!core.content.some((p) => p.kind === "tool_call"));
 });

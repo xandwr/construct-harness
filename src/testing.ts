@@ -29,6 +29,15 @@ import type {
 export interface ScriptedTurn {
     content: ContentPart[];
     stopReason?: StopReason; // defaults inferred from content
+    /**
+     * Optional reasoning trace this turn streams ahead of its content, as one or
+     * more `thinking` deltas. Lets a test drive the thinking path (a UI that
+     * shows the trace, a server that forwards it) deterministically. Thinking is
+     * never a persisted content part, so it appears only on the stream, never in
+     * the resulting message — exactly like a real provider's. Ignored by the
+     * non-streaming `generate`, which has no delta channel.
+     */
+    thinking?: string;
 }
 
 const NO_CAPS: ProviderCapabilities = {
@@ -100,6 +109,9 @@ export class FakeClient implements ModelClient {
         }
         const hasToolCall = turn.content.some((p) => p.kind === "tool_call");
         const stopReason = turn.stopReason ?? (hasToolCall ? "tool_use" : "end_turn");
+
+        // A real provider streams its reasoning trace first, then the answer.
+        if (turn.thinking) yield { kind: "thinking", text: turn.thinking };
 
         for (const part of turn.content) {
             if (part.kind === "text") {

@@ -435,6 +435,39 @@ const MIGRATIONS: ReadonlyArray<{ name: string; up: (db: DatabaseSync) => void }
             `);
         },
     },
+    {
+        // The `goals` table: a Construct's working sense of purpose, what it's
+        // trying to accomplish across turns (see GoalStore in goals.ts). It lives
+        // in the SAME database file and under the SAME user_version as the other
+        // stores, so it ships as a migration in this one authoritative array.
+        //
+        // Unlike `memory`, goals have no FTS or vector index: they're a small,
+        // current working set the agent reads in full each turn (goalContext
+        // injects the active ones), not a large corpus searched by relevance. The
+        // shape stays deliberately minimal — a line of text, a lifecycle `status`,
+        // an optional `session` scope, and timestamps. `status` is a plain text
+        // enum the application validates ('active' | 'done' | 'abandoned'); a CHECK
+        // keeps a bad write from ever landing one the reader can't interpret.
+        name: "create goals table",
+        up(db) {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS goals (
+                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    content TEXT NOT NULL,
+                    status  TEXT NOT NULL DEFAULT 'active'
+                                CHECK (status IN ('active', 'done', 'abandoned')),
+                    session TEXT,
+                    created INTEGER NOT NULL,
+                    updated INTEGER NOT NULL
+                );
+                -- The hot query is "this session's active goals, oldest first"
+                -- (goalContext, every turn); index the columns it filters and
+                -- orders by so it never scans the table.
+                CREATE INDEX IF NOT EXISTS idx_goals_session_status
+                    ON goals (session, status, created);
+            `);
+        },
+    },
 ];
 
 /** The schema version this build of the code expects. */

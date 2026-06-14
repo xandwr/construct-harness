@@ -2,6 +2,7 @@
 import { AnthropicClient } from "./bridge/anthropic.ts";
 import type { ModelClient } from "./bridge/types.ts";
 import { MemoryStore } from "./memory.ts";
+import { GoalStore } from "./goals.ts";
 import { OpenAIEmbedder, EmbeddingError, type Embedder } from "./embeddings.ts";
 import { Session } from "./session.ts";
 import { runRepl } from "./repl.ts";
@@ -9,7 +10,9 @@ import { runRepl } from "./repl.ts";
 const BASE_SYSTEM =
     "You are a helpful, concise assistant: a long-lived Construct that remembers " +
     "across conversations. Save durable facts and preferences with memory_save, and " +
-    "recall them with memory_recall. Don't save transient chatter.";
+    "recall them with memory_recall. Don't save transient chatter. When given a task " +
+    "worth holding across turns, track it with goal_set and mark it goal_update done " +
+    "when achieved; your active goals are shown to you each turn.";
 
 /**
  * Construct the cloud embedder when an OpenAI key is configured, else return
@@ -81,7 +84,9 @@ async function main() {
                 ),
         },
     });
-    const store = new MemoryStore(process.env.MEMORY_DB ?? "db.sqlite");
+    const dbPath = process.env.MEMORY_DB ?? "db.sqlite";
+    const store = new MemoryStore(dbPath);
+    const goals = new GoalStore(dbPath);
     const embedder = makeEmbedder();
 
     try {
@@ -95,6 +100,7 @@ async function main() {
             client,
             system: BASE_SYSTEM,
             store,
+            goals,
             embedder,
             compaction: { thresholdTokens: compactAt },
             providerOptions: { cacheSystem: true },
@@ -102,6 +108,7 @@ async function main() {
 
         await runRepl(session);
     } finally {
+        goals.close();
         store.close();
     }
 }
