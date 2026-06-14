@@ -52,12 +52,28 @@
 		<div class="text-faint px-4 py-3 text-xs lowercase">log is empty</div>
 	{:else}
 		{#each events as e (e.id)}
-			<div class="flex gap-3 border-b border-border/40 px-4 py-1.5">
-				<span class="text-faint w-6 shrink-0 text-right">{e.id}</span>
-				<span class="text-faint w-20 shrink-0">{e.kind}</span>
-				<span class="text-faint w-12 shrink-0">{e.role ?? ''}</span>
-				<span class="{kindColor[e.kind] ?? 'text-text'} min-w-0 wrap-break-word">{e.content}</span>
-			</div>
+			{#if e.session}
+				<!-- An event tied to a session deep-links into chat: the chat view
+				     scrolls to and flashes the matching message (#event-<id>). -->
+				<a
+					href="/?session={e.session}#event-{e.id}"
+					title="open in conversation"
+					class="flex gap-3 border-b border-border/40 px-4 py-1.5 hover:bg-surface"
+				>
+					<span class="text-faint w-6 shrink-0 text-right">{e.id}</span>
+					<span class="text-faint w-20 shrink-0">{e.kind}</span>
+					<span class="text-faint w-12 shrink-0">{e.role ?? ''}</span>
+					<span class="{kindColor[e.kind] ?? 'text-text'} min-w-0 wrap-break-word">{e.content}</span>
+				</a>
+			{:else}
+				<!-- No session to link to (e.g. a system event); render it inert. -->
+				<div class="flex gap-3 border-b border-border/40 px-4 py-1.5">
+					<span class="text-faint w-6 shrink-0 text-right">{e.id}</span>
+					<span class="text-faint w-20 shrink-0">{e.kind}</span>
+					<span class="text-faint w-12 shrink-0">{e.role ?? ''}</span>
+					<span class="{kindColor[e.kind] ?? 'text-text'} min-w-0 wrap-break-word">{e.content}</span>
+				</div>
+			{/if}
 		{/each}
 	{/if}
 </div>

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tick } from 'svelte';
 	import AppHeader from '$lib/AppHeader.svelte';
 	import { APPS } from '$lib/apps';
 	import { page } from '$app/state';
@@ -11,12 +12,19 @@
 	// shown under the agent's text; `pending` marks the reply still streaming.
 	// `ts` is the epoch-ms send time: the event log's `ts` when replaying, or a
 	// client clock reading when the line is created live.
+	// `eventId` is the source event's log id when replaying; it anchors the line
+	// so the event log can deep-link here with #event-<id>. Live lines have none.
+	// `coveredIds` also lists the ids of events folded into this line (the line's
+	// own message plus any tool_call events stacked onto it), so the event log can
+	// deep-link to a tool event and land on the agent message it belongs to.
 	interface Line {
 		role: 'user' | 'agent';
 		text: string;
 		tool?: string;
 		pending?: boolean;
 		ts?: number;
+		eventId?: number;
+		coveredIds?: number[];
 	}
 
 	// When ?session=<id> is present the conversations applet linked here to replay
@@ -29,6 +37,9 @@
 	let sending = $state(false);
 	let error = $state<string | null>(null);
 	let footer = $state<string | null>(null);
+	// The event id the URL hash (#event-<id>) points at: the message the event log
+	// linked to. We scroll it into view and flash it once after the replay renders.
+	let highlighted = $state<number | null>(null);
 
 	// Reload the transcript whenever the ?session param changes: replay that
 	// session's events when viewing one, else start the live view empty (a fresh
@@ -44,14 +55,45 @@
 		loadReplay(id);
 	});
 
+	// When only the hash changes (same session, different event clicked in the log),
+	// the replay effect above doesn't refire, so re-reveal the new target here.
+	// Reads page.url.hash to track it; skips while a load is in flight (loadReplay
+	// reveals on its own once messages render).
+	$effect(() => {
+		page.url.hash;
+		if (viewing && messages.length) revealHashTarget();
+	});
+
 	async function loadReplay(id: string) {
 		try {
 			const res = await getEvents(id);
 			messages = replayLines(res.events);
+			await revealHashTarget();
 		} catch (e) {
 			error = e instanceof ApiError ? e.message : 'failed to load conversation';
 			messages = [];
 		}
+	}
+
+	// Scroll the message named by the URL hash (#event-<id>) into view and flash it,
+	// so a click in the event log lands the eye on the exact message. The clicked id
+	// may be a message (its own line) or a tool_call (the agent line it was folded
+	// into), so resolve it to the line that covers it. Runs after the transcript
+	// renders (tick) so the anchor element exists. A no-op without a hash.
+	async function revealHashTarget() {
+		const m = page.url.hash.match(/^#event-(\d+)$/);
+		if (!m) {
+			highlighted = null;
+			return;
+		}
+		const clicked = Number(m[1]);
+		const line = messages.find((l) => l.coveredIds?.includes(clicked));
+		if (line?.eventId == null) return;
+		await tick();
+		const el = document.getElementById(`event-${line.eventId}`);
+		if (!el) return;
+		el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+		highlighted = line.eventId;
 	}
 
 	// Fold a session's raw event log into transcript lines: user and agent
@@ -60,15 +102,27 @@
 	function replayLines(events: WireEvent[]): Line[] {
 		const lines: Line[] = [];
 		let pendingTool: string | undefined;
+		// Ids of events folded into the next agent line (its tool_calls), so the
+		// agent line can claim them as deep-link targets alongside its own id.
+		let pendingIds: number[] = [];
 		for (const e of events) {
 			if (e.kind === 'message' && e.role === 'user') {
-				lines.push({ role: 'user', text: e.content, ts: e.ts });
+				lines.push({ role: 'user', text: e.content, ts: e.ts, eventId: e.id, coveredIds: [e.id] });
 			} else if (e.kind === 'message' && e.role === 'agent') {
-				lines.push({ role: 'agent', text: e.content, tool: pendingTool, ts: e.ts });
+				lines.push({
+					role: 'agent',
+					text: e.content,
+					tool: pendingTool,
+					ts: e.ts,
+					eventId: e.id,
+					coveredIds: [...pendingIds, e.id]
+				});
 				pendingTool = undefined;
+				pendingIds = [];
 			} else if (e.kind === 'tool_call') {
 				// Stack multiple tool calls in one turn onto a single note.
 				pendingTool = pendingTool ? `${pendingTool}, ${e.content}` : e.content;
+				pendingIds.push(e.id);
 			}
 		}
 		return lines;
@@ -169,9 +223,14 @@
 			     author boundary legible at wide widths, where text runs far from
 			     the left accent bar. The bar marks who; the rule marks where. -->
 			<div
-				class="flex gap-2 border-l-2 py-3 pl-2 {m.role === 'user'
+				id={m.eventId != null ? `event-${m.eventId}` : undefined}
+				class="flex scroll-mt-4 gap-2 border-l-2 py-3 pl-2 transition-colors duration-700 {m.role ===
+				'user'
 					? 'border-glow'
-					: 'border-border'} {i > 0 ? 'border-t border-t-border' : ''}"
+					: 'border-border'} {i > 0 ? 'border-t border-t-border' : ''} {m.eventId != null &&
+				m.eventId === highlighted
+					? 'bg-surface'
+					: ''}"
 			>
 				<span class="flex w-12 shrink-0 flex-col text-[10px] leading-tight lowercase">
 					<span class="text-faint">{m.role}</span>
