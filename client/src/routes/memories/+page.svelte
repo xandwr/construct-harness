@@ -13,7 +13,7 @@
 	];
 </script>
 
-<AppHeader title={app.title}>
+<AppHeader title={app.title} icon={app.icon}>
 	<span class="text-faint text-[10px] lowercase">{rows.length}</span>
 </AppHeader>
 

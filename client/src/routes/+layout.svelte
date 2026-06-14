@@ -20,7 +20,7 @@
 	<nav class="flex w-48 shrink-0 flex-col border-r border-border bg-base" aria-label="applets">
 		<div class="flex items-center gap-2 border-b border-border px-3 py-3">
 			<!-- The mark. It breathes. The one anomaly in a dead-still instrument. -->
-			<span class="breathe block size-1.5 bg-glow" aria-hidden="true"></span>
+			<img src={favicon} alt="Logo" class="w-5 h-5">
 			<span class="text-text text-xs lowercase tracking-wide">construct</span>
 		</div>
 
