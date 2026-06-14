@@ -8,14 +8,18 @@
  * or a stream off a {@link Session}, the same way the REPL is a terminal over a
  * Session.
  *
- * Process/session model: one live Session per server process (single-user, the
- * same shape as the REPL today), backed by a shared EventStore so every turn
- * persists to disk. Past conversations are replayed *read-only* out of the log;
- * only the one live Session accepts new turns. The client's `?session=<id>`
- * deep-link lands on that read-only replay.
+ * Process/session model: a {@link SessionPool} of live Sessions, all sharing one
+ * EventStore so every turn persists to disk. The pool starts with one fresh
+ * conversation; chatting into a past conversation (a `session` id on `/api/chat`)
+ * resumes it from the log into the pool, where it stays live and resumable. So
+ * the client's `?session=<id>` deep-link isn't a read-only replay: sending a turn
+ * there picks the conversation back up exactly where it left off. Reads
+ * (`/api/sessions`, `/api/events`) report which conversations are currently live
+ * (loaded in the pool) versus only on disk.
  *
  * The five endpoints, each named by the frontend stub that consumes it:
- *  - `POST /api/chat`            — send a message; reply streams back as SSE.
+ *  - `POST /api/chat`            — send a message (optional `session` to resume
+ *                                  a past conversation); reply streams as SSE.
  *  - `GET  /api/events?session=` — one conversation's transcript, oldest first.
  *  - `GET  /api/sessions`        — conversation list (id + preview + count).
  *  - `GET  /api/memories`        — the curated memory store.
@@ -35,7 +39,7 @@ import { EventStore, type Event } from "./events.ts";
 import { backfillEventEmbeddings } from "./eventTools.ts";
 import { GoalStore } from "./goals.ts";
 import { OpenAIEmbedder, EmbeddingError, type Embedder } from "./embeddings.ts";
-import { Session } from "./session.ts";
+import { Session, type SessionConfig } from "./session.ts";
 import type { LoopEvent } from "./bridge/loop.ts";
 import { NotesStore, Note, NoteError, type NoteFrontmatter } from "./notes.ts";
 import { NotesService } from "./notesService.ts";
@@ -65,19 +69,95 @@ const DEFAULT_COMPACT_AT = 120_000;
 /** Default page size for the conversation and log reads, overridable per query. */
 const DEFAULT_PAGE = 100;
 
-/** What the server holds for its lifetime: the stores it reads, the one live
- *  Session it drives, the knowledge-base service, and a close() that releases the
+/** What the server holds for its lifetime: the stores it reads, the pool of live
+ *  Sessions it drives, the knowledge-base service, and a close() that releases the
  *  database handles. `notes` is optional so the server still runs without a KB
  *  (the routes 503 cleanly), but the default wiring always provides one. */
 interface ServerDeps {
     store: MemoryStore;
     events: EventStore;
     goals: GoalStore;
-    session: Session;
+    /** The live conversations this process holds in memory, keyed by session id.
+     *  Each one accepts new turns; a conversation only in the log (not here) is a
+     *  past one waiting to be resumed into the pool on its next turn. */
+    sessions: SessionPool;
     notes?: NotesService;
     notesStore?: NotesStore;
     corsOrigin?: string;
     close(): void;
+}
+
+/** Builds the shared {@link SessionConfig} every live conversation runs under,
+ *  carrying the `events` log so {@link Session.resume} has a transcript to
+ *  rehydrate from. It deliberately leaves `sessionId` unset (a fresh
+ *  conversation gets a fresh id); the {@link SessionPool} pins the id when
+ *  resuming a specific conversation. {@link buildDeps} supplies the closure with
+ *  everything wired in. */
+export type SessionConfigBase = () => SessionConfig & { events: EventStore };
+
+/**
+ * The set of live Sessions a server process drives, keyed by session id.
+ *
+ * The harness keeps every conversation in one shared log, but a {@link Session}
+ * (the in-memory thing that holds working context and accepts turns) is more
+ * expensive: it carries the rehydrated history and pending embeds. So we keep a
+ * pool, not one-Session-per-process and not one-per-conversation-ever: a
+ * conversation becomes live the first time it's chatted into ({@link resolve}
+ * resumes it from the log), stays live for the process's life, and any
+ * conversation in the log can be resumed this way. {@link has} lets a read
+ * endpoint report which conversations are currently live (in the pool) versus
+ * merely on disk.
+ */
+export class SessionPool {
+    private readonly sessions = new Map<string, Session>();
+    /** Builds the shared config every conversation runs under (see
+     *  {@link SessionConfigBase}); the pool pins the id for a resume. */
+    private readonly config: SessionConfigBase;
+    /** The conversation a chat with no session id lands on, so a client that
+     *  never names one keeps talking to the same conversation across turns. */
+    private readonly defaultId: string;
+
+    /** Register one brand-new live conversation at boot via {@link config}, so
+     *  the server always has an addressable live conversation even before anyone
+     *  resumes a past one; its id becomes the default. */
+    constructor(config: SessionConfigBase) {
+        this.config = config;
+        const initial = new Session(config());
+        this.sessions.set(initial.id, initial);
+        this.defaultId = initial.id;
+    }
+
+    /** Whether a conversation is currently live (has an in-memory Session in the
+     *  pool), as opposed to only existing in the log. */
+    has(id: string): boolean {
+        return this.sessions.has(id);
+    }
+
+    /** The ids of every live conversation in the pool. */
+    ids(): string[] {
+        return [...this.sessions.keys()];
+    }
+
+    /**
+     * Get the live Session for `id`, resuming it from the log into the pool if it
+     * isn't live yet. With no `id` the caller wants "a live conversation to talk
+     * to": return the default conversation so a client that never sends a session
+     * id keeps landing on the same one across turns.
+     *
+     * Resuming rehydrates the conversation's prior turns into the new Session's
+     * working context (see {@link Session.resume}), so the first turn after a
+     * resume builds on the real exchange, not an empty history. A brand-new id
+     * (one with no events in the log) resumes to an empty history, which is the
+     * correct behavior: it just becomes a fresh live conversation under that id.
+     */
+    async resolve(id: string | undefined): Promise<Session> {
+        if (!id) return this.sessions.get(this.defaultId)!;
+        const live = this.sessions.get(id);
+        if (live) return live;
+        const resumed = await Session.resume({ ...this.config(), sessionId: id });
+        this.sessions.set(resumed.id, resumed);
+        return resumed;
+    }
 }
 
 /** Where the knowledge-base markdown folder lives, mirroring MEMORY_DB. */
@@ -167,7 +247,13 @@ function buildDeps(): ServerDeps {
     const notesStore = new NotesStore(dbPath);
     const notes = new NotesService({ store: notesStore, root: kbDir, embedder });
 
-    const session = new Session({
+    // One wiring shared by every live conversation. Every Session in the pool —
+    // the boot one and every resumed past conversation — runs under this exact
+    // configuration; the pool pins the `sessionId` when resuming a specific
+    // conversation, leaving it fresh here. Keeping it in one closure is what
+    // guarantees a resumed conversation behaves identically to the one it's
+    // continuing: same tools, same compaction, same provider options.
+    const sessionConfig: SessionConfigBase = () => ({
         client,
         system: BASE_SYSTEM,
         store,
@@ -192,6 +278,7 @@ function buildDeps(): ServerDeps {
             serverTools,
         },
     });
+    const sessions = new SessionPool(sessionConfig);
 
     notes
         .start()
@@ -224,7 +311,7 @@ function buildDeps(): ServerDeps {
         store,
         events,
         goals,
-        session,
+        sessions,
         notes,
         notesStore,
         corsOrigin: process.env.CORS_ORIGIN,
@@ -681,19 +768,24 @@ export function createHandler(deps: ServerDeps) {
 
         try {
             if (req.method === "GET" && path === "/api/health") {
-                sendJson(res, 200, { ok: true, session: deps.session.id });
+                sendJson(res, 200, { ok: true, sessions: deps.sessions.ids() });
                 return;
             }
 
             if (req.method === "GET" && path === "/api/sessions") {
                 const scan = clampPage(url.searchParams.get("scan"), 1000, 5000);
+                const live = deps.sessions.ids();
+                const liveSet = new Set(live);
                 const sessions = summarizeSessions(deps.events, scan).map((s) => ({
                     ...s,
-                    // Mark the one session that's still live (accepts new turns);
-                    // the rest are read-only replays.
-                    live: s.session === deps.session.id,
+                    // Mark every conversation currently held live in the pool
+                    // (in-memory, accepting turns). The rest live only in the log
+                    // until they're resumed — which any of them can be, by sending
+                    // a turn into them. So `live` is "loaded now", not "the only one
+                    // you can talk to".
+                    live: liveSet.has(s.session),
                 }));
-                sendJson(res, 200, { sessions, live: deps.session.id });
+                sendJson(res, 200, { sessions, live });
                 return;
             }
 
@@ -706,7 +798,11 @@ export function createHandler(deps: ServerDeps) {
                 const limit = clampPage(url.searchParams.get("limit"), DEFAULT_PAGE, 1000);
                 // Oldest first: natural reading order for a transcript.
                 const rows = deps.events.recent({ session, limit }).reverse().map(eventToJson);
-                sendJson(res, 200, { session, live: session === deps.session.id, events: rows });
+                sendJson(res, 200, {
+                    session,
+                    live: deps.sessions.has(session),
+                    events: rows,
+                });
                 return;
             }
 
@@ -745,19 +841,33 @@ export function createHandler(deps: ServerDeps) {
 
             if (req.method === "POST" && path === "/api/chat") {
                 let text: string;
+                let wantSession: string | undefined;
                 try {
                     const body = await readBody(req);
-                    const parsed = JSON.parse(body || "{}") as { message?: unknown };
+                    const parsed = JSON.parse(body || "{}") as {
+                        message?: unknown;
+                        session?: unknown;
+                    };
                     if (typeof parsed.message !== "string" || parsed.message.trim() === "") {
                         sendJson(res, 400, { error: "message must be a non-empty string" });
                         return;
                     }
                     text = parsed.message;
+                    // An optional session id resumes (or continues) that
+                    // conversation; omitted, the turn lands on the default live one.
+                    if (typeof parsed.session === "string" && parsed.session !== "") {
+                        wantSession = parsed.session;
+                    }
                 } catch {
                     sendJson(res, 400, { error: "invalid JSON body" });
                     return;
                 }
-                await streamChat(deps.session, text, res);
+                // Resolve the conversation before streaming: resuming reads the log
+                // and rehydrates history, which can fail (a store error), so do it
+                // here where we can still send a real error status. Once streamChat
+                // writes the SSE head we can only report errors in-band.
+                const session = await deps.sessions.resolve(wantSession);
+                await streamChat(session, text, res);
                 return;
             }
 
@@ -808,7 +918,7 @@ function main(): void {
     const port = Number(process.env.PORT) || 8787;
     server.listen(port, () => {
         console.log(`construct-harness server listening on http://localhost:${port}`);
-        console.log(`  live session: ${deps.session.id}`);
+        console.log(`  live session: ${deps.sessions.ids().join(", ")}`);
     });
 
     let closing = false;

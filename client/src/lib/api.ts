@@ -25,8 +25,10 @@ export interface WireEvent {
     correlation: string | null;
 }
 
-/** One conversation in the `/api/sessions` list. `live` marks the single session
- *  still accepting new turns; the rest are read-only replays. */
+/** One conversation in the `/api/sessions` list. `live` marks a conversation the
+ *  server currently holds in memory (loaded in its session pool). Any
+ *  conversation can be resumed by sending a turn into it, so `live` is "loaded
+ *  now", not "the only one you can continue". */
 export interface SessionSummary {
     session: string;
     when: number;
@@ -96,11 +98,11 @@ async function getJson<T>(path: string, fetchFn: typeof fetch = fetch): Promise<
     return res.json() as Promise<T>;
 }
 
-/** The conversation list, newest first. `live` is the id of the session that
- *  still accepts new turns (also flagged per-row). */
+/** The conversation list, newest first. `live` lists the ids of the
+ *  conversations the server currently holds in memory (also flagged per-row). */
 export function getSessions(
     fetchFn?: typeof fetch,
-): Promise<{ sessions: SessionSummary[]; live: string }> {
+): Promise<{ sessions: SessionSummary[]; live: string[] }> {
     return getJson("/api/sessions", fetchFn);
 }
 
@@ -225,6 +227,11 @@ export type ChatEvent =
  * `tool` events to show activity, and a terminal `done` or `error`. Resolves
  * when the stream closes.
  *
+ * `opts.session` continues (resuming if needed) that conversation; omit it to
+ * land on the server's default live conversation. The first frame is always an
+ * `open` carrying the session id the turn actually ran under, so a caller that
+ * started a fresh conversation learns its id.
+ *
  * `signal` aborts the turn (the server sees the connection drop). A network
  * failure before any frame is thrown as an {@link ApiError}; a model failure
  * mid-stream arrives as an `error` event, not a throw, because by then the
@@ -233,13 +240,13 @@ export type ChatEvent =
 export async function sendChat(
     message: string,
     onEvent: (event: ChatEvent) => void,
-    opts: { signal?: AbortSignal; fetchFn?: typeof fetch } = {},
+    opts: { session?: string; signal?: AbortSignal; fetchFn?: typeof fetch } = {},
 ): Promise<void> {
     const fetchFn = opts.fetchFn ?? fetch;
     const res = await fetchFn("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message }),
+        body: JSON.stringify(opts.session ? { message, session: opts.session } : { message }),
         signal: opts.signal,
     });
 

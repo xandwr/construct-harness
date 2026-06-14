@@ -34,27 +34,36 @@
 		coveredIds?: number[];
 	}
 
-	// When ?session=<id> is present the conversations applet linked here to replay
-	// a past conversation read-only (composer disabled). Otherwise this is the live
-	// session: the composer is enabled and replies stream in.
+	// When ?session=<id> is present the conversations applet linked here to that
+	// conversation: we load its transcript and resume it — sending a message picks
+	// it back up where it left off (the server rehydrates its history). Without the
+	// param this is a fresh conversation; the first turn's `open` event tells us the
+	// id the server assigned, which we then track so follow-up turns continue it.
 	const viewing = $derived(page.url.searchParams.get('session'));
 
 	let messages = $state<Line[]>([]);
 	let draft = $state('');
 	let sending = $state(false);
+	let loadingReplay = $state(false);
 	let error = $state<string | null>(null);
 	let footer = $state<string | null>(null);
+	// The id the composer sends turns into. Equal to `viewing` when resuming a past
+	// conversation; for a fresh conversation it's undefined until the first reply's
+	// `open` event assigns the server-minted id, after which later turns continue it.
+	let activeSession = $state<string | undefined>(undefined);
 	// The event id the URL hash (#event-<id>) points at: the message the event log
 	// linked to. We scroll it into view and flash it once after the replay renders.
 	let highlighted = $state<number | null>(null);
 
 	// Reload the transcript whenever the ?session param changes: replay that
-	// session's events when viewing one, else start the live view empty (a fresh
-	// turn appends to it). Reruns because it reads `viewing`, a $derived.
+	// session's events when resuming one, else start a fresh conversation empty.
+	// Either way the composer stays enabled — sending resumes the viewed session or
+	// starts a new one. Reruns because it reads `viewing`, a $derived.
 	$effect(() => {
 		const id = viewing;
 		error = null;
 		footer = null;
+		activeSession = id ?? undefined;
 		if (!id) {
 			messages = [];
 			return;
@@ -72,6 +81,7 @@
 	});
 
 	async function loadReplay(id: string) {
+		loadingReplay = true;
 		try {
 			const res = await getEvents(id);
 			messages = replayLines(res.events);
@@ -79,6 +89,8 @@
 		} catch (e) {
 			error = e instanceof ApiError ? e.message : 'failed to load conversation';
 			messages = [];
+		} finally {
+			loadingReplay = false;
 		}
 	}
 
@@ -138,7 +150,10 @@
 	async function submit(event: SubmitEvent) {
 		event.preventDefault();
 		const text = draft.trim();
-		if (!text || sending || viewing) return;
+		// Block on an in-flight turn or a replay still loading (sending before the
+		// transcript is in context would resume from an incomplete history), but not
+		// on viewing a past conversation — that's the resume path.
+		if (!text || sending || loadingReplay) return;
 
 		draft = '';
 		error = null;
@@ -153,7 +168,9 @@
 		const idx = messages.push({ role: 'agent', text: '', pending: true }) - 1;
 
 		try {
-			await sendChat(text, (e: ChatEvent) => onChatEvent(e, idx));
+			// Send into the active conversation: the viewed session resumes it; a
+			// fresh one (activeSession undefined) gets a new id back via `open`.
+			await sendChat(text, (e: ChatEvent) => onChatEvent(e, idx), { session: activeSession });
 		} catch (e) {
 			messages[idx].pending = false;
 			error = e instanceof ApiError ? e.message : 'the request failed';
@@ -207,21 +224,26 @@
 				if (!reply.text) reply.text = `[${error}]`;
 				break;
 			case 'open':
-				// Session id is available here if we want to deep-link the live
-				// turn later; nothing to render for it now.
+				// The server tells us which conversation this turn ran under. For a
+				// fresh conversation that's a newly-minted id; adopt it so follow-up
+				// turns continue the same conversation rather than spawning new ones.
+				if (!activeSession) activeSession = e.session;
 				break;
 		}
 	}
 </script>
 
 <AppHeader title={app.title} icon={app.icon}>
-	{#if viewing}
-		<span class="text-faint text-[10px] lowercase">{viewing}</span>
-		<a href="/" class="text-muted hover:text-text text-[10px] lowercase underline">live</a>
+	{#if activeSession}
+		<!-- Resuming (or continuing) a specific conversation: show its id and a way
+		     to start a fresh one. -->
+		<span class="text-faint text-[10px] lowercase">{activeSession}</span>
+		{#if sending}<span class="text-glow text-[10px] lowercase">…</span>{/if}
+		<a href="/" class="text-muted hover:text-text text-[10px] lowercase underline">new</a>
 	{:else if sending}
 		<span class="text-glow text-[10px] lowercase">…</span>
 	{:else}
-		<span class="text-faint text-[10px] lowercase">live</span>
+		<span class="text-faint text-[10px] lowercase">new conversation</span>
 	{/if}
 </AppHeader>
 
@@ -230,7 +252,11 @@
 	<div class="min-h-0 flex-1 overflow-y-auto px-4 py-4">
 		{#if messages.length === 0 && !error}
 			<div class="text-faint text-xs lowercase">
-				{viewing ? 'no messages in this conversation' : 'say something to begin'}
+				{loadingReplay
+					? 'loading conversation…'
+					: viewing
+						? 'no messages here yet — say something to pick it up'
+						: 'say something to begin'}
 			</div>
 		{/if}
 		{#each messages as m, i (i)}
@@ -301,18 +327,23 @@
 		{/if}
 	</div>
 
-	<!-- Composer: disabled while replaying a past conversation. -->
+	<!-- Composer: always enabled (resuming a past conversation is just sending into
+	     it); only blocked mid-turn or while a replay is still loading. -->
 	<form class="border-t border-border px-4 py-3" onsubmit={submit}>
 		<div class="flex items-stretch gap-2">
 			<input
 				bind:value={draft}
-				disabled={!!viewing || sending}
-				placeholder={viewing ? 'viewing a past conversation' : 'say something'}
+				disabled={sending || loadingReplay}
+				placeholder={loadingReplay
+					? 'loading…'
+					: viewing
+						? 'resume this conversation'
+						: 'say something'}
 				class="placeholder:text-faint flex-1 border border-border bg-surface px-3 py-2 text-xs text-text outline-none focus:border-glow disabled:opacity-50"
 			/>
 			<button
 				type="submit"
-				disabled={!!viewing || sending || draft.trim() === ''}
+				disabled={sending || loadingReplay || draft.trim() === ''}
 				class="border border-border bg-surface px-4 py-2 text-xs lowercase text-muted disabled:opacity-50"
 			>
 				{sending ? '…' : 'send'}

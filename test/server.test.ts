@@ -16,8 +16,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 
-import { createHandler, resolveServerTools } from "../src/server.ts";
-import { Session } from "../src/session.ts";
+import { createHandler, resolveServerTools, SessionPool } from "../src/server.ts";
 import { MemoryStore, Memory } from "../src/memory.ts";
 import { EventStore } from "../src/events.ts";
 import { GoalStore } from "../src/goals.ts";
@@ -101,18 +100,22 @@ function postReq(url: string, body: string): any {
 }
 
 /** Build deps over in-memory stores and a scripted client, plus a close() that
- *  releases both handles. The Session is wired with the EventStore, exactly as
- *  the real server does, so a chat turn persists. */
+ *  releases both handles. The Sessions are wired with the EventStore, exactly as
+ *  the real server does (via a SessionPool over one shared config), so a chat
+ *  turn persists and a past conversation can be resumed by id. */
 function makeDeps(client: FakeClient) {
     const store = new MemoryStore(":memory:");
     const events = new EventStore(":memory:");
     const goals = new GoalStore(":memory:");
-    const session = new Session({ client, system: "be brief", store, events, goals });
+    const sessions = new SessionPool(() => ({ client, system: "be brief", store, events, goals }));
     return {
         store,
         events,
         goals,
-        session,
+        sessions,
+        // The scripted client, exposed so a resume test can read the messages the
+        // model was handed (FakeClient records every call's params).
+        client,
         close() {
             events.close();
             goals.close();
@@ -121,7 +124,13 @@ function makeDeps(client: FakeClient) {
     };
 }
 
-test("GET /api/health reports ok and the live session id", async () => {
+/** The default (boot) session's id — what a chat with no `session` lands on, and
+ *  what the read endpoints flag as live. The pool seeds exactly one at start. */
+function defaultId(deps: { sessions: SessionPool }): string {
+    return deps.sessions.ids()[0]!;
+}
+
+test("GET /api/health reports ok and the live session ids", async () => {
     const deps = makeDeps(new FakeClient([]));
     const handle = createHandler(deps);
     const { res, captured } = fakeRes();
@@ -131,7 +140,7 @@ test("GET /api/health reports ok and the live session id", async () => {
     assert.equal(captured.status, 200);
     const body = JSON.parse(captured.body);
     assert.equal(body.ok, true);
-    assert.equal(body.session, deps.session.id);
+    assert.deepEqual(body.sessions, [defaultId(deps)]);
 });
 
 test("CORS origin is configurable", async () => {
@@ -206,7 +215,7 @@ test("POST /api/chat streams SSE frames and persists the turn to the log", async
 
     // The load-bearing property: running the turn wrote it to the event log, so
     // it's queryable as a past conversation.
-    const logged = deps.events.recent({ session: deps.session.id });
+    const logged = deps.events.recent({ session: defaultId(deps) });
     const contents = logged.map((e) => e.content);
     assert.ok(contents.includes("what about deploys?"), "user message persisted");
     assert.ok(contents.includes("You deploy on Fridays."), "agent reply persisted");
@@ -240,7 +249,7 @@ test("POST /api/chat forwards the model's thinking trace as `thinking` frames", 
     assert.ok(kinds.indexOf("thinking") < kinds.indexOf("text"), "thinking should stream first");
 
     // Reasoning is ephemeral: the log holds the reply, never the trace.
-    const logged = deps.events.recent({ session: deps.session.id }).map((e) => e.content);
+    const logged = deps.events.recent({ session: defaultId(deps) }).map((e) => e.content);
     assert.ok(!logged.some((c) => /work it out/.test(c)), "thinking must not be persisted");
 
     deps.close();
@@ -263,10 +272,102 @@ test("a tool turn surfaces tool frames and the conversation appears in /api/sess
     const list = fakeRes();
     await handle(getReq("/api/sessions"), list.res);
     const body = JSON.parse(list.captured.body);
-    const mine = body.sessions.find((s: { session: string }) => s.session === deps.session.id);
+    const mine = body.sessions.find((s: { session: string }) => s.session === defaultId(deps));
     assert.ok(mine, "live session is listed");
     assert.equal(mine.live, true);
     assert.ok(mine.count > 0);
+
+    deps.close();
+});
+
+// ── Resuming a past conversation ─────────────────────────────────────────────
+
+test("POST /api/chat with no session lands on the default conversation across turns", async () => {
+    const deps = makeDeps(new FakeClient([textTurn("one"), textTurn("two")]));
+    const handle = createHandler(deps);
+
+    const a = fakeRes();
+    await handle(postReq("/api/chat", JSON.stringify({ message: "first" })), a.res);
+    const b = fakeRes();
+    await handle(postReq("/api/chat", JSON.stringify({ message: "second" })), b.res);
+
+    // Both turns announce the same session id: a client that never sends one keeps
+    // talking to the same conversation.
+    const idA = (a.captured.frames().find((f) => f.event === "open")!.data as { session: string })
+        .session;
+    const idB = (b.captured.frames().find((f) => f.event === "open")!.data as { session: string })
+        .session;
+    assert.equal(idA, idB);
+    assert.equal(idA, defaultId(deps));
+
+    deps.close();
+});
+
+test("POST /api/chat with a new session id opens that conversation and lists it live", async () => {
+    const deps = makeDeps(new FakeClient([textTurn("hi there")]));
+    const handle = createHandler(deps);
+
+    const chat = fakeRes();
+    await handle(
+        postReq("/api/chat", JSON.stringify({ message: "hello", session: "my-thread" })),
+        chat.res,
+    );
+
+    // The turn ran under the requested id, and it persisted there.
+    const open = chat.captured.frames().find((f) => f.event === "open")!.data as {
+        session: string;
+    };
+    assert.equal(open.session, "my-thread");
+    const logged = deps.events.recent({ session: "my-thread" }).map((e) => e.content);
+    assert.ok(logged.includes("hello"), "user message persisted under the requested session");
+
+    // It's now held live in the pool alongside the boot conversation.
+    assert.ok(deps.sessions.has("my-thread"), "requested session is live in the pool");
+    const list = fakeRes();
+    await handle(getReq("/api/sessions"), list.res);
+    const body = JSON.parse(list.captured.body);
+    assert.ok(body.live.includes("my-thread"), "live list includes the resumed session");
+    const row = body.sessions.find((s: { session: string }) => s.session === "my-thread");
+    assert.equal(row.live, true);
+
+    deps.close();
+});
+
+test("POST /api/chat resuming a past conversation feeds its history to the model", async () => {
+    // Seed a prior exchange directly in the log under a session that is NOT live in
+    // this process's pool, the shape of a conversation left over from an earlier run.
+    const deps = makeDeps(new FakeClient([textTurn("still 4")]));
+    deps.events.append({ kind: "message", role: "user", content: "what is 2+2", session: "old" });
+    deps.events.append({ kind: "message", role: "agent", content: "4", session: "old" });
+    assert.ok(!deps.sessions.has("old"), "precondition: the past conversation isn't live yet");
+
+    const handle = createHandler(deps);
+    const chat = fakeRes();
+    await handle(
+        postReq("/api/chat", JSON.stringify({ message: "are you sure", session: "old" })),
+        chat.res,
+    );
+
+    // The resumed turn ran under "old" and its reply persisted there, so the
+    // conversation continued rather than forking a new one.
+    const open = chat.captured.frames().find((f) => f.event === "open")!.data as {
+        session: string;
+    };
+    assert.equal(open.session, "old");
+
+    // The load-bearing resume property: the model saw the prior turns in context,
+    // not an empty history. The FakeClient records the messages it was handed.
+    const lastCall = deps.client.calls.at(-1)!;
+    const texts = lastCall.messages
+        .flatMap((m) => m.content)
+        .filter((p): p is { kind: "text"; text: string } => p.kind === "text")
+        .map((p) => p.text);
+    assert.ok(
+        texts.some((t) => t.includes("what is 2+2")),
+        "prior user message rehydrated into context",
+    );
+    assert.ok(texts.includes("4"), "prior agent reply rehydrated into context");
+    assert.ok(texts.includes("are you sure"), "the new turn is present too");
 
     deps.close();
 });
