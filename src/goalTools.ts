@@ -26,11 +26,14 @@ import type { ContextProvider } from "./context.ts";
  *  harness shouldn't paper over; the cap keeps the per-turn injection bounded. */
 export const DEFAULT_GOAL_LIMIT = 12;
 
-/** The serializable view of a goal handed back to the model. */
+/** The serializable view of a goal handed back to the model. `scope` lets the
+ *  model tell a shared, human-set goal (`"shared"`, no session) from one belonging
+ *  to this conversation (`"session"`) — the same split goalContext shows each turn. */
 export interface GoalView {
     id: number;
     content: string;
     status: GoalStatus;
+    scope: "shared" | "session";
     created: number;
     updated: number;
 }
@@ -40,6 +43,7 @@ function toView(g: Goal): GoalView {
         id: g.id,
         content: g.content,
         status: g.status,
+        scope: g.session === undefined ? "shared" : "session",
         created: g.created,
         updated: g.updated,
     };
@@ -150,8 +154,10 @@ export function goalTools(store: GoalStore, sessionId?: string): ToolDef[] {
     const list: ToolDef = {
         name: "goal_list",
         description:
-            "List your goals. Active goals are already shown to you each turn; use " +
-            "this to review completed or abandoned ones, or to re-check the list. " +
+            "List your goals: both the shared goals a human set for every " +
+            "conversation and the goals scoped to this one (each row's `scope` says " +
+            "which). Active goals are already shown to you each turn; use this to " +
+            "review completed or abandoned ones, or to re-check the full list. " +
             "Filter by `status` ('active' | 'done' | 'abandoned'); omit for all.",
         parameters: {
             type: "object",
@@ -168,7 +174,19 @@ export function goalTools(store: GoalStore, sessionId?: string): ToolDef[] {
             const a = asRecord(args);
             const status = isGoalStatus(a.status) ? a.status : undefined;
             const limit = typeof a.limit === "number" ? a.limit : DEFAULT_GOAL_LIMIT;
-            const goals = store.list({ status, session, limit });
+            // Read the same two scopes goalContext injects, so the list the model
+            // can pull matches the goals it's shown each turn. A bare `session`
+            // filter (the previous behavior) silently dropped the shared,
+            // human-set goals — the ones a user defines on the Goals page — because
+            // those carry no session. Read the shared (global) goals on their own
+            // scope, then this conversation's, and concatenate. The two sets are
+            // disjoint (global is `session IS NULL`, session is `session = ?`), so
+            // no dedupe is needed; shared first, the order goalContext uses.
+            const shared = store.list({ status, scope: "global", limit });
+            const own = session
+                ? store.list({ status, scope: "session", session, limit })
+                : [];
+            const goals = [...shared, ...own].slice(0, limit);
             return { count: goals.length, goals: goals.map(toView) };
         },
     };

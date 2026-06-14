@@ -171,6 +171,64 @@ test("goal_list returns this session's goals, filterable by status", async () =>
     store.close();
 });
 
+test("goal_list shows the shared goals a human defined, not just this session's", async () => {
+    const store = freshStore();
+    // What a user sets on the Goals page: a global goal with no session. This is
+    // the case the old goal_list missed — it filtered `session = s` and so never
+    // returned the very goals the human had actually defined.
+    store.create({ content: "uphold the house style" });
+    const tools = goalTools(store, "s");
+    await tool(tools, "goal_set").run({ content: "ship the migration" });
+
+    const res = (await tool(tools, "goal_list").run({})) as {
+        count: number;
+        goals: { content: string; scope: string }[];
+    };
+    assert.equal(res.count, 2);
+    const byContent = new Map(res.goals.map((g) => [g.content, g.scope]));
+    // The shared goal is present and tagged as shared; the session goal as session.
+    assert.equal(byContent.get("uphold the house style"), "shared");
+    assert.equal(byContent.get("ship the migration"), "session");
+    // Shared first, matching the order goalContext injects.
+    assert.equal(res.goals[0].content, "uphold the house style");
+    store.close();
+});
+
+test("goal_list shows shared goals even when this session has none of its own", async () => {
+    const store = freshStore();
+    store.create({ content: "global standing goal" });
+    // A session that never set a goal still sees the human's shared goals.
+    const list = tool(goalTools(store, "fresh-session"), "goal_list");
+    const res = (await list.run({})) as { count: number; goals: { content: string }[] };
+    assert.equal(res.count, 1);
+    assert.equal(res.goals[0].content, "global standing goal");
+    store.close();
+});
+
+test("goal_list does not pull in other sessions' goals via the shared read", async () => {
+    const store = freshStore();
+    store.create({ content: "session-A goal", session: "A" });
+    store.create({ content: "shared goal" });
+    // Session B: sees the shared goal, never A's session-scoped one.
+    const list = tool(goalTools(store, "B"), "goal_list");
+    const res = (await list.run({})) as { count: number; goals: { content: string }[] };
+    assert.equal(res.count, 1);
+    assert.equal(res.goals[0].content, "shared goal");
+    store.close();
+});
+
+test("goal_list with no session scope still returns the shared goals", async () => {
+    // A session-less tool set (e.g. a single-session REPL) reads only the shared
+    // goals; there is no session bucket to add.
+    const store = freshStore();
+    store.create({ content: "lone shared goal" });
+    const list = tool(goalTools(store), "goal_list");
+    const res = (await list.run({})) as { count: number; goals: { content: string }[] };
+    assert.equal(res.count, 1);
+    assert.equal(res.goals[0].content, "lone shared goal");
+    store.close();
+});
+
 // ---------------------------------------------------------------------------
 // goalContext provider
 // ---------------------------------------------------------------------------
