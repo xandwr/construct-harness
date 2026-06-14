@@ -42,6 +42,11 @@ export * from "./notesFile.ts";
 export * from "./notesService.ts";
 export * from "./noteTools.ts";
 
+// The local shell: an unguarded tool the loop dispatches to run commands on the
+// user's real machine, the counterpart to the sandboxed code_execution server
+// tool.
+export * from "./shellTools.ts";
+
 // Context engineering: passive context, compaction, usage accounting.
 export * from "./context.ts";
 export * from "./compaction.ts";

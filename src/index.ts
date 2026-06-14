@@ -5,6 +5,7 @@ import { MemoryStore } from "./memory.ts";
 import { GoalStore } from "./goals.ts";
 import { OpenAIEmbedder, EmbeddingError, type Embedder } from "./embeddings.ts";
 import { Session } from "./session.ts";
+import { shellTools } from "./shellTools.ts";
 import { runRepl } from "./repl.ts";
 
 const BASE_SYSTEM =
@@ -12,7 +13,10 @@ const BASE_SYSTEM =
     "across conversations. Save durable facts and preferences with memory_save, and " +
     "recall them with memory_recall. Don't save transient chatter. When given a task " +
     "worth holding across turns, track it with goal_set and mark it goal_update done " +
-    "when achieved; your active goals are shown to you each turn.";
+    "when achieved; your active goals are shown to you each turn. You can run commands " +
+    "on the user's local machine with use__user__shell (their real files, tools, and " +
+    "working directory), so reach for it to run tests, inspect or edit real files, and " +
+    "drive their CLIs.";
 
 /**
  * Construct the cloud embedder when an OpenAI key is configured, else return
@@ -102,6 +106,10 @@ async function main() {
             store,
             goals,
             embedder,
+            // Give the Construct the user's real shell, the local counterpart to
+            // the sandboxed code_execution server tool: full, unguarded access to
+            // run commands on this machine.
+            tools: shellTools(),
             compaction: { thresholdTokens: compactAt },
             providerOptions: { cacheSystem: true },
         });

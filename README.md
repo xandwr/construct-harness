@@ -33,11 +33,15 @@ turn and how long the session has run ([`src/context.ts`](src/context.ts)); a
 `transcript_recall` tool to search its own durable event log, not just the
 in-context window ([`src/eventTools.ts`](src/eventTools.ts)); goals it sets and
 holds across turns, injected into every prompt so it doesn't drift from the task
-([`src/goals.ts`](src/goals.ts), [`src/goalTools.ts`](src/goalTools.ts)); and
+([`src/goals.ts`](src/goals.ts), [`src/goalTools.ts`](src/goalTools.ts));
 provider-hosted web search / fetch / code execution it can run server-side
-([`src/bridge/anthropic.ts`](src/bridge/anthropic.ts)). Its reasoning trace
-streams through to the UI as a collapsible block. None of this is auto-magic: each
-is a tool or a passive context provider you opt into when wiring the `Session`.
+([`src/bridge/anthropic.ts`](src/bridge/anthropic.ts)); and, the unguarded local
+counterpart to that sandboxed code execution, a `use__user__shell` tool that runs
+commands on the user's _real_ machine, with the harness process's own privileges,
+so it can run the project's tests, read or edit actual files, and drive the user's
+CLIs ([`src/shellTools.ts`](src/shellTools.ts)). Its reasoning trace streams
+through to the UI as a collapsible block. None of this is auto-magic: each is a
+tool or a passive context provider you opt into when wiring the `Session`.
 
 **An adversarial critic panel with stakes.** This is the part with no shipped
 equivalent we have found, and the reason the project exists. A reviewer agent

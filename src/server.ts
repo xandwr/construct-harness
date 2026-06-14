@@ -40,6 +40,7 @@ import type { LoopEvent } from "./bridge/loop.ts";
 import { NotesStore, Note, NoteError, type NoteFrontmatter } from "./notes.ts";
 import { NotesService } from "./notesService.ts";
 import { noteTools } from "./noteTools.ts";
+import { shellTools } from "./shellTools.ts";
 
 const BASE_SYSTEM =
     "You are a helpful, concise assistant: a long-lived Construct that remembers " +
@@ -52,7 +53,10 @@ const BASE_SYSTEM =
     "with transcript_recall. For longer-form documentation the human also edits (runbooks, " +
     "references, design notes), use the knowledge base: note_save / note_update to " +
     "write, note_recall to read it when relevant, note_link to relate a note to a " +
-    "memory or another note.";
+    "memory or another note. You also have two ways to run code: the sandboxed " +
+    "code-execution tool for disposable computation, and use__user__shell to run " +
+    "commands on the user's real local machine (their files, tools, and working " +
+    "directory) when the work has to touch this environment.";
 
 /** Compaction threshold (estimated tokens), well below the model's real window
  *  so there's headroom for the next turn. Overridable via COMPACT_AT. */
@@ -172,7 +176,9 @@ function buildDeps(): ServerDeps {
         embedder,
         // The agent opts into the KB: it gets the note tools (save/update/recall/
         // link) but notes are not auto-injected into context the way memories are.
-        tools: noteTools(notes, notesStore, embedder),
+        // It also gets use__user__shell, the unguarded local counterpart to the
+        // sandboxed code_execution server tool wired in via serverTools below.
+        tools: [...noteTools(notes, notesStore, embedder), ...shellTools()],
         compaction: { thresholdTokens: compactAt },
         // Cache the system prefix; turn on adaptive thinking with a summarized
         // display so the streaming path emits readable `thinking` deltas the
