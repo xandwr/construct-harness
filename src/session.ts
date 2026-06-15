@@ -26,6 +26,7 @@ import { MemoryStore, MAX_LIMIT } from "./memory.ts";
 import { memoryTools, recallContextDetailed } from "./memoryTools.ts";
 import { eventTools, embedEventIfPossible } from "./eventTools.ts";
 import { dreamTools, dreamContext } from "./dreamTools.ts";
+import { resumeContext } from "./resumeContext.ts";
 import { goalTools, goalContext } from "./goalTools.ts";
 import { GoalStore } from "./goals.ts";
 import type { Embedder } from "./embeddings.ts";
@@ -273,12 +274,29 @@ export class Session {
         this.cfg = config;
         this.events = config.events;
         this.sessionId = config.sessionId ?? freshSessionId();
+        // The working mind is built first (before the tools), because the memory
+        // tools take it: an explicit memory_recall feeds what it surfaced into the
+        // mind's warm-memory band, the same continuity passive auto-recall gets.
+        // It's the Construct's own recent state, on by default; disabled only by an
+        // explicit `false`. Constructed here so `memoryTools` below can close over
+        // it; the context provider that pushes it onto each turn is wired in once
+        // the base context is assembled.
+        this.mind =
+            config.workingMind === false
+                ? undefined
+                : new WorkingMind(typeof config.workingMind === "object" ? config.workingMind : {});
         // A store contributes its memory tools; an event log can contribute the
         // transcript tool (scoped to this Session) and the dream-recall tool
         // (spanning every dream, not session-scoped); the model's own tools come
         // last. transcript_recall and dream_recall are both on by default
         // whenever a log is present.
-        const memTools = config.store ? memoryTools(config.store, config.embedder) : [];
+        const memTools = config.store
+            ? memoryTools(config.store, {
+                  embedder: config.embedder,
+                  // Pass the mind so an explicit recall warms what it surfaced.
+                  mind: this.mind,
+              })
+            : [];
         const txTools =
             this.events && config.transcriptRecall !== false
                 ? eventTools(this.events, {
@@ -301,20 +319,20 @@ export class Session {
             temporalContext(),
             ...(config.goals ? [goalContext(config.goals, this.sessionId)] : []),
             ...(this.events && config.dreams !== false ? [dreamContext(this.events)] : []),
+            // The resume catch-up: on the first turn of a conversation resumed
+            // after a real gap, a one-shot "while you were away" block assembled
+            // from the dream/goal events that accumulated during the absence. No
+            // model call; pure log assembly. Needs the log to read those events,
+            // so it's added only when one is present.
+            ...(this.events ? [resumeContext(this.events)] : []),
         ];
         // The working mind is orthogonal to the context *list*: it's the
-        // Construct's own recent state, on by default. So it's appended even when
-        // a caller supplies their own `context` (replacing the defaults shouldn't
-        // silently drop the mind) — unless explicitly disabled with `false`.
-        if (config.workingMind === false) {
-            this.mind = undefined;
-            this.context = baseContext;
-        } else {
-            this.mind = new WorkingMind(
-                typeof config.workingMind === "object" ? config.workingMind : {},
-            );
-            this.context = [...baseContext, workingMindContext(this.mind)];
-        }
+        // Construct's own recent state (built above so the memory tools could take
+        // it). So its provider is appended even when a caller supplies their own
+        // `context` — replacing the defaults shouldn't silently drop the mind —
+        // unless the mind was disabled with `false`, in which case there's nothing
+        // to push.
+        this.context = this.mind ? [...baseContext, workingMindContext(this.mind)] : baseContext;
         this.startedAt = this.resolveStart();
     }
 
@@ -369,6 +387,28 @@ export class Session {
     /** A read-only snapshot of the durable conversation (no system turn). */
     history(): readonly Message[] {
         return this.conversation;
+    }
+
+    /**
+     * Seed the working mind's `concern` band with topics the Construct has been
+     * raising unprompted across sessions (mined during downtime; see
+     * {@link mineConcerns}). Called when a conversation becomes live, so the
+     * Construct wakes already holding what it keeps returning to.
+     *
+     * This is the *only* way a concern enters the mind, and it deliberately just
+     * `note`s — it never refreshes a concern's warmth afterwards. A seeded concern
+     * decays like any band item; it stays present only if the Construct keeps
+     * bringing it up (which re-`note`s it as a thought, and re-mines it next
+     * downtime), and slips out on its own if it stops. The harness identifies the
+     * candidate; the Construct decides it's real by continuing to raise it. The
+     * text is the Construct's own phrase, lifted verbatim by the miner — never a
+     * harness paraphrase. No-op when the mind is disabled or the list is empty.
+     */
+    seedConcerns(texts: readonly string[]): void {
+        if (!this.mind) return;
+        for (const text of texts) {
+            this.mind.note("concern", text);
+        }
     }
 
     /** Drop the in-memory conversation, starting the Construct fresh. Memory in

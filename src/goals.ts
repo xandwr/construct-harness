@@ -57,6 +57,29 @@ export type GoalStatus = "active" | "done" | "abandoned";
 export type GoalChange = "created" | "deleted" | "status" | "edited";
 
 /**
+ * The event-log `kind` a goal change is recorded under, the goal counterpart to
+ * `DREAM_EVENT_KIND`. One kind covers the whole lifecycle (created, deleted,
+ * status, edited); the change is discriminated by `meta.change`, so a reader can
+ * filter goal events with `recent({ kind: GOAL_EVENT_KIND })` and tell what
+ * happened from the payload. Defined here (not at the wiring site) so any reader
+ * of the log — the server's {@link GoalEventSink}, the resume catch-up provider —
+ * agrees on the constant by construction rather than a scattered string literal.
+ */
+export const GOAL_EVENT_KIND = "goal";
+
+/**
+ * The shape a goal change writes into a {@link GOAL_EVENT_KIND} event's `meta`.
+ * Read defensively (the EventStore degrades a corrupt meta to `undefined`), but
+ * named here so both the writer (the sink) and readers (the resume provider) work
+ * against one declared structure rather than re-guessing the fields.
+ */
+export interface GoalEventMeta {
+    change: GoalChange;
+    goalId: number;
+    status: GoalStatus;
+}
+
+/**
  * A callback the store invokes after a successful write, so a change to the
  * agent's intent can be recorded in the event log the way a message or a tool
  * call is — "goals also emit events when added/deleted." It is the store's only

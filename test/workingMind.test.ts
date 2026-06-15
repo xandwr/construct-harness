@@ -151,3 +151,41 @@ test("render does not leak the warmth number (mechanism stays hidden)", () => {
     const text = mind.render()!;
     assert.doesNotMatch(text, /warmth|0\.\d|\bdecay\b/i);
 });
+
+test("a concern is held in its own band and rendered as a recurring topic", () => {
+    const mind = new WorkingMind();
+    mind.note("concern", "the limits of the computer");
+    const text = mind.render();
+    assert.ok(text);
+    assert.match(text!, /keep returning to|recurring concerns/i);
+    assert.match(text!, /the limits of the computer/);
+});
+
+test("concern, thought, and memory bands render as three separate sections", () => {
+    const mind = new WorkingMind();
+    mind.note("thought", "a recent reasoning tail");
+    mind.note("memory", "a surfaced fact");
+    mind.note("concern", "a standing concern");
+    const text = mind.render()!;
+    assert.match(text!, /train of thought/i);
+    assert.match(text!, /surfaced and still warm/i);
+    assert.match(text!, /keep returning to/i);
+    assert.match(text!, /a recent reasoning tail/);
+    assert.match(text!, /a surfaced fact/);
+    assert.match(text!, /a standing concern/);
+});
+
+test("a concern decays out on its own when it stops being raised (the hard constraint)", () => {
+    // The harness only seeds a concern; it stays present only while the Construct
+    // keeps bringing it up. Left un-refreshed, it cools and slips out — exactly
+    // like a thought that stopped recurring.
+    const mind = new WorkingMind({ decay: 0.5, floor: 0.15 });
+    mind.note("concern", "an idea I keep returning to");
+    // Age it without ever re-noting it: it should fall below the floor and drop.
+    for (let i = 0; i < 5; i++) mind.tick();
+    assert.equal(
+        mind.snapshot().filter((i) => i.band === "concern").length,
+        0,
+        "an un-reinforced concern decays out without any harness deletion",
+    );
+});

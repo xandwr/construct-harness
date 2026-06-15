@@ -199,6 +199,66 @@ test("workingMind:false disables the pushed mind entirely", async () => {
     assert.doesNotMatch(wireSystemOf(client, 1), /on your mind/i);
 });
 
+test("seedConcerns pushes mined concerns into the working mind", async () => {
+    const client = new FakeClient([textTurn("acknowledged")]);
+    const session = new Session({ client, system: "S" });
+    // The harness seeds candidates; the Construct decides by continuing to raise
+    // them. On the turn right after seeding, the concern is in front of the model.
+    session.seedConcerns(["the limits of the computer"]);
+    await send(session, "hello");
+    const wire = wireSystemOf(client, 0);
+    assert.match(wire, /keep returning to|recurring concerns/i);
+    assert.match(wire, /the limits of the computer/);
+});
+
+test("seedConcerns is a no-op when the working mind is disabled", () => {
+    const client = new FakeClient([]);
+    const session = new Session({ client, system: "S", workingMind: false });
+    // Must not throw with no mind to write to.
+    assert.doesNotThrow(() => session.seedConcerns(["a concern"]));
+});
+
+test("a resumed conversation gets a 'while you were away' catch-up after a long gap", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        // A first conversation, one turn, logged long ago.
+        const longAgo = Date.now() - 31 * 60 * 1000; // 31 minutes: past the 30m gate
+        const first = new FakeClient([textTurn("noted")]);
+        const s1 = new Session({ client: first, system: "S", events, dreams: false });
+        // Manually log a user turn with an old timestamp so the resume sees a gap.
+        events.append({
+            kind: "message",
+            role: "user",
+            content: "see you later",
+            session: s1.id,
+            ts: longAgo,
+        });
+        // A dream happened during the gap (logged directly under the dream kind).
+        events.append({
+            kind: "dream",
+            role: "agent",
+            content: "the dreamer chose to wait",
+            meta: {
+                persona: { name: "Nightjar" },
+                scenario: "You face a quiet choice.",
+                sourceMemoryIds: [],
+            },
+            ts: longAgo + 60_000,
+        });
+
+        // Resume the same conversation and take a turn: the catch-up should appear
+        // on the first wire.
+        const second = new FakeClient([textTurn("back now")]);
+        const s2 = await Session.resume({ client: second, system: "S", events, sessionId: s1.id });
+        await send(s2, "I'm back");
+        const wire = wireSystemOf(second, 0);
+        assert.match(wire, /while you were away/i);
+        assert.match(wire, /Nightjar/);
+    } finally {
+        events.close();
+    }
+});
+
 test("a surfaced memory stays warm into a next turn whose message doesn't match it", async () => {
     const dir = mkdtempSync(join(tmpdir(), "wm-warm-"));
     try {

@@ -65,9 +65,15 @@ import {
     Goal,
     GoalError,
     isGoalStatus,
+    GOAL_EVENT_KIND,
     type GoalStatus,
     type GoalChange,
+    type GoalEventMeta,
 } from "./goals.ts";
+
+// Re-export the goal event kind from its home in goals.ts so existing importers
+// of `server.ts` (and the test suite) keep resolving it here unchanged.
+export { GOAL_EVENT_KIND };
 import { OpenAIEmbedder, EmbeddingError, type Embedder } from "./embeddings.ts";
 import { Session, type SessionConfig, type ImageInput } from "./session.ts";
 import type { LoopEvent } from "./bridge/loop.ts";
@@ -79,6 +85,8 @@ import { BUILTIN_COMMANDS } from "./commands.ts";
 import { dreamLoop, DREAM_EVENT_KIND, type Dream } from "./dreaming.ts";
 import { SYSTEM_PROMPT } from "./systemPrompt.ts";
 import { UserPresence, type Override } from "./presence.ts";
+import { DowntimeDaemon } from "./downtimeDaemon.ts";
+import { gardenTools } from "./memoryGarden.ts";
 
 // The base system prompt lives in SYSTEM.md at the repo root (see
 // systemPrompt.ts), not inline here, so the Construct's persona is a markdown
@@ -121,6 +129,11 @@ interface ServerDeps {
      *  user turn (the chat route), read by `/api/presence`, written by a PUT to
      *  the same. In-process for the process's life; see {@link UserPresence}. */
     presence: UserPresence;
+    /** The downtime daemon: watches {@link presence} and, once the human has been
+     *  genuinely away a while, puts the silence to use — dreaming, mining the
+     *  Construct's recurring concerns, gardening the memory store. Started in
+     *  {@link buildDeps} and stopped on {@link close}. See {@link DowntimeDaemon}. */
+    daemon: DowntimeDaemon;
     notes?: NotesService;
     notesStore?: NotesStore;
     /** The live runtime knobs the settings page reads and writes: the model in
@@ -202,15 +215,37 @@ export class SessionPool {
     /** The conversation a chat with no session id lands on, so a client that
      *  never names one keeps talking to the same conversation across turns. */
     private readonly defaultId: string;
+    /** Supplies the concern candidates a freshly-live Session is seeded with —
+     *  the topics the Construct keeps raising unprompted, mined during downtime
+     *  (the daemon's {@link DowntimeDaemon.concerns}). Optional: with none, a
+     *  Session simply starts with an empty concern band. The pool calls it each
+     *  time a conversation becomes live, so a Construct picking a conversation back
+     *  up wakes already holding what it keeps returning to. */
+    private readonly seedConcerns?: () => readonly string[];
 
     /** Register one brand-new live conversation at boot via {@link config}, so
      *  the server always has an addressable live conversation even before anyone
-     *  resumes a past one; its id becomes the default. */
-    constructor(config: SessionConfigBase) {
+     *  resumes a past one; its id becomes the default. `seedConcerns`, when given,
+     *  seeds each conversation's concern band as it becomes live. */
+    constructor(config: SessionConfigBase, seedConcerns?: () => readonly string[]) {
         this.config = config;
+        this.seedConcerns = seedConcerns;
         const initial = new Session(config());
+        this.seed(initial);
         this.sessions.set(initial.id, initial);
         this.defaultId = initial.id;
+    }
+
+    /** Seed a newly-live Session's concern band from the provider, if one is
+     *  wired. Best-effort: a provider hiccup must not block bringing a
+     *  conversation live. */
+    private seed(session: Session): void {
+        if (!this.seedConcerns) return;
+        try {
+            session.seedConcerns(this.seedConcerns());
+        } catch {
+            // A concern seed is an enhancement, never a gate on the conversation.
+        }
     }
 
     /** Whether a conversation is currently live (has an in-memory Session in the
@@ -241,6 +276,9 @@ export class SessionPool {
         const live = this.sessions.get(id);
         if (live) return live;
         const resumed = await Session.resume({ ...this.config(), sessionId: id });
+        // Seed its concern band before it takes its first turn, so the resumed
+        // conversation wakes holding what the Construct keeps returning to.
+        this.seed(resumed);
         this.sessions.set(resumed.id, resumed);
         return resumed;
     }
@@ -495,20 +533,48 @@ function buildDeps(): ServerDeps {
         // are not auto-injected into context the way memories are; the shell
         // (use__user__shell) is the unguarded local counterpart to the sandboxed
         // code_execution server tool enabled via providerOptions.serverTools.
-        tools: localGroups.filter((g) => runtime.isLocalEnabled(g.key)).flatMap((g) => g.build()),
+        // garden_review is always on: it's the read side of memory gardening (the
+        // downtime daemon flags consolidation candidates; this lets the Construct
+        // review and act on them with the memory tools it already has).
+        tools: [
+            ...localGroups.filter((g) => runtime.isLocalEnabled(g.key)).flatMap((g) => g.build()),
+            ...gardenTools(events),
+        ],
         compaction: { thresholdTokens: compactAt },
         // The shared, mutable provider options (see above): live edits land here.
         providerOptions: sharedProviderOptions,
     });
-    const sessions = new SessionPool(sessionConfig);
-    // Tracks streaming turns so the cancel route can abort one by session id.
-    const inflight = new InflightTurns();
 
     // The human's presence. Seed last-activity with boot time so a freshly
     // launched daemon reads Online rather than "never seen": today the client and
     // daemon launch together, so a booted process means a present human. The first
-    // user message re-touches it; 15 minutes of silence flips it to Away.
+    // user message re-touches it; 15 minutes of silence flips it to Away. Built
+    // before the daemon (which gates on it) and the pool (which seeds from the
+    // daemon's mined concerns).
     const presence = new UserPresence(Date.now());
+
+    // The downtime daemon: bridges the human stepping away to the Construct using
+    // the silence. Constructed before the pool so the pool can seed each live
+    // conversation's concern band from the daemon's mined candidates. Started
+    // below, once the deps are assembled; stopped on close().
+    const daemon = new DowntimeDaemon({
+        presence,
+        events,
+        store,
+        client,
+        embedder,
+        onDream: (d) =>
+            console.log(`  dreamed during downtime as ${d.persona.name ?? "(unknown)"}`),
+        onGarden: (pairs) =>
+            console.log(`  flagged ${pairs.length} memory-consolidation candidate(s)`),
+    });
+
+    // The pool seeds each newly-live conversation's concern band from the daemon's
+    // latest mined concerns, so a Construct picking a conversation back up wakes
+    // holding what it keeps returning to (empty until the first downtime mining).
+    const sessions = new SessionPool(sessionConfig, () => daemon.concerns());
+    // Tracks streaming turns so the cancel route can abort one by session id.
+    const inflight = new InflightTurns();
 
     notes
         .start()
@@ -537,6 +603,11 @@ function buildDeps(): ServerDeps {
             );
     }
 
+    // Arm the downtime daemon: from here it watches presence and, once the human
+    // has been away long enough, dreams / mines concerns / gardens memory. Its
+    // interval is unref'd, so it never on its own keeps the process alive.
+    daemon.start();
+
     return {
         client,
         store,
@@ -545,6 +616,7 @@ function buildDeps(): ServerDeps {
         sessions,
         inflight,
         presence,
+        daemon,
         notes,
         notesStore,
         runtime,
@@ -572,7 +644,11 @@ function buildDeps(): ServerDeps {
             },
         },
         close() {
-            // Stop the watcher first so no inbound event races the store closing.
+            // Stop the downtime daemon first so no dream/garden tick races the
+            // store closing. A dream already in flight is left to finish (the
+            // daemon doesn't interrupt it); stop() only disarms the next tick.
+            daemon.stop();
+            // Stop the watcher next so no inbound event races the store closing.
             notes.close();
             // Close the handles. All point at the same file; closing checkpoints
             // the WAL, so order only affects which one truncates it. Either order
@@ -802,13 +878,6 @@ function memoryToJson(m: Memory, deps: Pick<ServerDeps, "store" | "events">, now
     };
 }
 
-/** The event `kind` a goal change is logged under, the goal counterpart to
- *  {@link DREAM_EVENT_KIND}. One kind covers the whole lifecycle (created,
- *  deleted, status, edited); the `meta.change` discriminates, so a reader can
- *  filter goal events with `recent({ kind: GOAL_EVENT_KIND })` and tell what
- *  happened from the payload. */
-export const GOAL_EVENT_KIND = "goal";
-
 /**
  * Build the {@link GoalEventSink} that records a goal write into the event log,
  * so adding or deleting a goal leaves the same kind of trace a message or a
@@ -836,11 +905,12 @@ export function goalEventSink(
     };
     return (change, goal, now) => {
         try {
+            const meta: GoalEventMeta = { change, goalId: goal.id, status: goal.status };
             events.append({
                 kind: GOAL_EVENT_KIND,
                 role: "agent",
                 content: `Goal ${verb[change]}: ${goal.content}`,
-                meta: { change, goalId: goal.id, status: goal.status },
+                meta,
                 session: goal.session,
                 ts: now,
             });

@@ -16,6 +16,7 @@
 import type { ToolDef } from "./types.ts";
 import { Memory, MemoryError, MemoryStore, MAX_LIMIT } from "./memory.ts";
 import { embedOne, EmbeddingError, type Embedder } from "./embeddings.ts";
+import type { WorkingMind } from "./workingMind.ts";
 
 /** How many memories auto-recall injects by default. */
 export const DEFAULT_RECALL_LIMIT = 10;
@@ -141,10 +142,19 @@ async function recallMemories(
 
 /** An existing memory a save was found to duplicate, with the score that decided
  *  it (the cosine similarity, or 1 for an exact-content match on the no-embedder
- *  path). */
+ *  path) and which path caught it. `semantic_duplicate` is a meaning-match above
+ *  the cosine threshold (a reworded restatement of the same fact); `exact_match`
+ *  is a byte-identical (case/whitespace-folded) content match, the no-embedder
+ *  floor and the semantic path's backstop. The save surfaces this `reason` so the
+ *  Construct can tell "you already said this in other words" from "this is
+ *  literally already saved" and decide whether to update the existing memory or
+ *  force a separate save. */
+type DuplicateReason = "semantic_duplicate" | "exact_match";
+
 interface DuplicateHit {
     memory: Memory;
     similarity: number;
+    reason: DuplicateReason;
 }
 
 /**
@@ -178,7 +188,7 @@ async function findDuplicate(
             const vec = await embedOne(embedder, trimmed);
             const [top] = store.semanticSearch(vec, { limit: 1 });
             if (top && top.score >= threshold) {
-                return { memory: top.memory, similarity: top.score };
+                return { memory: top.memory, similarity: top.score, reason: "semantic_duplicate" };
             }
             // A confident semantic *non*-match still falls through to the exact
             // check below: a brand-new memory that happens to be byte-identical to
@@ -194,7 +204,7 @@ async function findDuplicate(
     const folded = trimmed.toLowerCase();
     for (const m of store.search(trimmed, { limit: MAX_LIMIT })) {
         if (m.content.trim().toLowerCase() === folded) {
-            return { memory: m, similarity: 1 };
+            return { memory: m, similarity: 1, reason: "exact_match" };
         }
     }
     return undefined;
@@ -212,6 +222,15 @@ export interface MemoryToolOptions {
      * (exact-content dedup still applies).
      */
     dedupeThreshold?: number;
+    /**
+     * The Construct's working mind. When given, an *explicit* `memory_recall`
+     * feeds the memories it surfaced into the mind's warm-memory band the same
+     * way passive auto-recall does (see {@link Session.buildSystem}), so a memory
+     * the Construct deliberately reached for stays warm afterwards rather than
+     * blinking out. Optional, same pattern as {@link embedder}: omit it and the
+     * recall tool just returns its hits.
+     */
+    mind?: WorkingMind;
 }
 
 /**
@@ -246,6 +265,7 @@ export function memoryTools(
         : (embedderOrOptions ?? {});
     const embedder = options.embedder;
     const dedupeThreshold = options.dedupeThreshold ?? DEFAULT_DEDUPE_THRESHOLD;
+    const mind = options.mind;
     const save: ToolDef = {
         name: "memory_save",
         description:
@@ -289,6 +309,11 @@ export function memoryTools(
                         return {
                             saved: false,
                             deduped: true,
+                            // Which check caught it: a meaning-match above the
+                            // cosine threshold vs a byte-identical content match. Let
+                            // the Construct decide between memory_update (revise the
+                            // existing one) and force:true (save a distinct memory).
+                            reason: dup.reason,
                             similarity: dup.similarity,
                             memory: toView(dup.memory),
                         };
@@ -399,6 +424,24 @@ export function memoryTools(
             const limit = typeof a.limit === "number" ? a.limit : DEFAULT_RECALL_LIMIT;
             const tags = asTags(a.tags);
             const hits = await recallMemories(store, embedder, query, { limit, tags });
+            // Reinforce every memory an *explicit* recall surfaced. Reaching for a
+            // memory deliberately is a stronger relevance signal than passively
+            // matching one during auto-recall (which buildSystem already
+            // reinforces), so an explicit hit should strengthen at least as much.
+            // Best-effort, mirroring buildSystem's discipline: a strength write is
+            // an earned ranking signal, not load-bearing for the tool call, so a
+            // failure (closed store, vanished row) is swallowed.
+            for (const m of hits) {
+                try {
+                    store.reinforce(m.id);
+                } catch {
+                    // Swallowed exactly like the passive-recall reinforce loop.
+                }
+                // And feed it into the working mind's warm-memory band, the same
+                // way passively-surfaced memories enter it, keyed by store id so a
+                // memory recalled again refreshes its warmth rather than stacking.
+                mind?.note("memory", m.content, `m${m.id}`);
+            }
             return { count: hits.length, memories: hits.map(toView) };
         },
     };

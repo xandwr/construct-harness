@@ -51,6 +51,8 @@ export * from "./shellTools.ts";
 // usage accounting.
 export * from "./context.ts";
 export * from "./workingMind.ts";
+export * from "./resumeContext.ts";
+export * from "./salience.ts";
 export * from "./compaction.ts";
 export * from "./usage.ts";
 
@@ -71,6 +73,12 @@ export * from "./biasHarness.ts";
 // that bridge those dreams back into the loop (recall + last-dream injection).
 export * from "./dreaming.ts";
 export * from "./dreamTools.ts";
+
+// Downtime: the daemon that bridges the human stepping away to the Construct
+// dreaming, mining its concerns, and gardening its memory, plus the gardening
+// pass and its review tool.
+export * from "./downtimeDaemon.ts";
+export * from "./memoryGarden.ts";
 
 // The interactive runner, for embedding a REPL in your own entry point.
 export * from "./repl.ts";

@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { MemoryStore, Memory } from "../src/memory.ts";
 import { EventStore } from "../src/events.ts";
 import { memoryTools, recallContext, DEFAULT_RECALL_LIMIT } from "../src/memoryTools.ts";
+import { WorkingMind } from "../src/workingMind.ts";
 import { EmbeddingError, type Embedder } from "../src/embeddings.ts";
 import { runLoop } from "../src/bridge/loop.ts";
 import { RoleType } from "../src/types.ts";
@@ -148,6 +149,49 @@ test("memory_recall filters by tags", async () => {
         res.memories.map((m) => m.content),
         ["work thing"],
     );
+    store.close();
+});
+
+test("explicit memory_recall reinforces every memory it surfaces", async () => {
+    const store = freshStore();
+    const m = store.save(new Memory({ content: "the keystone fact", importance: 0.5 }));
+    // Strength before any recall: the un-reinforced baseline.
+    const before = store.strengthOf(m.id)!;
+
+    const recall = tool(memoryTools(store), "memory_recall");
+    await recall.run({ query: "keystone" });
+
+    const after = store.strengthOf(m.id)!;
+    assert.ok(
+        after > before,
+        `an explicit recall should strengthen what it surfaced (${before} → ${after})`,
+    );
+    store.close();
+});
+
+test("explicit memory_recall feeds the working mind's warm-memory band", async () => {
+    const store = freshStore();
+    store.save(new Memory({ content: "remember the airlock code" }));
+    const mind = new WorkingMind();
+    const recall = tool(memoryTools(store, { mind }), "memory_recall");
+
+    await recall.run({ query: "airlock" });
+
+    const snap = mind.snapshot().filter((i) => i.band === "memory");
+    assert.equal(snap.length, 1, "the recalled memory entered the mind's memory band");
+    assert.match(snap[0]!.text, /airlock code/);
+    // Keyed by store id, so recalling it again refreshes rather than stacks.
+    await recall.run({ query: "airlock" });
+    assert.equal(mind.snapshot().filter((i) => i.band === "memory").length, 1);
+    store.close();
+});
+
+test("memory_recall without a mind still returns its hits (mind is optional)", async () => {
+    const store = freshStore();
+    store.save(new Memory({ content: "a fact" }));
+    const recall = tool(memoryTools(store), "memory_recall");
+    const res = (await recall.run({ query: "fact" })) as { count: number };
+    assert.equal(res.count, 1);
     store.close();
 });
 
@@ -296,11 +340,13 @@ test("memory_save dedupes an exact-content repeat (no embedder)", async () => {
     const dup = (await save.run({ content: "  User lives in Berlin  " })) as {
         saved: boolean;
         deduped: boolean;
+        reason: string;
         similarity: number;
         memory: { content: string };
     };
     assert.equal(dup.saved, false);
     assert.equal(dup.deduped, true);
+    assert.equal(dup.reason, "exact_match");
     assert.equal(dup.similarity, 1);
     assert.equal(dup.memory.content, "user lives in Berlin"); // the existing row
     assert.equal(store.count(), 1); // no second row
@@ -321,10 +367,12 @@ test("memory_save dedupes a semantic near-duplicate when an embedder is configur
     const dup = (await save.run({ content: "the user likes dark mode" })) as {
         saved: boolean;
         deduped: boolean;
+        reason: string;
         similarity: number;
     };
     assert.equal(dup.saved, false);
     assert.equal(dup.deduped, true);
+    assert.equal(dup.reason, "semantic_duplicate");
     assert.ok(dup.similarity >= 0.95);
     assert.equal(store.count(), 1);
 

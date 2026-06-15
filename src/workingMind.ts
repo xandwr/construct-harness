@@ -47,14 +47,21 @@ import type { ContextProvider } from "./context.ts";
  *  - `memory`: a stored memory that surfaced (via recall or because it came up),
  *    kept warm a while after so it doesn't blink out the moment the next message
  *    stops matching it. The glass-pane fix: what came up stays up, then fades.
+ *  - `concern`: a topic the Construct keeps raising *unprompted* across sessions
+ *    (the user didn't introduce it; the Construct brought it up, repeatedly).
+ *    Unlike thought/memory, a concern is mined during downtime from the event
+ *    log (see {@link ./salience.ts}) and noted into the mind when a session
+ *    starts. The harness only ever *identifies* a candidate; whether it's a real
+ *    concern is decided by the Construct continuing to raise it — if it stops,
+ *    the warmth decays and the concern slips out on its own, exactly like a
+ *    thought that stopped recurring. The harness never authors a concern's text:
+ *    it's the Construct's own recurring noun phrase, lifted verbatim.
  *
- * `concern` and `person` are deliberately absent from v1: populating them
- * honestly (without a summarizer authoring the mind) is the fuzziest part, and
- * thought + memory are the two that most directly answer "behind glass". They
- * can be added as bands here once there's a faithful signal to promote them
- * from.
+ * `person` is deliberately still absent: populating it honestly (without a
+ * summarizer authoring the mind) needs a faithful signal we don't have yet. It
+ * can be added as a band here once there is one.
  */
-export type MindBand = "thought" | "memory";
+export type MindBand = "thought" | "memory" | "concern";
 
 /** One thing held in mind: a piece of text, how warm it is, and when it was last
  *  refreshed. `key` is what de-dupes reinforcement from duplication: two notes
@@ -236,6 +243,7 @@ export class WorkingMind {
         const sections: string[] = [];
         const thoughts = snap.filter((i) => i.band === "thought");
         const memories = snap.filter((i) => i.band === "memory");
+        const concerns = snap.filter((i) => i.band === "concern");
 
         if (thoughts.length) {
             const lines = thoughts.map((i) => `- ${i.text}`).join("\n");
@@ -244,6 +252,12 @@ export class WorkingMind {
         if (memories.length) {
             const lines = memories.map((i) => `- ${i.text}`).join("\n");
             sections.push(`Recently surfaced and still warm:\n${lines}`);
+        }
+        if (concerns.length) {
+            const lines = concerns.map((i) => `- ${i.text}`).join("\n");
+            sections.push(
+                `Things you keep returning to of your own accord (recurring concerns, not prompts):\n${lines}`,
+            );
         }
 
         return `What's currently on your mind, carried over from the last few moments (not something to act on, just what you already hold):\n\n${sections.join("\n\n")}`;
