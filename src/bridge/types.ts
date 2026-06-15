@@ -57,11 +57,24 @@ export interface GenerateParams {
     maxTokens?: number;
     /** Opaque, per-provider extras gated by {@link ProviderCapabilities}. */
     providerOptions?: ProviderOptions;
+    /**
+     * Cooperative cancellation. When the caller aborts this signal mid-request,
+     * the provider tears the connection down and surfaces the failure as a
+     * {@link HarnessError} of kind `"canceled"` (Anthropic's
+     * `APIUserAbortError`, never retried). For {@link ModelClient.stream} this is
+     * the load-bearing path behind a user pressing "stop": deltas already yielded
+     * before the abort are real output the consumer keeps; the abort just ends the
+     * turn early. Omit for an uninterruptible request.
+     */
+    signal?: AbortSignal;
 }
 
 /** Why generation stopped, normalized across providers. `"other"` carries the
- *  raw provider reason in {@link GenerateResult.raw} for inspection. */
-export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "refusal" | "other";
+ *  raw provider reason in {@link GenerateResult.raw} for inspection. `"canceled"`
+ *  is never a provider's own reason — the harness stamps it on the partial result
+ *  it assembles when a caller aborts a stream mid-flight (see the streaming loop),
+ *  so a consumer can tell a turn the user stopped from one the model finished. */
+export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "refusal" | "canceled" | "other";
 
 /** Token accounting, normalized. Providers that don't report a field omit it. */
 export interface Usage {

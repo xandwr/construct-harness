@@ -363,6 +363,89 @@ test("a plain text turn appends a user message and an agent reply to the log", a
     }
 });
 
+test("cancelling a turn saves the partial reply and logs a ResponseCancelled marker", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        // The model streams two text parts, then the user presses "stop".
+        const client = new FakeClient([
+            {
+                content: [
+                    { kind: "text", text: "Half of an " },
+                    { kind: "text", text: "answer." },
+                    { kind: "text", text: " The rest never comes." },
+                ],
+                abortAfterTextParts: 2,
+            },
+        ]);
+        const session = new Session({ client, system: "S", events });
+
+        // Drain the turn (the abort is scripted, so no external signal needed).
+        let streamed = "";
+        const gen = session.send("go");
+        let next = await gen.next();
+        let sawCancelled = false;
+        while (!next.done) {
+            const e: LoopEvent = next.value;
+            if (e.kind === "text") streamed += e.text;
+            if (e.kind === "cancelled") sawCancelled = true;
+            next = await gen.next();
+        }
+        const result = next.value;
+
+        // The stream surfaced the cancellation and the partial prose was kept.
+        assert.ok(sawCancelled, "a cancelled event must reach the consumer");
+        assert.equal(streamed, "Half of an answer.");
+        assert.equal(result.cancelled, true);
+        assert.equal(result.text, "Half of an answer.");
+
+        // The log holds: the user turn, the saved partial reply, and the marker —
+        // in that order. The partial stream is NOT discarded.
+        const log = events.recent({ session: session.id }).reverse();
+        assert.equal(log.length, 3);
+        assert.equal(log[0]!.kind, "message");
+        assert.equal(log[0]!.role, "user");
+        assert.equal(log[1]!.kind, "message");
+        assert.equal(log[1]!.role, "agent");
+        assert.equal(log[1]!.content, "Half of an answer.", "the partial reply must be saved");
+        assert.equal(log[2]!.kind, "response_cancelled");
+        assert.equal(log[2]!.role, "user");
+        assert.deepEqual(log[2]!.meta, { savedChars: "Half of an answer.".length });
+
+        // The committed conversation ends with the partial assistant turn, so the
+        // next turn builds on what was actually said.
+        const history = session.history();
+        const last = history.at(-1)!;
+        assert.equal(last.sender.role, RoleType.Agent);
+    } finally {
+        events.close();
+    }
+});
+
+test("an external abort signal cancels the turn and still saves what streamed", async () => {
+    const events = new EventStore(":memory:");
+    try {
+        const controller = new AbortController();
+        // Abort the signal up front: the stream throws before any delta, so the
+        // reply is empty but the turn is still recorded as cancelled.
+        controller.abort();
+        const client = new FakeClient([textTurn("never streams")]);
+        const session = new Session({ client, system: "S", events });
+
+        const gen = session.send("go", [], controller.signal);
+        let next = await gen.next();
+        while (!next.done) next = await gen.next();
+        assert.equal(next.value.cancelled, true);
+
+        const log = events.recent({ session: session.id }).reverse();
+        // user message + cancellation marker (no agent reply: nothing streamed).
+        const kinds = log.map((e) => e.kind);
+        assert.deepEqual(kinds, ["message", "response_cancelled"]);
+        assert.deepEqual(log.at(-1)!.meta, { savedChars: 0 });
+    } finally {
+        events.close();
+    }
+});
+
 test("send with an image shows the model the image and persists its bytes", async () => {
     const events = new EventStore(":memory:");
     try {

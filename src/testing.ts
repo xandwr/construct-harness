@@ -17,6 +17,7 @@
 
 import { RoleType } from "./types.ts";
 import type { ContentPart, Message } from "./types.ts";
+import { HarnessError } from "./bridge/errors.ts";
 import type {
     CoreDelta,
     GenerateParams,
@@ -38,6 +39,15 @@ export interface ScriptedTurn {
      * non-streaming `generate`, which has no delta channel.
      */
     thinking?: string;
+    /**
+     * If set, `stream` aborts partway through this turn the way a user pressing
+     * "stop" does: it yields this many of the turn's text parts, then throws a
+     * `canceled` {@link HarnessError} (the same kind a real abort surfaces)
+     * instead of finishing with `done`. Lets a test drive the cancellation path
+     * deterministically, asserting that the partial text already yielded is saved.
+     * Ignored by `generate` (single-shot, no partial output to keep).
+     */
+    abortAfterTextParts?: number;
 }
 
 const NO_CAPS: ProviderCapabilities = {
@@ -113,10 +123,30 @@ export class FakeClient implements ModelClient {
         // A real provider streams its reasoning trace first, then the answer.
         if (turn.thinking) yield { kind: "thinking", text: turn.thinking };
 
+        // Mirror a real provider's cooperative cancellation: throw the same
+        // `canceled` HarnessError the Anthropic client would, both for an
+        // already-aborted signal and once it aborts mid-iteration. The deltas
+        // yielded before this point are real output the consumer keeps.
+        const aborted = () =>
+            new HarnessError("request canceled", { kind: "canceled", retryable: false });
+        if (params.signal?.aborted) throw aborted();
+
+        let textParts = 0;
         for (const part of turn.content) {
             if (part.kind === "text") {
+                if (params.signal?.aborted) throw aborted();
                 yield { kind: "text", text: part.text };
+                textParts++;
+                // Scripted abort: stop after N text parts, as if the user pressed
+                // "stop" with this much of the reply already on screen.
+                if (
+                    turn.abortAfterTextParts !== undefined &&
+                    textParts >= turn.abortAfterTextParts
+                ) {
+                    throw aborted();
+                }
             } else if (part.kind === "tool_call") {
+                if (params.signal?.aborted) throw aborted();
                 yield { kind: "tool_call_start", id: part.id, name: part.name };
                 yield {
                     kind: "tool_call_args",

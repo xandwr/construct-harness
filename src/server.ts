@@ -112,6 +112,10 @@ interface ServerDeps {
      *  Each one accepts new turns; a conversation only in the log (not here) is a
      *  past one waiting to be resumed into the pool on its next turn. */
     sessions: SessionPool;
+    /** The chat turns currently streaming, each behind an AbortController the
+     *  `/api/chat/cancel` route fires so the human can stop a reply mid-stream and
+     *  the server still saves what was produced. See {@link InflightTurns}. */
+    inflight: InflightTurns;
     /** The human's presence (Online/Away/DND/Offline), computed from when they
      *  last sent a message plus any manual override they pinned. Touched on every
      *  user turn (the chat route), read by `/api/presence`, written by a PUT to
@@ -257,6 +261,59 @@ export class SessionPool {
         if (live) return live;
         // Transient: resumed for this read only, never pooled.
         return Session.resume({ ...this.config(), sessionId: id });
+    }
+}
+
+/**
+ * The set of chat turns currently streaming, keyed by session id, each behind an
+ * {@link AbortController} the cancel route can fire.
+ *
+ * A streamed reply has no request the client can simply drop to stop cleanly:
+ * the connection dropping is racy and wouldn't give the server a chance to *save*
+ * the partial reply. So cancellation is an explicit, addressable action — the
+ * client POSTs `/api/chat/cancel` with the session id, which {@link abort}s the
+ * controller this registry holds for that turn. Aborting routes through the
+ * bridge's cancel path (a `canceled` HarnessError), so the Session keeps the
+ * prose already streamed and logs the cancellation, rather than the turn just
+ * vanishing.
+ *
+ * One turn per session at a time: a session streams a single reply, so the latest
+ * `begin` for an id replaces any stale entry. Entries are removed when the turn
+ * settles (see the chat route's `finally`), so the map only ever holds genuinely
+ * in-flight turns.
+ */
+export class InflightTurns {
+    private readonly controllers = new Map<string, AbortController>();
+
+    /** Register a starting turn for `session` and return its {@link AbortSignal}
+     *  to thread into {@link streamChat}. Replaces any prior controller for the
+     *  same session (a session has at most one streaming reply at a time). */
+    begin(session: string): AbortSignal {
+        const controller = new AbortController();
+        this.controllers.set(session, controller);
+        return controller.signal;
+    }
+
+    /** Abort the in-flight turn for `session`, if one is streaming. Returns whether
+     *  a turn was actually aborted (false when nothing is in flight for that id, so
+     *  the cancel route can 404 a stale/duplicate request honestly). The entry is
+     *  left for the turn's own `finally` to remove, so a double-cancel is a no-op. */
+    cancel(session: string): boolean {
+        const controller = this.controllers.get(session);
+        if (!controller) return false;
+        controller.abort();
+        return true;
+    }
+
+    /** Drop the registry entry for a settled turn. Idempotent; called from the
+     *  chat route's `finally` whether the turn finished, errored, or was cancelled. */
+    end(session: string): void {
+        this.controllers.delete(session);
+    }
+
+    /** Whether a turn is currently streaming for `session`. */
+    has(session: string): boolean {
+        return this.controllers.has(session);
     }
 }
 
@@ -444,6 +501,8 @@ function buildDeps(): ServerDeps {
         providerOptions: sharedProviderOptions,
     });
     const sessions = new SessionPool(sessionConfig);
+    // Tracks streaming turns so the cancel route can abort one by session id.
+    const inflight = new InflightTurns();
 
     // The human's presence. Seed last-activity with boot time so a freshly
     // launched daemon reads Online rather than "never seen": today the client and
@@ -484,6 +543,7 @@ function buildDeps(): ServerDeps {
         events,
         goals,
         sessions,
+        inflight,
         presence,
         notes,
         notesStore,
@@ -914,6 +974,7 @@ async function streamChat(
     text: string,
     res: ServerResponse,
     images: ImageInput[] = [],
+    signal?: AbortSignal,
 ): Promise<void> {
     res.writeHead(200, {
         "Content-Type": "text/event-stream; charset=utf-8",
@@ -925,7 +986,7 @@ async function streamChat(
     sse(res, "open", { session: session.id });
 
     try {
-        const turn = session.send(text, images);
+        const turn = session.send(text, images, signal);
         let next = await turn.next();
         while (!next.done) {
             const event: LoopEvent = next.value;
@@ -952,6 +1013,14 @@ async function streamChat(
                 case "compacted":
                     sse(res, "compacted", { turn: event.turn });
                     break;
+                case "cancelled":
+                    // The human pressed "stop": the Session has saved the partial
+                    // reply (the `text` deltas already streamed) and logged a
+                    // ResponseCancelled marker. Tell the client so it can mark the
+                    // reply cancelled while keeping what's on screen; a `done` frame
+                    // still follows with the turn's final accounting.
+                    sse(res, "cancelled", { text: event.text });
+                    break;
                 // tool_call_start / tool_call_args / turn_start / loop_done are not
                 // surfaced to the client (loop_done's payload is folded into the
                 // `done` frame below, from the TurnResult).
@@ -965,6 +1034,7 @@ async function streamChat(
             stoppedAtMaxTurns: result.stoppedAtMaxTurns,
             compactions: result.compactions,
             usage: result.usage,
+            cancelled: result.cancelled,
         });
     } catch (err) {
         // Headers are already sent, so we can't set a status; report the failure
@@ -2041,7 +2111,42 @@ export function createHandler(deps: ServerDeps) {
                 // override — you can't be talking and offline. A pinned `dnd`
                 // survives: present and not-to-be-disturbed are compatible.
                 deps.presence.touch(Date.now());
-                await streamChat(session, text, res, images);
+                // Register this turn so `/api/chat/cancel` can stop it by session id,
+                // and hand its abort signal to the stream. The `finally` drops the
+                // registry entry however the turn ends (done, error, or cancelled),
+                // so the map never holds a settled turn.
+                const cancelSignal = deps.inflight.begin(session.id);
+                try {
+                    await streamChat(session, text, res, images, cancelSignal);
+                } finally {
+                    deps.inflight.end(session.id);
+                }
+                return;
+            }
+
+            // Stop an in-flight streamed reply. The chat SSE stream can't carry a
+            // request back to the server, so cancellation is this separate, small
+            // call: the client POSTs the session id of the turn to stop, and we
+            // abort that turn's controller. The abort routes through the bridge's
+            // cancel path, so the Session saves the partial reply (the prose already
+            // streamed) and logs a ResponseCancelled marker — the original chat
+            // stream then sends its own `cancelled` then `done` frames and closes.
+            // This route just fires the abort; it doesn't touch the SSE stream.
+            if (req.method === "POST" && path === "/api/chat/cancel") {
+                const body = await readJsonObject(req);
+                const session = body && typeof body.session === "string" ? body.session : "";
+                if (!session) {
+                    sendJson(res, 400, { error: "session must be a non-empty string" });
+                    return;
+                }
+                // 404 when nothing is in flight for that id (a stale or duplicate
+                // cancel), so the client can tell "stopped it" from "too late".
+                const cancelled = deps.inflight.cancel(session);
+                if (!cancelled) {
+                    sendJson(res, 404, { error: `no in-flight turn for session ${session}` });
+                    return;
+                }
+                sendJson(res, 200, { cancelled: true, session });
                 return;
             }
 

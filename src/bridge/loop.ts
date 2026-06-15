@@ -16,6 +16,7 @@ import { compactConversation } from "../compaction.ts";
 import type { CompactionOptions } from "../compaction.ts";
 import { UsageTracker, estimateTokens } from "../usage.ts";
 import type { CumulativeUsage } from "../usage.ts";
+import { HarnessError } from "./errors.ts";
 import type { CoreDelta, GenerateParams, GenerateResult, ModelClient } from "./types.ts";
 
 export interface RunLoopParams extends GenerateParams {
@@ -81,6 +82,16 @@ export interface RunLoopResult {
     stoppedAtMaxTurns: boolean;
     /** How many times the loop compacted the conversation during this run. */
     compactions: number;
+    /**
+     * True when the run ended because the caller aborted {@link RunLoopParams.signal}
+     * mid-stream (a user pressing "stop"), rather than the model finishing. The
+     * partial assistant turn produced up to the abort is still committed to
+     * {@link messages} and is {@link final} (its `stopReason` is `"canceled"`), so
+     * the output the model had already streamed is kept, not discarded — the
+     * cancellation just ends the turn early. Only the streaming loop sets this; the
+     * buffered {@link runLoop} has no mid-flight abort to honor.
+     */
+    cancelled: boolean;
 }
 
 /** Index tools by name for O(1) dispatch, rejecting duplicate names.
@@ -274,6 +285,10 @@ export async function runLoop(client: ModelClient, params: RunLoopParams): Promi
         usage: usage.totals(),
         stoppedAtMaxTurns,
         compactions,
+        // The buffered path has no mid-stream abort to honor: `generate` either
+        // returns a whole turn or rejects (a `canceled` rejection propagates to the
+        // caller, it doesn't become a partial result here the way streaming does).
+        cancelled: false,
     };
 }
 
@@ -292,6 +307,12 @@ export type LoopEvent =
     | { kind: "tool_start"; id: string; name: string; args: unknown }
     | { kind: "tool_end"; id: string; name: string; result: unknown; isError: boolean }
     | { kind: "turn_start"; turn: number }
+    // The caller aborted the stream (a user pressing "stop"). Carries the partial
+    // assistant text streamed up to the abort, so a consumer can mark the reply
+    // cancelled while keeping what was already shown. Emitted at most once, and
+    // always immediately before the terminal `loop_done` (whose result has
+    // `cancelled: true`). `text` is "" when the abort landed before any prose.
+    | { kind: "cancelled"; text: string }
     | { kind: "loop_done"; result: RunLoopResult };
 
 /**
@@ -323,6 +344,9 @@ export async function* runLoopStream(
     let turns = 0;
     let stoppedAtMaxTurns = false;
     let compactions = 0;
+    // Set when the caller aborts mid-stream: the turn loop breaks, the partial
+    // assistant turn is committed, and `loop_done` reports cancelled: true.
+    let cancelled = false;
 
     // Track text across turns so we can separate it. A multi-turn run emits the
     // model's prose in pieces: the model says something, calls a tool, then on
@@ -352,26 +376,54 @@ export async function* runLoopStream(
         const outgoing = await applyContext(messages, context, turns, params.sessionStart);
 
         // Consume the model stream, passing its deltas straight through and
-        // capturing the terminal `done` as this turn's result.
+        // capturing the terminal `done` as this turn's result. We also accumulate
+        // this turn's prose locally so that if the caller aborts mid-stream we can
+        // assemble a partial result from what was already streamed rather than
+        // discarding it — saving the partial stream is the whole point of an
+        // honest cancel.
         let result: GenerateResult | undefined;
+        let turnText = "";
         turnHadText = false;
-        for await (const delta of client.stream({ ...params, messages: outgoing })) {
-            if (delta.kind === "done") {
-                result = delta.result;
-            } else if (delta.kind === "text") {
-                // First non-empty text of a turn that follows an earlier turn's
-                // text: insert the paragraph break that the cross-turn boundary
-                // otherwise lacks. Guard on `delta.text` so an empty delta never
-                // triggers (or absorbs) the separator.
-                if (delta.text.length > 0 && !turnHadText) {
-                    turnHadText = true;
-                    if (sawText) yield { kind: "text", text: "\n\n" };
-                    sawText = true;
+        try {
+            for await (const delta of client.stream({ ...params, messages: outgoing })) {
+                if (delta.kind === "done") {
+                    result = delta.result;
+                } else if (delta.kind === "text") {
+                    // First non-empty text of a turn that follows an earlier turn's
+                    // text: insert the paragraph break that the cross-turn boundary
+                    // otherwise lacks. Guard on `delta.text` so an empty delta never
+                    // triggers (or absorbs) the separator.
+                    if (delta.text.length > 0 && !turnHadText) {
+                        turnHadText = true;
+                        if (sawText) yield { kind: "text", text: "\n\n" };
+                        sawText = true;
+                    }
+                    turnText += delta.text;
+                    yield delta;
+                } else {
+                    yield delta;
                 }
-                yield delta;
-            } else {
-                yield delta;
             }
+        } catch (err) {
+            // A mid-stream abort (the user pressed "stop") is the one failure we
+            // turn into a clean, partial completion instead of propagating: the
+            // text already streamed is real output we keep. Any other error
+            // (network, server, a malformed stream) still throws to the caller.
+            if (!isCanceled(err)) throw err;
+            cancelled = true;
+            turns++;
+            // Commit the partial turn as the run's final result: a real assistant
+            // message carrying the prose streamed so far, stamped `canceled` so a
+            // reader can tell a stopped turn from a finished one. No `done` delta
+            // arrived, so its usage is unknown (zeros) — the partial text is the
+            // signal that matters, not the token count of an interrupted turn.
+            const partial = partialResult(turnText, client.model);
+            final = partial;
+            messages.push(partial.message);
+            // Tell the consumer the turn was cancelled (carrying the partial text),
+            // then fall through to the single terminal `loop_done` below.
+            yield { kind: "cancelled", text: turnText };
+            break;
         }
         if (!result) {
             throw new Error("runLoopStream: model stream ended without a done delta");
@@ -420,6 +472,34 @@ export async function* runLoopStream(
             usage: usage.totals(),
             stoppedAtMaxTurns,
             compactions,
+            cancelled,
         },
+    };
+}
+
+/** Whether a thrown value is the bridge's cancellation signal: the caller aborted
+ *  the request (a user pressing "stop"). This is the one stream failure the loop
+ *  converts into a partial completion rather than rethrowing. */
+function isCanceled(err: unknown): boolean {
+    return err instanceof HarnessError && err.kind === "canceled";
+}
+
+/**
+ * Assemble the partial {@link GenerateResult} for a turn the caller aborted, from
+ * the prose streamed up to the abort. This is what makes a cancel non-lossy: the
+ * text the model had already produced becomes a real assistant message in the
+ * conversation, stamped `stopReason: "canceled"` so a reader can distinguish it
+ * from a finished turn. Usage is zeroed (no `done` delta carried the real counts;
+ * an interrupted turn's token total isn't meaningful), and `content` is empty when
+ * the abort landed before any text — a cancelled turn with nothing to save.
+ */
+function partialResult(text: string, model: string): GenerateResult {
+    const content: ContentPart[] = text ? [{ kind: "text", text }] : [];
+    return {
+        message: { sender: { role: RoleType.Agent, name: model }, timestamp: Date.now(), content },
+        stopReason: "canceled",
+        usage: {},
+        model,
+        raw: null,
     };
 }

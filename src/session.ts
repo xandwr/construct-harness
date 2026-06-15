@@ -33,6 +33,18 @@ import { EventStore } from "./events.ts";
 import type { AttachmentMediaType, Event, EventInput } from "./events.ts";
 
 /**
+ * The event `kind` a turn the human cancelled is marked with in the log. A
+ * `ResponseCancelled` event sits right after the partial reply it stopped (an
+ * agent `message` carrying the prose streamed up to the stop), so a reader of the
+ * transcript can see both what was produced and that the human cut it short. Its
+ * `meta.savedChars` records how much of the partial reply was kept, making the
+ * "we saved the stream" guarantee inspectable. One kind, like
+ * `DREAM_EVENT_KIND` / `GOAL_EVENT_KIND`; the migration that introduces it
+ * documents it as a known marker (see the memory module's MIGRATIONS).
+ */
+export const RESPONSE_CANCELLED_EVENT_KIND = "response_cancelled";
+
+/**
  * One image accompanying a user turn. `data` is the raw bytes; the session
  * shows them to the model (base64-encoded into an {@link ImagePart}) and
  * persists them to the event log's attachment side table so reopening the
@@ -151,7 +163,8 @@ export interface SessionConfig {
 
 /** A completed Session turn: what the assistant said, plus run accounting. */
 export interface TurnResult {
-    /** The assistant's final text for this turn (concatenated text parts). */
+    /** The assistant's final text for this turn (concatenated text parts). When the
+     *  turn was cancelled this is the partial reply streamed up to the stop. */
     text: string;
     /** Model turns this user-turn took (≥1; more when tools were called). */
     modelTurns: number;
@@ -161,6 +174,11 @@ export interface TurnResult {
     compactions: number;
     /** Cumulative token usage for this turn's run. */
     usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number };
+    /** True when the human aborted this turn mid-stream (pressed "stop"). The
+     *  partial reply is still in {@link text} and was committed to the conversation
+     *  and the log, and a `ResponseCancelled` event marks the stop. Lets a caller
+     *  distinguish a turn the user cut short from one the model finished. */
+    cancelled: boolean;
 }
 
 /** One section of a {@link ContextInspection}: a named slice of what the next
@@ -575,12 +593,21 @@ export class Session {
      * never persisted into {@link history}. On completion the assistant turn(s)
      * and any tool turns are committed back to the conversation.
      *
+     * `signal` lets the caller cancel the turn mid-stream — a user pressing
+     * "stop". Aborting it tears down the model stream; the prose already streamed
+     * is *kept*, not discarded: it's committed to the conversation and logged as
+     * the assistant's reply exactly as a finished turn would be, and a
+     * {@link RESPONSE_CANCELLED_EVENT_KIND} event is appended to mark the stop. The
+     * returned {@link TurnResult} carries `cancelled: true`. Omit for an
+     * uninterruptible turn.
+     *
      * Yields each {@link LoopEvent}; the generator's return value is the
      * {@link TurnResult}.
      */
     async *send(
         text: string,
         images: ImageInput[] = [],
+        signal?: AbortSignal,
     ): AsyncGenerator<LoopEvent, TurnResult, void> {
         // What the model sees this turn: the text (when non-empty) followed by one
         // image block per attachment. An image-only turn has no text part. The
@@ -652,8 +679,13 @@ export class Session {
             compaction: this.cfg.compaction,
             maxTurns: this.cfg.maxTurns,
             providerOptions: this.cfg.providerOptions,
+            // The caller's cancel signal: aborting it stops the model stream and
+            // routes through the `cancelled` event below, where the partial reply
+            // is saved and the turn marked.
+            signal,
         });
 
+        let cancelled = false;
         for await (const event of stream) {
             if (event.kind === "text") assistantText += event.text;
             // Mirror the tool lifecycle into the log: a call when it starts, its
@@ -682,11 +714,20 @@ export class Session {
                 // is the overlay turning MemoryStore into curation over the log.
                 this.linkSavedMemory(event, userEvent);
             }
+            // The human pressed "stop": the loop has committed the partial reply
+            // into r.messages and is about to send loop_done. Just note it here so
+            // the loop_done handler logs the partial reply and the cancellation
+            // marker in the right order; the actual saving happens there.
+            if (event.kind === "cancelled") {
+                cancelled = true;
+            }
             if (event.kind === "loop_done") {
                 const r = event.result;
                 // The assistant's final text for this turn closes it out in the
                 // log (skip an empty reply: a turn that only called tools and
-                // stopped has nothing to record as a message).
+                // stopped has nothing to record as a message). A cancelled turn
+                // saves its partial reply here exactly the same way — the prose the
+                // model streamed before the stop is kept, not discarded.
                 const reply = assistantText.trim();
                 if (reply) {
                     const replyEvent = this.logEvent({
@@ -697,6 +738,20 @@ export class Session {
                     // Embed the agent's reply too: it's the other half of the
                     // conversation a later turn might recall by meaning.
                     this.embedMessage(replyEvent);
+                }
+                // Mark a cancelled turn in the log, right after the partial reply it
+                // stopped, so the transcript records both what was produced and that
+                // the human cut it short. `savedChars` makes the "we kept the
+                // partial stream" guarantee inspectable. Logged whether or not any
+                // prose was streamed (an instant stop saves an empty reply but still
+                // marks the cancellation).
+                if (cancelled) {
+                    this.logEvent({
+                        kind: RESPONSE_CANCELLED_EVENT_KIND,
+                        role: "user",
+                        content: "Response cancelled by user.",
+                        meta: { savedChars: reply.length },
+                    });
                 }
                 // Commit the durable conversation: everything the run produced
                 // except the system turn we prepended (which is rebuilt per turn).
@@ -724,6 +779,9 @@ export class Session {
                         outputTokens: r.usage.outputTokens,
                         cacheReadTokens: r.usage.cacheReadTokens,
                     },
+                    // r.cancelled is the loop's verdict; our local flag mirrors it
+                    // from the `cancelled` event. Trust the loop result.
+                    cancelled: r.cancelled,
                 };
                 continue;
             }

@@ -81,6 +81,37 @@ test("MemoryStore then EventStore on one file share a single user_version", () =
     });
 });
 
+test("the response_cancelled partial index exists and covers only cancellation events", () => {
+    withTempDir((dir) => {
+        const path = join(dir, "cancel-idx.sqlite");
+        const events = new EventStore(path);
+        // A cancellation marker plus an ordinary message, so the partial index has
+        // something to cover and something to exclude.
+        events.append({ kind: "response_cancelled", content: "Response cancelled by user." });
+        events.append({ kind: "message", role: "agent", content: "a normal reply" });
+        events.close();
+
+        const raw = new DatabaseSync(path);
+        // The migration created the partial index (a named index with a WHERE
+        // clause over the cancellation kind).
+        const idx = raw
+            .prepare(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_events_cancelled'",
+            )
+            .get() as { sql: string } | undefined;
+        assert.ok(idx, "the idx_events_cancelled partial index must exist");
+        assert.match(idx!.sql, /WHERE kind = 'response_cancelled'/);
+
+        // The query the index serves returns only the cancellation row.
+        const cancelled = raw
+            .prepare("SELECT content FROM events WHERE kind = 'response_cancelled'")
+            .all() as Array<{ content: string }>;
+        assert.equal(cancelled.length, 1);
+        assert.equal(cancelled[0]!.content, "Response cancelled by user.");
+        raw.close();
+    });
+});
+
 test("EventStore first, then MemoryStore on the same file, both work", () => {
     withTempDir((dir) => {
         const path = join(dir, "events-first.sqlite");

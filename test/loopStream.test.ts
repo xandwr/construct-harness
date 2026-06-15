@@ -225,3 +225,117 @@ test("does not surface the model's done delta to the consumer", async () => {
     const dones = events.filter((e) => e.kind === "done");
     assert.equal(dones.length, 0, "raw model done must not leak to the consumer");
 });
+
+// ── Cancellation: saving the partial stream ──────────────────────────────────
+
+test("a mid-stream abort keeps the partial prose and ends cleanly", async () => {
+    // The model streams two text parts, then the user presses "stop" before the
+    // turn finishes. The loop must keep the prose already streamed, mark the run
+    // cancelled, and still end with exactly one loop_done (not a thrown error).
+    const client = new FakeClient([
+        {
+            content: [
+                { kind: "text", text: "First part. " },
+                { kind: "text", text: "Second part. " },
+                { kind: "text", text: "Third part never streams." },
+            ],
+            // Abort after the first two text parts, as if "stop" was pressed then.
+            abortAfterTextParts: 2,
+        },
+    ]);
+    const { events, done } = await drain(runLoopStream(client, { messages: [user("go")] }));
+
+    // The prose streamed before the abort is delivered as normal text deltas.
+    const streamed = events
+        .filter((e): e is Extract<LoopEvent, { kind: "text" }> => e.kind === "text")
+        .map((e) => e.text)
+        .join("");
+    assert.equal(streamed, "First part. Second part. ", "partial prose must be kept");
+
+    // Exactly one cancelled event, carrying the same partial text.
+    const cancelledEvents = events.filter((e) => e.kind === "cancelled");
+    assert.equal(cancelledEvents.length, 1, "one cancelled event");
+    assert.equal(
+        (cancelledEvents[0] as Extract<LoopEvent, { kind: "cancelled" }>).text,
+        "First part. Second part. ",
+    );
+
+    // The run reports cancelled and the partial turn is the final result.
+    assert.equal(done.result.cancelled, true);
+    assert.equal(done.result.final.stopReason, "canceled");
+    assert.equal(done.result.turns, 1);
+});
+
+test("the cancelled partial turn is committed to the conversation as an agent message", async () => {
+    const client = new FakeClient([
+        { content: [{ kind: "text", text: "kept prose" }], abortAfterTextParts: 1 },
+    ]);
+    const { done } = await drain(runLoopStream(client, { messages: [user("go")] }));
+
+    // The last message in the returned conversation is the partial assistant turn,
+    // carrying the prose that streamed before the abort (not discarded).
+    const last = done.result.messages.at(-1)!;
+    assert.equal(last.sender.role, RoleType.Agent);
+    const text = last.content.find((p) => p.kind === "text");
+    assert.ok(text && text.kind === "text");
+    assert.equal(text.text, "kept prose");
+});
+
+test("aborting before any prose marks cancelled with empty text", async () => {
+    // An already-aborted signal: the stream throws before emitting any delta. The
+    // run is still cancelled, with an empty partial reply (nothing to save).
+    const controller = new AbortController();
+    controller.abort();
+    const client = new FakeClient([textTurn("never streams")]);
+    const { events, done } = await drain(
+        runLoopStream(client, { messages: [user("go")], signal: controller.signal }),
+    );
+
+    const cancelledEvents = events.filter((e) => e.kind === "cancelled");
+    assert.equal(cancelledEvents.length, 1);
+    assert.equal((cancelledEvents[0] as Extract<LoopEvent, { kind: "cancelled" }>).text, "");
+    assert.equal(done.result.cancelled, true);
+    // No text content on the empty partial turn.
+    const last = done.result.messages.at(-1)!;
+    assert.equal(last.content.length, 0);
+});
+
+test("the abort signal threads through to the model stream", async () => {
+    // The loop must forward params.signal to client.stream so a real provider can
+    // honor it. FakeClient throws `canceled` when its signal is already aborted;
+    // observing the cancelled outcome proves the signal reached the stream call.
+    const controller = new AbortController();
+    controller.abort();
+    const client = new FakeClient([textTurn("x")]);
+    const { done } = await drain(
+        runLoopStream(client, { messages: [user("go")], signal: controller.signal }),
+    );
+    assert.equal(done.result.cancelled, true);
+});
+
+test("a non-cancel stream error still propagates (not swallowed as a cancel)", async () => {
+    // Only a `canceled` HarnessError becomes a partial completion; any other
+    // failure must still throw to the caller rather than masquerade as a stop.
+    const failing = {
+        provider: "boom",
+        model: "boom",
+        capabilities: {
+            thinking: false,
+            effort: false,
+            promptCaching: false,
+            serverTools: false,
+            streaming: true as const,
+        },
+        async generate() {
+            throw new Error("unused");
+        },
+        // eslint-disable-next-line require-yield
+        async *stream() {
+            throw new Error("network exploded");
+        },
+    };
+    await assert.rejects(
+        () => drain(runLoopStream(failing as never, { messages: [user("go")] })),
+        /network exploded/,
+    );
+});

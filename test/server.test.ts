@@ -23,6 +23,7 @@ import {
     createHandler,
     resolveServerTools,
     SessionPool,
+    InflightTurns,
     goalEventSink,
     GOAL_EVENT_KIND,
 } from "../src/server.ts";
@@ -128,6 +129,9 @@ function makeDeps(client: FakeClient) {
         events,
         goals,
         sessions,
+        // The in-flight turn registry the chat/cancel routes use, exactly as
+        // buildDeps wires it.
+        inflight: new InflightTurns(),
         // Boot presence with no seed activity so a read is deterministic (Away
         // until a chat turn touches it); presence-specific tests drive the clock
         // through the UserPresence class directly.
@@ -160,6 +164,7 @@ function makeSharedDeps(client: FakeClient) {
         events,
         goals,
         sessions,
+        inflight: new InflightTurns(),
         presence: new UserPresence(),
         client,
         close() {
@@ -440,6 +445,88 @@ test("POST /api/chat streams SSE frames and persists the turn to the log", async
     assert.ok(contents.includes("what about deploys?"), "user message persisted");
     assert.ok(contents.includes("You deploy on Fridays."), "agent reply persisted");
 
+    deps.close();
+});
+
+test("POST /api/chat emits a cancelled frame and saves the partial reply when the turn aborts", async () => {
+    // The scripted turn streams two text parts, then aborts (as if the user
+    // pressed stop). The server must relay a `cancelled` frame, a terminal `done`
+    // flagged cancelled, and persist the partial reply plus a marker to the log.
+    const deps = makeDeps(
+        new FakeClient([
+            {
+                content: [
+                    { kind: "text", text: "Partial " },
+                    { kind: "text", text: "answer." },
+                    { kind: "text", text: " Never sent." },
+                ],
+                abortAfterTextParts: 2,
+            },
+        ]),
+    );
+    const handle = createHandler(deps);
+    const { res, captured } = fakeRes();
+
+    await handle(postReq("/api/chat", JSON.stringify({ message: "go" })), res);
+
+    const frames = captured.frames();
+    const kinds = frames.map((f) => f.event);
+    assert.ok(kinds.includes("cancelled"), "expected a cancelled frame");
+    assert.equal(kinds.at(-1), "done");
+    const cancelledFrame = frames.find((f) => f.event === "cancelled");
+    assert.equal((cancelledFrame!.data as { text: string }).text, "Partial answer.");
+    const done = frames.at(-1)!.data as { cancelled: boolean; text: string };
+    assert.equal(done.cancelled, true);
+    assert.equal(done.text, "Partial answer.");
+
+    // The partial stream was saved, not discarded: the log holds the user message,
+    // the partial agent reply, and the cancellation marker.
+    const logged = deps.events.recent({ session: defaultId(deps) }).reverse();
+    assert.deepEqual(
+        logged.map((e) => e.kind),
+        ["message", "message", "response_cancelled"],
+    );
+    assert.equal(logged[1]!.content, "Partial answer.", "partial reply persisted");
+
+    // And the registry was cleaned up: nothing is in flight after the turn settled.
+    assert.equal(deps.inflight.has(defaultId(deps)), false);
+
+    deps.close();
+});
+
+test("POST /api/chat/cancel aborts the in-flight turn registered for a session", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const handle = createHandler(deps);
+
+    // Register a turn the way the chat route does, then cancel it through the route.
+    const signal = deps.inflight.begin("s_test");
+    assert.equal(signal.aborted, false);
+
+    const { res, captured } = fakeRes();
+    await handle(postReq("/api/chat/cancel", JSON.stringify({ session: "s_test" })), res);
+    assert.equal(captured.status, 200);
+    assert.deepEqual(JSON.parse(captured.body), { cancelled: true, session: "s_test" });
+    // The signal handed to the (pretend) turn is now aborted.
+    assert.equal(signal.aborted, true);
+
+    deps.close();
+});
+
+test("POST /api/chat/cancel 404s when no turn is in flight for that session", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const handle = createHandler(deps);
+    const { res, captured } = fakeRes();
+    await handle(postReq("/api/chat/cancel", JSON.stringify({ session: "nope" })), res);
+    assert.equal(captured.status, 404);
+    deps.close();
+});
+
+test("POST /api/chat/cancel 400s without a session id", async () => {
+    const deps = makeDeps(new FakeClient([]));
+    const handle = createHandler(deps);
+    const { res, captured } = fakeRes();
+    await handle(postReq("/api/chat/cancel", JSON.stringify({})), res);
+    assert.equal(captured.status, 400);
     deps.close();
 });
 
@@ -1209,6 +1296,7 @@ test("a server-tool toggle reaches a live conversation's next turn", async () =>
         events,
         goals,
         sessions,
+        inflight: new InflightTurns(),
         presence: new UserPresence(),
         client,
         runtime,

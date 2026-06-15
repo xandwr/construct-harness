@@ -98,3 +98,68 @@ test("retry: false disables the harness retry layer", async () => {
     );
     assert.equal(calls, 1, "no retries when retry is disabled");
 });
+
+// ── Cancellation: the abort signal reaches the SDK ───────────────────────────
+
+/** Swap in a stubbed `messages.stream` on a client's private SDK, returning a
+ *  minimal async-iterable stream that ends with the assembled message. */
+function stubStream(client: AnthropicClient, impl: (body: unknown, options: unknown) => unknown) {
+    const sdk = (client as unknown as { sdk: Anthropic }).sdk;
+    (sdk.messages as unknown as { stream: typeof impl }).stream = impl;
+}
+
+test("generate forwards the caller's abort signal to the SDK as a request option", async () => {
+    const client = new AnthropicClient({ apiKey: "test", retry: false });
+    const controller = new AbortController();
+    let seenOptions: unknown;
+    stubCreate(client, async function (this: unknown, ...args: unknown[]) {
+        // create(body, options): the signal must ride on the second arg.
+        seenOptions = args[1];
+        return fakeMessage();
+    } as unknown as () => Promise<unknown>);
+
+    await client.generate({ messages: [user("hi")], signal: controller.signal });
+    assert.equal(
+        (seenOptions as { signal?: AbortSignal }).signal,
+        controller.signal,
+        "the abort signal must reach messages.create as a request option",
+    );
+});
+
+test("stream forwards the caller's abort signal to the SDK as a request option", async () => {
+    const client = new AnthropicClient({ apiKey: "test", retry: false });
+    const controller = new AbortController();
+    let seenOptions: unknown;
+    stubStream(client, (_body, options) => {
+        seenOptions = options;
+        // A minimal MessageStream stand-in: async-iterable plus finalMessage().
+        return {
+            [Symbol.asyncIterator]() {
+                let done = false;
+                return {
+                    async next() {
+                        if (done) return { done: true, value: undefined };
+                        done = true;
+                        return {
+                            done: false,
+                            value: { type: "message_stop" },
+                        };
+                    },
+                };
+            },
+            async finalMessage() {
+                return fakeMessage();
+            },
+        };
+    });
+
+    const stream = client.stream({ messages: [user("hi")], signal: controller.signal });
+    for await (const _ of stream) {
+        // drain
+    }
+    assert.equal(
+        (seenOptions as { signal?: AbortSignal }).signal,
+        controller.signal,
+        "the abort signal must reach messages.stream as a request option",
+    );
+});

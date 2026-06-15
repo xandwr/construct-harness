@@ -473,7 +473,15 @@ export class AnthropicClient implements ModelClient {
 
     async generate(params: GenerateParams): Promise<GenerateResult> {
         const req = this.buildRequest(params, DEFAULT_MAX_TOKENS);
-        const msg = await this.run(() => this.sdk.messages.create({ ...req, stream: false }));
+        // The caller's abort signal rides as a request option, not in the body:
+        // aborting it makes the SDK reject with APIUserAbortError, which
+        // classifyAnthropicError maps to a non-retryable `canceled` HarnessError.
+        const msg = await this.run(() =>
+            this.sdk.messages.create(
+                { ...req, stream: false },
+                params.signal ? { signal: params.signal } : undefined,
+            ),
+        );
         return toResult(msg);
     }
 
@@ -489,11 +497,17 @@ export class AnthropicClient implements ModelClient {
         // retried without duplicating emitted text: it's classified and
         // rethrown below for the loop/REPL to handle.
         const toolIdByIndex = new Map<number, string>();
+        // The caller's abort signal rides as a request option (same as `generate`):
+        // aborting it mid-stream makes the SDK throw APIUserAbortError on the next
+        // `iterator.next()`, which the catch below classifies to a `canceled`
+        // HarnessError. Deltas already yielded before that point are real output
+        // the consumer keeps — the abort just ends the turn early.
+        const options = params.signal ? { signal: params.signal } : undefined;
         // Open the stream and pull its first event as one retried unit, holding
         // onto the single iterator so the rest of the loop continues from it
         // (not a fresh one).
         const { stream, iterator, first } = await this.run(async () => {
-            const s = this.sdk.messages.stream(req);
+            const s = this.sdk.messages.stream(req, options);
             const it = s[Symbol.asyncIterator]();
             const r = await it.next();
             return { stream: s, iterator: it, first: r };

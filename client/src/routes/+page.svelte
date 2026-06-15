@@ -8,6 +8,7 @@
 	import { page } from '$app/state';
 	import {
 		sendChat,
+		cancelChat,
 		getEvents,
 		getCommands,
 		attachmentUrl,
@@ -71,6 +72,11 @@
 		thinking?: string;
 		thinkingOpen?: boolean;
 		pending?: boolean;
+		// True when the human stopped this reply mid-stream. The partial text it
+		// streamed is kept (the server saved it); this just flags the line so the UI
+		// can append a "stopped" note under the kept prose. Set live on a `cancelled`
+		// event, and on replay for the agent message a ResponseCancelled marker follows.
+		cancelled?: boolean;
 		ts?: number;
 		eventId?: number;
 		coveredIds?: number[];
@@ -92,6 +98,9 @@
 	// The hidden file picker, clicked by the attach button.
 	let fileInput = $state<HTMLInputElement | null>(null);
 	let sending = $state(false);
+	// True between pressing "stop" and the stream actually closing: keeps the
+	// button from firing a second cancel and lets it show the in-progress state.
+	let cancelling = $state(false);
 	let loadingReplay = $state(false);
 	let error = $state<string | null>(null);
 	let footer = $state<string | null>(null);
@@ -286,6 +295,16 @@
 				// Stack multiple tool calls in one turn onto a single note.
 				pendingTool = pendingTool ? `${pendingTool}, ${e.content}` : e.content;
 				pendingIds.push(e.id);
+			} else if (e.kind === 'response_cancelled') {
+				// A cancellation marker follows the partial agent reply it stopped.
+				// Flag that reply line (the last one) and let it claim the marker's id
+				// as a deep-link target so the event log can land on the stopped reply.
+				// A cancel with no prose streamed has no agent line to flag; ignore it.
+				const last = lines.at(-1);
+				if (last?.role === 'agent') {
+					last.cancelled = true;
+					last.coveredIds = [...(last.coveredIds ?? []), e.id];
+				}
 			}
 		}
 		return lines;
@@ -503,6 +522,26 @@
 		if (removed) URL.revokeObjectURL(removed.url);
 	}
 
+	// Stop the in-flight reply. Asks the server to abort this conversation's
+	// streaming turn; the server saves whatever the model produced and the open
+	// SSE stream then delivers `cancelled` + `done`, which flips `sending` off and
+	// marks the line. We don't tear the stream down on the client side — letting
+	// the server finish it cleanly is what keeps the partial reply (and its log
+	// entry) intact. A no-op without an active session (nothing has streamed yet)
+	// or when already cancelling.
+	async function cancel() {
+		if (!activeSession || cancelling || !sending) return;
+		cancelling = true;
+		try {
+			await cancelChat(activeSession);
+		} catch {
+			// The cancel call itself failing (network) shouldn't strand the UI: the
+			// stream will still resolve on its own eventually. Drop the flag so the
+			// button can be tried again.
+			cancelling = false;
+		}
+	}
+
 	async function submit(event: SubmitEvent) {
 		event.preventDefault();
 		const text = draft.trim();
@@ -577,6 +616,7 @@
 			// Stamp the reply's completion time if no `done` event did (error/abort).
 			messages[idx].ts ??= Date.now();
 			sending = false;
+			cancelling = false;
 		}
 	}
 
@@ -621,12 +661,21 @@
 			case 'compacted':
 				reply.tool = reply.tool ? `${reply.tool}, compacted` : 'compacted';
 				break;
+			case 'cancelled':
+				// The human stopped this reply: the server kept whatever streamed
+				// (already in reply.text via prior `text` events). Mark the line so a
+				// "stopped" note shows under the kept prose; `done` follows to close it.
+				reply.cancelled = true;
+				reply.pending = false;
+				break;
 			case 'done':
 				reply.pending = false;
+				reply.cancelled = e.cancelled;
 				reply.ts = Date.now();
 				footer =
 					`${e.modelTurns} turn(s) · ${e.usage.inputTokens} in / ${e.usage.outputTokens} out` +
 					(e.compactions ? ` · ${e.compactions} compaction(s)` : '') +
+					(e.cancelled ? ' · stopped' : '') +
 					(e.stoppedAtMaxTurns ? ' · cut off' : '');
 				break;
 			case 'error':
@@ -750,6 +799,11 @@
 					{#if m.tool}
 						<div class="text-faint mt-1 text-[10px]">{m.tool}</div>
 					{/if}
+					{#if m.cancelled}
+						<!-- The human stopped this reply: the prose above is what the model
+						     had streamed and the server kept. This note records the stop. -->
+						<div class="text-faint mt-1 text-[10px] lowercase italic">⊘ stopped by you</div>
+					{/if}
 				</div>
 			</div>
 		{/each}
@@ -862,13 +916,30 @@
 					class="placeholder:text-faint block w-full resize-none border border-border bg-surface px-3 py-2 text-xs leading-5 text-text outline-none focus:border-glow disabled:opacity-50"
 				></textarea>
 			</div>
-			<button
-				type="submit"
-				disabled={sending || loadingReplay || (draft.trim() === '' && pendingImages.length === 0)}
-				class="border border-border bg-surface px-4 py-2 text-xs lowercase text-muted disabled:opacity-50"
-			>
-				{sending ? '…' : 'send'}
-			</button>
+			{#if sending}
+				<!-- Mid-stream the send button becomes a stop button: it cancels the
+				     in-flight reply rather than queuing another turn. The server keeps
+				     whatever the model streamed, so stopping is non-destructive. While
+				     the cancel is settling it shows "…" and is disabled so a second
+				     press can't fire. -->
+				<button
+					type="button"
+					onclick={cancel}
+					disabled={cancelling || !activeSession}
+					title="stop the reply (keeps what's been written)"
+					class="border border-border bg-surface px-4 py-2 text-xs lowercase text-glow hover:text-text disabled:opacity-50"
+				>
+					{cancelling ? '…' : 'stop'}
+				</button>
+			{:else}
+				<button
+					type="submit"
+					disabled={loadingReplay || (draft.trim() === '' && pendingImages.length === 0)}
+					class="border border-border bg-surface px-4 py-2 text-xs lowercase text-muted disabled:opacity-50"
+				>
+					send
+				</button>
+			{/if}
 		</div>
 	</form>
 </div>

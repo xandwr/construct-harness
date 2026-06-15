@@ -622,6 +622,34 @@ const MIGRATIONS: ReadonlyArray<{ name: string; up: (db: DatabaseSync) => void }
             `);
         },
     },
+    {
+        // The `response_cancelled` event marker: the log entry a turn the human
+        // cancelled mid-stream leaves behind (see RESPONSE_CANCELLED_EVENT_KIND in
+        // session.ts). A cancel is non-lossy — the partial reply the model had
+        // already streamed is saved as an ordinary agent `message` event, and this
+        // marker sits right after it recording that the human stopped the turn (its
+        // `meta.savedChars` says how much was kept).
+        //
+        // The marker rides on the existing free-form `kind` column, so storing it
+        // needs no new table or column. What this migration adds is a *partial*
+        // index over just the cancellation rows, so the "which turns did the user
+        // cancel?" scan — a small, growing subset of a large log — hits an index
+        // containing only those rows rather than filtering the whole table through
+        // the broad idx_events_kind. The WHERE clause is what keeps the index tiny
+        // (only cancellation events are indexed at all); it orders by ts DESC, id
+        // DESC to match the log's newest-first read order. The literal kind string
+        // must stay in lockstep with RESPONSE_CANCELLED_EVENT_KIND; it's inlined
+        // here (not imported) so a published migration never moves under a later
+        // refactor — the append-only rule the array's header documents.
+        name: "index response_cancelled events for the cancelled-turns view",
+        up(db) {
+            db.exec(`
+                CREATE INDEX IF NOT EXISTS idx_events_cancelled
+                    ON events (ts DESC, id DESC)
+                    WHERE kind = 'response_cancelled';
+            `);
+        },
+    },
 ];
 
 /** The schema version this build of the code expects. */

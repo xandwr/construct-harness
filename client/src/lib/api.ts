@@ -590,12 +590,19 @@ export type ChatEvent =
     | { kind: "thinking"; text: string }
     | { kind: "tool"; phase: "start" | "end"; name: string; args?: unknown; isError?: boolean }
     | { kind: "compacted"; turn: number }
+    // The human stopped this reply mid-stream. `text` is the partial reply the
+    // server saved up to the stop (also already delivered as `text` deltas). A
+    // `done` frame still follows with the turn's final accounting (its own
+    // `cancelled` flag set), so this is a marker, not a terminator.
+    | { kind: "cancelled"; text: string }
     | {
           kind: "done";
           text: string;
           modelTurns: number;
           stoppedAtMaxTurns: boolean;
           compactions: number;
+          /** True when the human cancelled this turn mid-stream. */
+          cancelled: boolean;
           usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number };
       }
     | { kind: "error"; errorKind: string; message: string };
@@ -671,6 +678,38 @@ export async function sendChat(
     }
 }
 
+/**
+ * Stop an in-flight streamed reply for `session`.
+ *
+ * The chat SSE stream is one-way, so cancelling is this separate call: it tells
+ * the server to abort that conversation's streaming turn. The server saves the
+ * partial reply produced so far and logs a cancellation marker, then the original
+ * {@link sendChat} stream delivers its own `cancelled` and `done` frames and
+ * closes — so the caller learns the turn stopped through the stream it's already
+ * consuming, not from this call's return.
+ *
+ * Returns true when a turn was actually aborted; false when the server had none
+ * in flight for that id (the reply already finished, or a duplicate cancel — a
+ * 404, which we treat as "nothing to stop" rather than an error). Any other
+ * non-2xx throws {@link ApiError}.
+ */
+export async function cancelChat(session: string, fetchFn: typeof fetch = fetch): Promise<boolean> {
+    const res = await fetchFn("/api/chat/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session }),
+    });
+    if (res.status === 404) return false;
+    if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new ApiError(
+            (body as { error?: string }).error ?? `cancel failed (${res.status})`,
+            res.status,
+        );
+    }
+    return true;
+}
+
 /** Parse one SSE frame (`event:` + `data:` lines) into a {@link ChatEvent}, or
  *  null if it isn't one we recognize. The server only emits `data` as a single
  *  JSON line per frame, so we don't handle multi-line data. */
@@ -707,6 +746,8 @@ function parseFrame(frame: string): ChatEvent | null {
             };
         case "compacted":
             return { kind: "compacted", turn: Number(payload.turn) };
+        case "cancelled":
+            return { kind: "cancelled", text: String(payload.text ?? "") };
         case "done": {
             const u = (payload.usage ?? {}) as Record<string, unknown>;
             return {
@@ -715,6 +756,7 @@ function parseFrame(frame: string): ChatEvent | null {
                 modelTurns: Number(payload.modelTurns ?? 0),
                 stoppedAtMaxTurns: Boolean(payload.stoppedAtMaxTurns),
                 compactions: Number(payload.compactions ?? 0),
+                cancelled: Boolean(payload.cancelled),
                 usage: {
                     inputTokens: Number(u.inputTokens ?? 0),
                     outputTokens: Number(u.outputTokens ?? 0),
